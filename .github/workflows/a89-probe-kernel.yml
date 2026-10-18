@@ -1,0 +1,88 @@
+# A89 探测内核云端编译工作流（正式生效位置：仓库根 .github/workflows/）
+#
+# 推送到 GitHub 后，Actions 页面会出现 "Build A89 probe kernel"，
+# 手动 Run workflow 即可；无需手机。
+#
+# 产出物（artifact: a89-probe-kernel）：
+#   Image / Image.lk —— a89-probe1 内核，配合本机 make-probe.py 使用
+#   config / kernel.release / SHA256SUMS
+#
+# 说明：这是"探测内核"阶段。完整 OpenWrt rootfs/刷机包（阶段 B）必须等
+# 真机 probe 结果确定设备树补丁、充电驱动、模块列表之后再固化配方，
+# 见 README-A89移植指南.md 阶段 B。
+#
+# 仓库结构假设（与本工作区一致）：
+#   仓库根 = a89-openwrt-port（README-A89移植指南.md、cloud-build/、e5-linux/…）
+#   探测脚本 = e5-linux/device/linux_device_a89/
+#   内核由 Actions 单独 checkout 到 e5-linux/linux-lts-e5/（不进仓库）
+name: Build A89 probe kernel
+
+on:
+  push:
+    tags: ['a89-v*']
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: 'sprd-linux-devs/linux 分支/标签/提交（T157/T158 稳定内核）'
+        default: 'e5-6.18'
+        required: true
+      jobs:
+        description: '并行编译任务数'
+        default: '8'
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a89-probe-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  probe-kernel:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - name: Checkout 本仓库
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout 稳定内核（T157/T158）
+        uses: actions/checkout@v4
+        with:
+          repository: sprd-linux-devs/linux
+          ref: ${{ inputs.kernel_ref || 'e5-6.18' }}
+          path: e5-linux/linux-lts-e5
+          fetch-depth: 128
+          persist-credentials: false
+
+      - name: 安装构建工具
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm lz4 make python3 libncurses-dev
+
+      - name: 编译 A89 探测内核
+        working-directory: e5-linux
+        env:
+          A89_KERNEL: ${{ github.workspace }}/e5-linux/linux-lts-e5
+          A89_BUILD: ${{ github.workspace }}/e5-linux/out/a89/build
+          JOBS: ${{ inputs.jobs || '8' }}
+        run: |
+          bash device/linux_device_a89/build-probe.sh
+
+      - name: 校验产物
+        working-directory: e5-linux/out/a89/probe
+        run: sha256sum --check SHA256SUMS
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: a89-probe-kernel
+          path: |
+            e5-linux/out/a89/probe/Image
+            e5-linux/out/a89/probe/Image.lk
+            e5-linux/out/a89/probe/config
+            e5-linux/out/a89/probe/kernel.release
+            e5-linux/out/a89/probe/SHA256SUMS
+          if-no-files-found: error
