@@ -23,8 +23,8 @@ on:
   workflow_dispatch:
     inputs:
       kernel_ref:
-        description: 'sprd-linux-devs/linux 分支/标签/提交（T157/T158 稳定内核）'
-        default: 'e5-6.18'
+        description: '内核 ref：默认锁 M8 基线提交（prepare-kernel.py 依赖此树）；勿随意改'
+        default: '020b970e351eee3887e6caaf2d653926e7086e44'
         required: true
       jobs:
         description: '并行编译任务数'
@@ -48,11 +48,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Checkout 稳定内核（T157/T158）
+      - name: Checkout 稳定内核（T157/T158，锁定 M8 基线提交）
         uses: actions/checkout@v4
         with:
           repository: sprd-linux-devs/linux
-          ref: ${{ inputs.kernel_ref || 'e5-6.18' }}
+          ref: ${{ inputs.kernel_ref || '020b970e351eee3887e6caaf2d653926e7086e44' }}
           path: e5-linux/linux-lts-e5
           fetch-depth: 128
           persist-credentials: false
