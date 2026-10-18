@@ -1,0 +1,104 @@
+#!/bin/sh
+# Send one AT command to the baseband through whoever owns its AT channel.
+#
+#   e5-at "AT+CSQ"            print the reply, ending in OK or ERROR
+#   e5-at -t 20 "AT+COPS=?"   with a timeout in seconds (default 8)
+#
+# The channel has exactly one owner (docs/FINDINGS.md 22, 37): ModemManager,
+# through the WWAN port of sipc_wwan, or on an image still in the unisoc-cpd
+# shape the daemon.  Both serialise and pace what they send, so this asks the
+# owner -- ModemManager's Modem.Command (mmcli --command; the E5 build serves
+# it without --debug), or the daemon's socket -- and never opens the port or
+# /dev/stty_nr1 itself: a second reader splits replies with the owner and makes
+# the CP's PS task assert with "The queue was full".
+#
+# Nothing is refused.  Warned about, whoever the owner: the commands after
+# which the CP's AT server answers nobody (ATZ, AT&F, AT+CPMS=...) or the SIM
+# is not seen (AT+CFUN=0, AT+SFUN=3/5) until a reboot.  The info screen's
+# /api/at warns the same way.
+set -u
+
+T=8
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -t) shift; [ $# -gt 0 ] && { T=$1; shift; } ;;
+        --) shift; break ;;
+        *) break ;;
+    esac
+done
+if [ $# -eq 0 ] || [ -z "$1" ]; then
+    echo "usage: e5-at [-t SECONDS] AT+COMMAND" >&2
+    exit 2
+fi
+CMD=$1
+
+# Warned about, not refused: the commands after which the CP's AT server
+# answers nobody (ATZ, AT&F, AT+CPMS=...) or the SIM is not seen (AT+CFUN=0,
+# AT+SFUN=3/5) until a reboot.  Every ;-separated part is checked, and the
+# command is sent as it is.
+norm=$(printf '%s' "$CMD" | tr '[:lower:]' '[:upper:]' | tr -d ' ')
+warn=
+IFS=';'
+for part in ${norm#AT}; do
+    part=${part#AT}
+    case "$part" in
+        Z*|\&F*|+CPMS=*|+CFUN=0*|+SFUN=3*|+SFUN=5*)
+            warn="it may leave the modem's AT server or SIM dead until a reboot" ;;
+    esac
+done
+unset IFS
+if [ -n "$warn" ]; then
+    echo "e5-at: warning: '$CMD' $warn" >&2
+fi
+
+# Adapted images use permanently held nr2 for interactive commands, nr6/nr7 for
+# collectors (selected with T551M_AT_CHANNEL). Keep nr1 and
+# the URC rings with ModemManager; never fall back to opening either device.
+profile=$(cat /etc/e5/device-profile 2>/dev/null)
+if [ "$profile" = t551m ] || [ "$profile" = e5 ] || [ "$profile" = m8 ]; then
+    case "$norm" in
+        # E5SMS is a virtual command implemented by MM, not modem firmware.
+        # Existing per-SIM SMS operations must retain MM's port-local charset,
+        # PDU mode, storage selection and multi-step transaction ownership.
+        AT+E5SMS*) ;;
+        AT+SPACTCARD=*)
+            # Addressing a SIM does not make a command an SMS transaction.
+            # Keep dashboard collectors/controls on their selected nr2/6/7
+            # owner; otherwise every scoped request queues on MM's dial port.
+            # SMS operations still need that port's charset/storage context.
+            case "$norm" in
+                *+E5SMS*|*+CMGS*|*+CMGC*|*+CMGW*|*+CMSS*|*+CMGR*|*+CMGL*|*+CMGD*|*+CMGF*|*+CPMS*|*+CNMI*|*+CNMA*|*+CSCS=*|*+CSCA*|*+CSMP*|*+CSMS*|*+CSCB*|*+CSDH*) ;;
+                *) exec /opt/e5/t551m-at -t "$T" "$CMD" ;;
+            esac
+            ;;
+        *) exec /opt/e5/t551m-at -t "$T" "$CMD" ;;
+    esac
+fi
+
+# (systemd on Debian; OpenWrt has procd, and pidof)
+if systemctl -q is-active ModemManager 2>/dev/null ||
+   { ! command -v systemctl >/dev/null && pidof ModemManager >/dev/null; }; then
+    out=$(mmcli -m any --timeout="$T" --command="$CMD" 2>&1)
+    rc=$?
+    if [ $rc -eq 0 ]; then
+        # response: '<reply>'  (ModemManager keeps the final OK to itself)
+        out=${out#response: \'}
+        printf '%s\n' "${out%\'}" | sed '/^$/d'
+        echo "OK"
+        exit 0
+    fi
+    echo "e5-at: $out" >&2
+    case "$out" in
+        *"CME ERROR"*|*"CMS ERROR"*) printf '%s\n' "$out" | grep -o '+CM[ES] ERROR: *[0-9]*' | head -1 ;;
+        *) echo "ERROR" ;;
+    esac
+    exit 1
+fi
+
+if [ -S /run/unisoc-cpd/cmd.sock ]; then
+    exec /usr/local/bin/unisoc-cpd --mode native --profiles-dir /etc/unisoc-cpd \
+        --socket /run/unisoc-cpd/cmd.sock at "$CMD"
+fi
+
+echo "e5-at: no owner of the AT channel is running (ModemManager or unisoc-cpd)" >&2
+exit 1

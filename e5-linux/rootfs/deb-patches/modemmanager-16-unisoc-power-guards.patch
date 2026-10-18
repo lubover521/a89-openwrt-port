@@ -1,0 +1,192 @@
+Description: Fail closed on invalid Unisoc power readback and activation prerequisites
+ Keep the successful RIL command order and existing pre-dial replay. Never
+ guess 134/134 after a failed mode query or continue after a mandatory power
+ command fails. Propagate initialization errors and release parent port state.
+Author: e5-linux
+Forwarded: no
+
+--- a/src/plugins/unisoc/mm-broadband-modem-unisoc.c
++++ b/src/plugins/unisoc/mm-broadband-modem-unisoc.c
+@@ -50,6 +50,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <errno.h>
+ #include <fcntl.h>
+ #include <unistd.h>
+ #include <glib-unix.h>
+@@ -814,6 +815,30 @@
+     g_object_unref (task);
+ }
+ 
++/* Never substitute guessed radio modes for an unavailable CP readback. */
++static gboolean
++power_parse_uint (const gchar **cursor,
++                  guint        *value)
++{
++    const gchar *p = *cursor;
++    gchar       *end;
++    guint64      number;
++
++    while (g_ascii_isspace (*p))
++        p++;
++    if (!g_ascii_isdigit (*p))
++        return FALSE;
++    errno = 0;
++    number = g_ascii_strtoull (p, &end, 10);
++    if (errno || number > G_MAXUINT)
++        return FALSE;
++    while (g_ascii_isspace (*end))
++        end++;
++    *cursor = end;
++    *value = (guint) number;
++    return TRUE;
++}
++
+ static void
+ cards_on_testmode_ready (MMBaseModem  *self,
+                          GAsyncResult *res,
+@@ -821,14 +846,25 @@
+ {
+     CardsOnContext *ctx;
+     const gchar    *response;
+-    guint           mode1 = 134, mode2 = 134, a, b, n = 0;
++    guint           mode1, mode2, i, n = 0;
++    GError         *error = NULL;
+ 
+     /* +SPTESTMODE: <card 1>,<card 2>,<primary SIM>,... */
+-    response = mm_base_modem_at_command_finish (self, res, NULL);
++    response = mm_base_modem_at_command_finish (self, res, &error);
++    if (error) {
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
+     response = response ? strstr (response, "+SPTESTMODE:") : NULL;
+-    if (response && sscanf (response, "+SPTESTMODE:%u,%u", &a, &b) == 2) {
+-        mode1 = a;
+-        mode2 = b;
++    if (response)
++        response += strlen ("+SPTESTMODE:");
++    if (!response || !power_parse_uint (&response, &mode1) || *response++ != ',' ||
++        !power_parse_uint (&response, &mode2) || (*response && *response != ',')) {
++        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                                 "Cannot activate SIMs: invalid +SPTESTMODE readback");
++        g_object_unref (task);
++        return;
+     }
+ 
+     ctx = g_task_get_task_data (task);
+@@ -866,6 +902,11 @@
+     mm_obj_info (self, "power plan: SIM1=%s, SIM2=%s, data SIM%u",
+                  ctx->present[0] ? "present" : "absent", ctx->present[1] ? "present" : "absent", ctx->own + 1);
+ 
++    /* Slots proven absent were omitted above. A failure for a remaining
++     * SIM/mode/data/stack command is mandatory: never power a stack after
++     * its prerequisite failed, or report a partially applied plan as ready. */
++    for (i = 0; i < n; i++)
++        ctx->cmds[i].response_processor = mm_base_modem_response_processor_no_result_continue;
+     mm_base_modem_at_sequence (self, (const MMBaseModemAtCommand *) ctx->cmds, NULL, NULL,
+                                (GAsyncReadyCallback) cards_on_sequence_ready, task);
+ }
+@@ -910,17 +951,15 @@
+ }
+ 
+ static gboolean
+-cfun_is_zero (const gchar *response)
+-{
+-    const gchar *p;
+-
+-    p = response ? strstr (response, "+CFUN:") : NULL;
++power_parse_cfun (const gchar *response,
++                  guint       *value)
++{
++    const gchar *p = response ? strstr (response, "+CFUN:") : NULL;
++
+     if (!p)
+         return FALSE;
+     p += strlen ("+CFUN:");
+-    while (*p == ' ')
+-        p++;
+-    return p[0] == '0' && !g_ascii_isdigit (p[1]);
++    return power_parse_uint (&p, value) && !*p;
+ }
+ 
+ /* Separate worker: no AT request is put on MM's synchronous enable path. */
+@@ -994,9 +1033,18 @@
+                      GTask        *task)
+ {
+     const gchar *response;
+-
+-    response = mm_base_modem_at_command_finish (self, res, NULL);
+-    if (cfun_is_zero (response)) {
++    GError      *error = NULL;
++    guint        power;
++
++    response = mm_base_modem_at_command_finish (self, res, &error);
++    if (!error && !power_parse_cfun (response, &power))
++        error = g_error_new (MM_CORE_ERROR, MM_CORE_ERROR_FAILED, "Invalid +CFUN readback during power-up");
++    if (error) {
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
++    if (power == 0) {
+         mm_obj_dbg (self, "SIM and protocol stack off (+CFUN: 0): AT+SFUN=2 and AT+SFUN=4 for both cards");
+         cards_on (self, (GAsyncReadyCallback) power_sequence_ready, task);
+         return;
+@@ -1051,6 +1099,21 @@
+     return g_task_propagate_pointer (G_TASK (res), error);
+ }
+ 
++/* Parent initialization_started() transferred its open-port context to
++ * this task. Release it on failure; a failed finish() cannot transfer it to
++ * the caller's initialization_stopped(). Do not run our success hook here. */
++static void
++init_power_failed (MMBaseModem *self,
++                   GTask       *task,
++                   GError      *error)
++{
++    MM_BROADBAND_MODEM_CLASS (mm_broadband_modem_unisoc_parent_class)->initialization_stopped (
++        MM_BROADBAND_MODEM (self), g_task_get_task_data (task), NULL);
++    g_task_set_task_data (task, NULL, NULL);
++    g_task_return_error (task, error);
++    g_object_unref (task);
++}
++
+ static void
+ init_sim_on_ready (MMBaseModem  *self,
+                    GAsyncResult *res,
+@@ -1059,8 +1122,9 @@
+     GError *error = NULL;
+ 
+     if (!cards_on_finish (self, res, &error)) {
+-        mm_obj_warn (self, "couldn't switch the SIMs on: %s", error->message);
+-        g_error_free (error);
++        g_prefix_error (&error, "Couldn't activate SIMs: ");
++        init_power_failed (self, task, error);
++        return;
+     }
+     g_task_return_pointer (task, g_task_get_task_data (task), NULL);
+     g_object_unref (task);
+@@ -1072,9 +1136,17 @@
+                  GTask        *task)
+ {
+     const gchar *response;
+-
+-    response = mm_base_modem_at_command_finish (self, res, NULL);
+-    if (cfun_is_zero (response)) {
++    GError      *error = NULL;
++    guint        power;
++
++    response = mm_base_modem_at_command_finish (self, res, &error);
++    if (!error && !power_parse_cfun (response, &power))
++        error = g_error_new (MM_CORE_ERROR, MM_CORE_ERROR_FAILED, "Invalid +CFUN readback during initialization");
++    if (error) {
++        init_power_failed (self, task, error);
++        return;
++    }
++    if (power == 0) {
+         mm_obj_msg (self, "SIM and protocol stack off (+CFUN: 0): switching them on");
+         cards_on (self, (GAsyncReadyCallback) init_sim_on_ready, task);
+         return;

@@ -1,0 +1,87 @@
+#!/bin/bash
+# Rebuild a Debian package with the fixes in rootfs/deb-patches/, for the cases
+# where trixie's package has a bug that upstream has already fixed and the fix
+# matters on the E5.  Runs Debian's own source package in a debian:trixie arm64
+# container (native on an Apple-silicon host), adds each patch to its quilt
+# series (in file-name order), gives the version a local "+e5.<patch count>"
+# suffix and builds binaries only.
+#
+#   rootfs/build-patched-debs.sh network-manager    -> out/debs-patched/*.deb
+#
+# network-manager (docs/FINDINGS.md 35.2):
+#   01  the VHT80 centre of channels 149-161 (backport of upstream "supplicant:
+#       fix center channel calculation") -- 149 at 80 MHz failed to start
+#   02  an AP with PMF disabled advertises WPA-PSK only, not also
+#       WPA-PSK-SHA256 (AKM 6 without MFPC) -- phones could not join
+#
+# modemmanager (docs/FINDINGS.md 37):
+#   01  the unisoc plugin: the baseband over the kernel's sipc_wwan AT port
+#       and sipa_eth, without the commands that silence its AT server; cell
+#       info (serving and neighbour cells) and the LTE SINR from +SPENGMD
+#   02  +CREG/+CGREG/+CEREG with a two-digit AcT (NR SA reports 11) parse
+#   03  +CMGL PDU listings with an empty line before each PDU parse
+#   04  AT commands over D-Bus (mmcli --command) without --debug: e5-at and
+#       UFI-TOOLS reach the modem through ModemManager
+#   05  new contexts may take the ids below the first defined one: context 1
+#       is the one routed to sipa_eth0, and the CP boots with only IMS at 11
+#   06  a profile set by an id that is not defined yet is created with it:
+#       the initial EPS bearer goes to context 1, which the CP boots without
+#       (OpenWrt's ModemManager protocol sets it at every connect)
+#
+# phosh:
+#   01  the hotspot switch follows an access point whatever its IP setup: the
+#       E5's "Hotspot" is a bridge port with no IPv4 setting, and phosh only
+#       counted ipv4.method=shared -- the switch showed off and could not stop it
+#   02  phone mode keeps the window close button: with no Escape key, and a
+#       back key that closes no GTK dialog, dialogs could not be left
+#   03  the keypad's Menu key shows and hides the on-screen keyboard, which
+#       could not be dismissed from the keypad otherwise
+#
+# gnome-control-center:
+#   01  the Wi-Fi panel finds the bridged "Hotspot" and turns it on instead of
+#       creating a NAT-sharing one, and never adds ipv4.method=shared to a port
+#   02  Modem Details shows the serving cell (band, channel, PCI, cell id,
+#       TAC, bandwidth, RSRP/RSRQ/SINR) and the neighbour cells
+#
+# bluez:
+#   01  larger SDP MTU for headphones which send replies larger than the
+#       default 672 bytes; otherwise pairing finishes but audio setup stalls
+#   02  apply it to profile-specific searches too, including cached sessions
+#       opened before the device-wide browse during reconnection
+set -eu
+HERE="$(cd "$(dirname "$0")" && pwd)"
+PKG=${1:?package}
+OUT="$HERE/../out/debs-patched"
+mkdir -p "$OUT"
+# E5_DEB_CHECK=1 runs the package's test suite too (dpkg-buildpackage without
+# nocheck) -- worth it when a patch touches code the suite covers.
+exec docker run --rm --platform linux/arm64 \
+    -v "$HERE/deb-patches:/patches:ro" -v "$OUT:/out" \
+    -e PKG="$PKG" -e CHECK="${E5_DEB_CHECK:-0}" debian:trixie bash -euc '
+export DEBIAN_FRONTEND=noninteractive
+sed -i "s/^Types: deb$/Types: deb deb-src/" /etc/apt/sources.list.d/debian.sources
+apt-get update -qq
+apt-get install -y -qq --no-install-recommends build-essential devscripts quilt fakeroot >/dev/null
+apt-get build-dep -y -qq "$PKG" >/dev/null
+mkdir -p /build && cd /build
+apt-get source -qq "$PKG"
+cd "$(find . -maxdepth 1 -mindepth 1 -type d | head -1)"
+# (a series without a final newline would take our first patch into its last line)
+[ -n "$(tail -c1 debian/patches/series 2>/dev/null)" ] && echo >> debian/patches/series
+for p in /patches/"$PKG"-*.patch; do
+    cp "$p" debian/patches/
+    echo "$(basename "$p")" >> debian/patches/series
+done
+export QUILT_PATCHES=debian/patches
+quilt push -a >/build/quilt.log 2>&1 || { tail -20 /build/quilt.log; exit 1; }
+quilt pop -a >/dev/null
+N=$(ls /patches/"$PKG"-*.patch | wc -l)
+DEBEMAIL="e5-linux@localhost" DEBFULLNAME="e5-linux" \
+    dch -v "$(dpkg-parsechangelog -SVersion)+e5.$N" "E5: $(cd /patches && ls "$PKG"-*.patch | tr "\n" " ")"
+OPTS="parallel=$(nproc)"; [ "$CHECK" = 1 ] || OPTS="nocheck $OPTS"
+DEB_BUILD_OPTIONS="$OPTS" dpkg-buildpackage -b -uc -us >/build/log 2>&1 || { tail -60 /build/log; exit 1; }
+[ "$CHECK" = 1 ] && grep -E "^(Ok|Fail|Expected Fail|Unexpected Pass|Skipped|Timeout|ERROR):" /build/log | tail -8
+for d in ../*.deb; do rm -f /out/"$(basename "$d" | cut -d_ -f1)"_*.deb; done
+cp ../*.deb /out/
+ls -la /out
+'

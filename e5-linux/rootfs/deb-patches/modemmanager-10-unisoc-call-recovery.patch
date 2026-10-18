@@ -1,0 +1,96 @@
+Description: Confirm empty Unisoc voice snapshots and adopt orphan outgoing calls
+Author: e5-linux
+Forwarded: no
+
+--- a/src/plugins/unisoc/mm-broadband-modem-unisoc.c
++++ b/src/plugins/unisoc/mm-broadband-modem-unisoc.c
+@@ -1428,6 +1428,7 @@
+     guint slot;
+     guint own;
+     gint64 started_at;
++    gboolean empty_retried;
+     GList *calls;
+     GError *error;
+ } VoiceListContext;
+@@ -1463,6 +1464,15 @@
+     g_object_unref (task);
+ }
+ static void voice_query_next (GTask *task);
++/* Confirm a transient empty CLCC before publishing disappearance. Keep the
++ * original snapshot timestamp and the same addressed slot. Only this fault
++ * path adds one query; normal polling and explicit hangup are unchanged. */
++static gboolean voice_retry_empty (gpointer data)
++{
++    voice_query_next (G_TASK (data));
++    return G_SOURCE_REMOVE;
++}
++
+ typedef struct { guint slot; gboolean live; } SlotLive;
+ static void slot_live (MMBaseCall *call, SlotLive *ctx)
+ {
+@@ -1492,6 +1502,12 @@
+     if (list || has_live_on_slot (modem, ctx->slot + 1))
+         mm_obj_info (modem, "voice snapshot SIM%u: %u parsed call(s), error=%s", ctx->slot + 1,
+                       g_list_length (list), error ? error->message : "none");
++    if (!error && !list && !ctx->empty_retried && has_live_on_slot (modem, ctx->slot + 1)) {
++        ctx->empty_retried = TRUE;
++        mm_obj_info (modem, "empty voice snapshot SIM%u: confirming before ending calls", ctx->slot + 1);
++        g_timeout_add (250, voice_retry_empty, task);
++        return;
++    }
+     if (error) {
+         /* Absent/locked card must not hide the other card. A failed query
+          * while that card has a live call must never terminate it by omission. */
+@@ -1509,6 +1525,7 @@
+         }
+         ctx->calls = g_list_concat (ctx->calls, list);
+     }
++    ctx->empty_retried = FALSE;
+     ctx->slot++;
+     voice_query_next (task);
+ }
+--- a/src/mm-iface-modem-voice.c
++++ b/src/mm-iface-modem-voice.c
+@@ -480,6 +480,33 @@
+     mm_base_call_change_state (call, MM_CALL_STATE_TERMINATED, MM_CALL_STATE_REASON_UNKNOWN);
+ }
+ 
++/* A Unisoc CLCC can rediscover a call after an earlier empty snapshot or
++ * daemon restart. Adopt the CP object; never send ATD to recover its UI. */
++static gboolean
++recover_unisoc_outgoing_call (MMIfaceModemVoice *self,
++                              MMCallList *list,
++                              const MMCallInfo *info)
++{
++    MMBaseCall *call;
++
++    if (!g_object_get_data (G_OBJECT (self), "e5-dual-sim-voice") ||
++        info->sim_slot < 1 || info->sim_slot > 2 || !info->index ||
++        info->direction != MM_CALL_DIRECTION_OUTGOING ||
++        (info->state != MM_CALL_STATE_DIALING && info->state != MM_CALL_STATE_RINGING_OUT &&
++         info->state != MM_CALL_STATE_ACTIVE && info->state != MM_CALL_STATE_HELD))
++        return FALSE;
++    call = MM_IFACE_MODEM_VOICE_GET_IFACE (self)->create_call (self, MM_CALL_DIRECTION_OUTGOING, info->number);
++    mm_gdbus_call_set_sim_slot (MM_GDBUS_CALL (call), info->sim_slot);
++    mm_base_call_set_index (call, info->index);
++    mm_base_call_change_state (call, info->state, MM_CALL_STATE_REASON_UNKNOWN);
++    update_audio_settings_in_call (self, call);
++    mm_base_call_export (call);
++    mm_call_list_add_call (list, call);
++    g_object_unref (call);
++    mm_obj_info (self, "recovered existing outgoing call on SIM%u index %u (no redial)", info->sim_slot, info->index);
++    return TRUE;
++}
++
+ void
+ mm_iface_modem_voice_report_all_calls (MMIfaceModemVoice *self,
+                                        GList             *call_info_list)
+@@ -531,6 +558,8 @@
+             continue;
+ 
+         if (call_info->direction == MM_CALL_DIRECTION_OUTGOING) {
++            if (recover_unisoc_outgoing_call (self, list, call_info))
++                continue;
+             mm_obj_warn (self, "unexpected outgoing call to number '%s' reported in call list: state %s",
+                          call_info->number ? call_info->number : "n/a",
+                          mm_call_state_get_string (call_info->state));

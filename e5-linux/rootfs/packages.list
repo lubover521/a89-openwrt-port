@@ -1,0 +1,188 @@
+# e5-linux root filesystem package set.
+#
+# Phosh is the session the E5 runs (etc/sddm.conf autologins phosh.desktop) and the only
+# one installed: the Plasma Mobile half was dropped on 2026-09-19, together with the X11
+# it dragged in.  The device has a 480x320 DSI panel (lcd_st7365p_mipi_hdp) driven by
+# the SPRD DRM/KMS driver, so the session is Wayland with the DRM backend.
+#
+# Rendering is on the Mali-G57 through panfrost (kernel/patches/0005, MALI_MIDGARD=m),
+# which is what libgl1-mesa-dri / libegl-mesa0 carry.  llvmpipe is the fallback when a
+# client asks for what Valhall v9 cannot do; no vendor blob is involved either way.
+
+# --- base system ---
+systemd
+systemd-sysv
+dbus
+sudo
+locales
+tzdata
+ca-certificates
+kmod
+udev
+procps
+psmisc
+less
+nano
+htop
+curl
+wget
+iproute2
+iputils-ping
+net-tools
+e2fsprogs
+dosfstools
+parted
+
+# --- session: phosh on Wayland ---
+# The whole X11/KDE side is gone -- no plasma-mobile, plasma-workspace, kwin-wayland,
+# kwin-x11 or xdg-desktop-portal-kde.  Plasma was what put /usr/bin/X on this image,
+# which is why etc/sddm.conf.d/10-e5.conf has to force DisplayServer=wayland
+# (docs/STATUS.md, "Traps found the hard way").  qt6-wayland stays for sddm's own QML
+# greeter; xdg-desktop-portal is the daemon, and a fresh install currently has no backend
+# for it -- see "Open questions" in docs/STATUS.md.
+sddm
+polkitd
+qt6-wayland
+xdg-desktop-portal
+fonts-noto-core
+fonts-noto-color-emoji
+fonts-dejavu-core
+# CJK: without it every Chinese string in the session is boxes.  Noto Sans CJK
+# matches the Noto set above; fontconfig picks its SC face for zh-CN (91 MB).
+fonts-noto-cjk
+
+# --- graphics: software rendering only ---
+libgl1-mesa-dri
+libegl-mesa0
+libgles2
+mesa-utils
+libdrm-tests
+
+# --- networking ---
+# NetworkManager manages Wi-Fi and nothing else (etc/NetworkManager/conf.d/
+# 50-e5.conf): station mode from Phosh's Wi-Fi menu, and the hotspot -- the
+# "Hotspot" connection, an AP that is a port of br0 -- from Phosh, UFI-TOOLS or
+# nmcli.  The LAN (br0, usb0) is e5-net-bridge's, the bearer is e5-bearer-up's
+# and unisoc-cpd's, DHCP/DNS/RA is dnsmasq's.  Everything else is on NM's
+# unmanaged list, which is what keeps it off sipa_dummy0: an NM that
+# autoconnected there once held network-online.target for minutes and timed
+# the old hostapd hotspot out (docs/FINDINGS.md 26).  wpasupplicant runs both
+# station and AP mode for it.
+network-manager
+wpasupplicant
+rfkill
+# nftables: e5-mobile-data creates the NAT table for the USB/Wi-Fi clients and
+# the hotspot's forwarding depends on it.  ethtool: the sipa driver reports wrong
+# hardware checksums and mobile-data turns rx offload off.
+nftables
+ethtool
+# dnsmasq-base is only the binary; the systemd unit the hotspot's start script
+# restarts lives in the full dnsmasq package.  Without it a client associates
+# and then never gets a lease -- which is exactly how a fresh
+# --no-install-recommends build looked before this line existed.
+dnsmasq
+
+# --- phosh: the session itself ---
+# sddm autologins phosh.desktop (etc/sddm.conf in the overlay), so a fresh install
+# without these comes up to a display manager that has no session to start.
+phosh
+phoc
+# phosh only Recommends gnome-session, and this list is installed with
+# --no-install-recommends -- so /usr/bin/phosh-session, a wrapper that execs
+# "gnome-session --session=phosh", exited without a word and the device came up
+# with a display manager that could not start a session.  It is a Depends here.
+gnome-session
+# No RTC on this board.  Without something setting the clock the device boots
+# years behind and apt refuses the mirror ("Not live until ..."), which cost two
+# hand-set clocks today.  It is its own binary package, not part of systemd.
+systemd-timesyncd
+phosh-osk-stub
+squeekboard
+foot
+# Portal backends used to arrive as Recommends of xdg-desktop-portal; a session
+# whose apps ask for a portal has none without them.
+xdg-desktop-portal-gtk
+xdg-desktop-portal-phosh
+
+# --- Wi-Fi regulatory ---
+# iw sets the regulatory domain (e5-regdb-load) and wireless-regdb is the
+# signed regulatory.db it installs: with a country and that database the driver
+# advertises 5 GHz at 80 MHz and the hotspot can start (docs/FINDINGS.md 20).
+iw
+wireless-regdb
+
+# --- UFI-TOOLS ---
+# Its backend is pure Python 3 standard library, so python3 is the whole
+# requirement.  The terminal panel used to be ttyd; that package is gone from
+# trixie (apt fails the install with "Unable to locate package ttyd"), so the
+# overlay ships gotty instead -- one static aarch64 binary, same job, and
+# UFI-TOOLS' ttyd_unit/ttyd_port point at its unit (gotty.service, port 1146).
+python3
+python3-gi
+
+# --- field diagnostics ---
+# Both were missed while chasing the modem, the daemon and the Wi-Fi by hand.
+strace
+lsof
+
+# --- audio ---
+# The bring-up is /opt/e5/e5-audio-dsp (e5-audio.service): the vendor modules,
+# the AGDSP firmware off l_agdsp_a and the speaker route, ported from mu300-linux
+# (docs/FINDINGS.md section 24).  alsa-utils is what drives the mixer (amixer) and
+# what the DSP-liveness probes play through (aplay); PipeWire then finds hw:0
+# answering normally and WirePlumber publishes it as the default sink.
+# alsa-ucm-conf carries ucm2/ucm.conf, the lookup the card's own profile
+# (overlay usr/share/alsa/ucm2/conf.d/sprdphone-sc273/) hangs off: without it
+# WirePlumber probes all 19 front ends and alsaucm finds nothing.
+alsa-utils
+alsa-ucm-conf
+pipewire
+wireplumber
+# PulseAudio/ALSA compatibility for desktop apps (the Android HAL's paths do not
+# exist here; PipeWire is what the session's clients will use).
+pipewire-pulse
+pipewire-alsa
+# e5-bt-attach runs btattach/bluetoothd; bluez only arrived as someone else's
+# dependency before.
+bluez
+
+# --- apps for the phosh session ---
+# Adaptive (libadwaita/GTK4) applications that fit a 320x480 portrait panel and
+# work with the on-screen keyboard.  Deliberately not here: gnome-calls and
+# chatty, which need ModemManager -- the modem is unisoc-cpd's (FINDINGS 25) and
+# ModemManager would fight it for /dev/stty_nr*; and the evolution-data-server
+# stack (contacts, calendar, maps) the 4 GiB loop file has no room for.
+gnome-console
+gnome-text-editor
+gnome-calculator
+gnome-clocks
+gnome-weather
+loupe
+papers
+portfolio-filemanager
+phosh-mobile-settings
+# browser: GNOME Web adapts to the narrow screen; Firefox ESR does not without
+# mobile-config-firefox (not in trixie), but it was installed and is kept
+epiphany-browser
+firefox-esr
+nautilus
+# media: music (Amberol), video (Showtime), and a recorder -- which is also the
+# quickest end-to-end check of the microphone path
+amberol
+showtime
+gnome-sound-recorder
+# output scale/transform changes in a running phoc session (wlr-output-management)
+wlr-randr
+# Screenshot capture for checking the Phosh compositor on the device.
+grim
+# phone: GNOME Calls (dialer, call history), Chatty (SMS; also XMPP/Matrix via
+# libpurple) and Contacts, the phosh set, over modemmanager -- replaced by the
+# patched build with the unisoc plugin (install-packages.sh), run allowlist-only
+# on the two ports tagged for it (ModemManager.service.d/50-e5.conf, FINDINGS 37).
+gnome-calls
+# Calls only recommends its audio-control daemon; include it in the phone
+# research image even with --no-install-recommends. The Unisoc voice route
+# still needs investigation independently of this userspace service.
+callaudiod
+chatty
+gnome-contacts

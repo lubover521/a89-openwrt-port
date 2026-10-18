@@ -1,0 +1,13 @@
+# networkd leaves the LAN alone: br0 and its usb0 port are built by
+# opt/e5/net-bridge.sh (e5-net-bridge.service), with ip.
+#
+# This file used to give usb0 its 192.168.77.1.  It is kept, not deleted, so
+# that a root filesystem which already has the old one gets it overwritten by
+# the overlay -- a removed overlay file stays on the device forever.  networkd's
+# rtnl requests time out on this SoC's sprd pseudo-interfaces (a bridge it
+# half-built was an empty shell, FINDINGS 28), so it is not asked to do any of it.
+[Match]
+Name=usb0 br0
+
+[Link]
+Unmanaged=yes

@@ -1,0 +1,120 @@
+Description: Apply bearer PAP/CHAP credentials through the shared Unisoc AT owner
+Author: e5-linux
+Forwarded: no
+
+--- a/src/plugins/unisoc/mm-broadband-bearer-unisoc.c
++++ b/src/plugins/unisoc/mm-broadband-bearer-unisoc.c
+@@ -191,30 +191,83 @@
+-static void
+-dial_3gpp (MMBroadbandBearer   *self,
+-           MMBaseModem         *modem,
+-           MMPortSerialAt      *primary,
+-           guint                cid,
+-           GCancellable        *cancellable,
+-           GAsyncReadyCallback  callback,
+-           gpointer             user_data)
+-{
+-    GTask            *task;
+-    g_autofree gchar *cmd = NULL;
+-
+-    task = common_task_new (MM_BROADBAND_BEARER_UNISOC (self), modem, primary, NULL, cid,
+-                            cancellable, callback, user_data);
+-    if (!task)
+-        return;
+-
+-    /* the port's card becomes the one that carries data, as the vendor RIL
+-     * makes the preferred data card before it sets up a data call: the CP
+-     * keeps the data card of the last AT+SPSWDATA, whichever card that was */
+-    mm_base_modem_at_command_full (modem,
+-                                   MM_IFACE_PORT_AT (primary),
+-                                   "+SPSWDATA",
+-                                   10,
+-                                   FALSE, /* allow_cached */
+-                                   FALSE, /* is_raw */
+-                                   cancellable,
+-                                   (GAsyncReadyCallback) spswdata_ready,
+-                                   task);
+-}
++static gboolean
++unisoc_credential_valid (const gchar *value)
++{
++    const guchar *p;
++    if (!value)
++        return TRUE;
++    if (strlen (value) > 64)
++        return FALSE;
++    for (p = (const guchar *) value; *p; p++)
++        if (*p < 32 || *p > 126 || *p == '"' || *p == '\\' || *p == ',')
++            return FALSE;
++    return TRUE;
++}
++
++static void
++cgpco_ready (MMBaseModem *modem, GAsyncResult *res, GTask *task)
++{
++    CommonContext *ctx = g_task_get_task_data (task);
++    GError *error = NULL;
++    if (!mm_base_modem_at_command_full_finish (modem, res, &error)) {
++        /* Do not propagate a modem response that could echo credentials. */
++        g_clear_error (&error);
++        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                                 "Unisoc bearer authentication setup failed");
++        g_object_unref (task);
++        return;
++    }
++    mm_base_modem_at_command_full (ctx->modem, MM_IFACE_PORT_AT (ctx->primary),
++                                   "+SPSWDATA", 10, FALSE, FALSE,
++                                   g_task_get_cancellable (task),
++                                   (GAsyncReadyCallback) spswdata_ready, task);
++}
++
++static void
++dial_3gpp (MMBroadbandBearer   *self,
++           MMBaseModem         *modem,
++           MMPortSerialAt      *primary,
++           guint                cid,
++           GCancellable        *cancellable,
++           GAsyncReadyCallback  callback,
++           gpointer             user_data)
++{
++    GTask            *task;
++    MMBearerProperties *properties;
++    MMBearerAllowedAuth allowed;
++    const gchar *user, *password;
++    guint auth;
++    g_autofree gchar *cmd = NULL;
++
++    task = common_task_new (MM_BROADBAND_BEARER_UNISOC (self), modem, primary, NULL, cid,
++                            cancellable, callback, user_data);
++    if (!task)
++        return;
++
++    properties = mm_base_bearer_peek_config (MM_BASE_BEARER (self));
++    allowed = mm_bearer_properties_get_allowed_auth (properties);
++    user = mm_bearer_properties_get_user (properties);
++    password = mm_bearer_properties_get_password (properties);
++    auth = 0;
++    if (allowed == MM_BEARER_ALLOWED_AUTH_PAP)
++        auth = 1;
++    else if (allowed == MM_BEARER_ALLOWED_AUTH_CHAP)
++        auth = 2;
++    else if (allowed == (MM_BEARER_ALLOWED_AUTH_PAP | MM_BEARER_ALLOWED_AUTH_CHAP))
++        auth = 3;
++    else if (allowed != MM_BEARER_ALLOWED_AUTH_UNKNOWN && allowed != MM_BEARER_ALLOWED_AUTH_NONE) {
++        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
++                                 "Unisoc supports only none, PAP and CHAP authentication");
++        g_object_unref (task);
++        return;
++    }
++    if (!unisoc_credential_valid (user) || !unisoc_credential_valid (password)) {
++        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_INVALID_ARGS,
++                                 "Invalid Unisoc bearer credentials");
++        g_object_unref (task);
++        return;
++    }
++    cmd = g_strdup_printf ("+CGPCO=0,\"%s\",\"%s\",%u,%u",
++                           user ? user : "", password ? password : "", cid, auth);
++    mm_base_modem_at_command_full (modem, MM_IFACE_PORT_AT (primary), cmd, 10,
++                                   FALSE, FALSE, cancellable,
++                                   (GAsyncReadyCallback) cgpco_ready, task);
++}
