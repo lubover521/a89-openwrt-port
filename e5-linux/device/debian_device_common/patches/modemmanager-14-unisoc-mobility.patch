@@ -1,0 +1,184 @@
+diff -ruN a/src/mm-base-bearer.c b/src/mm-base-bearer.c
+--- a/src/mm-base-bearer.c	2026-10-13 15:33:00.445511584 +0800
++++ b/src/mm-base-bearer.c	2026-10-13 15:33:00.445511584 +0800
+@@ -46,6 +46,7 @@
+ #define BEARER_IP_TIMEOUT_DEFAULT 20
+ 
+ #define BEARER_DEFERRED_UNREGISTRATION_TIMEOUT 15
++#define BEARER_UNISOC_DEFERRED_UNREGISTRATION_TIMEOUT 45
+ 
+ #define BEARER_STATS_UPDATE_TIMEOUT 30
+ 
+@@ -697,10 +698,18 @@
+ 
+         /* Otherwise, setup the new timeout */
+         mm_obj_dbg (self, "connected bearer not registered in 3GPP network");
++        /* Unisoc briefly reports IDLE/UNKNOWN during inter-cell and
++         * inter-RAT mobility while its PDP context remains active.  Keep the
++         * ordinary timeout for every other modem, but give SIPC enough time
++         * to complete that transition; CGEV and the 5s CGACT monitor still
++         * report a real context loss immediately. */
+         self->priv->deferred_3gpp_unregistration_id =
+-            g_timeout_add_seconds (BEARER_DEFERRED_UNREGISTRATION_TIMEOUT,
+-                                   (GSourceFunc) deferred_3gpp_unregistration_cb,
+-                                   self);
++            g_timeout_add_seconds (
++                (g_strcmp0 (mm_base_modem_get_plugin (MM_BASE_MODEM (modem)), "unisoc") == 0) ?
++                    BEARER_UNISOC_DEFERRED_UNREGISTRATION_TIMEOUT :
++                    BEARER_DEFERRED_UNREGISTRATION_TIMEOUT,
++                (GSourceFunc) deferred_3gpp_unregistration_cb,
++                self);
+         return;
+     }
+ 
+diff -ruN a/src/mm-broadband-modem.c b/src/mm-broadband-modem.c
+--- a/src/mm-broadband-modem.c	2026-10-12 19:54:34.913289205 +0800
++++ b/src/mm-broadband-modem.c	2026-10-13 15:25:47.640075691 +0800
+@@ -3546,6 +3546,9 @@
+     if (!str)
+         return;
+ 
++    if (MM_BROADBAND_MODEM_GET_CLASS (self)->cgev_received)
++        MM_BROADBAND_MODEM_GET_CLASS (self)->cgev_received (self, str);
++
+     type = mm_3gpp_parse_cgev_indication_action (str);
+ 
+     switch (type) {
+diff -ruN a/src/mm-broadband-modem.h b/src/mm-broadband-modem.h
+--- a/src/mm-broadband-modem.h	2026-10-12 19:54:34.894385264 +0800
++++ b/src/mm-broadband-modem.h	2026-10-13 15:25:47.640075691 +0800
+@@ -110,6 +110,11 @@
+      * storage only succeed for the storages it reported with +CPMS?, and
+      * without a command; any other storage is refused. */
+     gboolean sms_storages_fixed;
++
++    /* Vendor hook invoked before the generic +CGEV parser.  It observes the
++     * indication without consuming it, so generic detach handling remains. */
++    void (* cgev_received) (MMBroadbandModem *self,
++                            const gchar      *indication);
+ };
+ 
+ GType mm_broadband_modem_get_type (void);
+diff -ruN a/src/mm-modem-helpers.c b/src/mm-modem-helpers.c
+--- a/src/mm-modem-helpers.c	2026-10-13 15:27:03.128947881 +0800
++++ b/src/mm-modem-helpers.c	2026-10-13 15:39:07.765529997 +0800
+@@ -3957,7 +3957,7 @@
+     r = g_regex_new ("(?:"
+                      "NW ACT|ME ACT|"
+                      "NW DEACT|ME DEACT"
+-                     ")\\s*([0-9]+),\\s*([0-9]+),\\s*([0-9]+)", 0, 0, NULL);
++                     ")\\s*([0-9]+),\\s*([0-9]+)(?:,\\s*([0-9]+))?", 0, 0, NULL);
+ 
+     str = mm_strip_tag (str, "+CGEV:");
+     g_regex_match_full (r, str, strlen (str), 0, 0, &match_info, &inner_error);
+@@ -3979,9 +3979,18 @@
+         goto out;
+     }
+ 
+-    if (out_event_type && !mm_get_uint_from_match_info (match_info, 3, &event_type)) {
+-        inner_error = g_error_new (MM_CORE_ERROR, MM_CORE_ERROR_FAILED, "Error parsing event type");
+-        goto out;
++    if (out_event_type) {
++        gint start = -1;
++        gint end = -1;
++
++        /* Unisoc also emits the abbreviated "NW ACT <p_cid>,<cid>".
++         * Treat its omitted event type as zero instead of rejecting the whole
++         * bearer notification. */
++        if (g_match_info_fetch_pos (match_info, 3, &start, &end) && start >= 0 &&
++            !mm_get_uint_from_match_info (match_info, 3, &event_type)) {
++            inner_error = g_error_new (MM_CORE_ERROR, MM_CORE_ERROR_FAILED, "Error parsing event type");
++            goto out;
++        }
+     }
+ 
+ out:
+diff -ruN a/src/plugins/unisoc/mm-broadband-modem-unisoc.c b/src/plugins/unisoc/mm-broadband-modem-unisoc.c
+--- a/src/plugins/unisoc/mm-broadband-modem-unisoc.c	2026-10-12 19:54:34.932193144 +0800
++++ b/src/plugins/unisoc/mm-broadband-modem-unisoc.c	2026-10-13 15:26:12.780848258 +0800
+@@ -113,6 +113,43 @@
+                         G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM_MESSAGING, iface_modem_messaging_init)
+                         G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM_VOICE, iface_modem_voice_init))
+ 
++
++#define UNISOC_BEARER_EVENT_FIFO "/run/modemmanager-unisoc-bearer.events"
++
++static void
++unisoc_bearer_event (const gchar *kind,
++                      const gchar *text)
++{
++    g_autofree gchar *line = NULL;
++    int               fd;
++
++    /* The netifd monitor owns this FIFO.  O_NONBLOCK means modem handling can
++     * never wait for a reader during boot, teardown or an interface restart. */
++    fd = open (UNISOC_BEARER_EVENT_FIFO, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
++    if (fd < 0)
++        return;
++    line = g_strdup_printf ("%s %s\n", kind, text ? text : "");
++    (void) write (fd, line, strlen (line));
++    close (fd);
++}
++
++static void
++unisoc_cgev_received (MMBroadbandModem *self,
++                       const gchar      *indication)
++{
++    unisoc_bearer_event ("cgev", indication);
++}
++
++static void
++sppcodata_received (MMPortSerialAt *port,
++                      GMatchInfo     *match_info,
++                      gpointer        user_data)
++{
++    g_autofree gchar *indication = NULL;
++
++    indication = g_match_info_fetch (match_info, 1);
++    unisoc_bearer_event ("sppcodata", indication);
++}
+ static MMBroadbandModemUnisocPrivate *
+ get_private (gpointer self)
+ {
+@@ -1167,6 +1204,7 @@
+     g_autoptr(GRegex) csq = NULL;
+     g_autoptr(GRegex) vendor = NULL;
+     g_autoptr(GRegex) call = NULL;
++    g_autoptr(GRegex) sppcodata = NULL;
+ 
+     MM_BROADBAND_MODEM_CLASS (mm_broadband_modem_unisoc_parent_class)->setup_ports (self);
+ 
+@@ -1198,8 +1236,13 @@
+                           G_REGEX_RAW | G_REGEX_OPTIMIZE, 0, NULL);
+     call = g_regex_new ("\\r\\n\\^(ORIG|CONF|CONN|CEND|DSCI):[^\\r\\n]*\\r\\n",
+                         G_REGEX_RAW | G_REGEX_OPTIMIZE, 0, NULL);
++    sppcodata = g_regex_new ("\\r\\n\\+SPPCODATA:[[:space:]]*([^\\r\\n]*)\\r\\n",
++                             G_REGEX_RAW | G_REGEX_OPTIMIZE, 0, NULL);
+     mm_port_serial_at_add_unsolicited_msg_handler (primary, vendor, NULL, NULL, NULL);
+     mm_port_serial_at_add_unsolicited_msg_handler (primary, call, NULL, NULL, NULL);
++    /* Added last so this specific handler runs before the broad vendor sink. */
++    mm_port_serial_at_add_unsolicited_msg_handler (primary, sppcodata,
++                                                   sppcodata_received, self, NULL);
+ }
+ 
+ /*****************************************************************************/
+@@ -1926,6 +1969,7 @@
+ 
+     G_OBJECT_CLASS (klass)->dispose = unisoc_dispose;
+     broadband_modem_class->setup_ports = setup_ports;
++    broadband_modem_class->cgev_received = unisoc_cgev_received;
+     broadband_modem_class->initialization_started = initialization_started;
+     broadband_modem_class->initialization_started_finish = initialization_started_finish;
+     broadband_modem_class->initialization_stopped = initialization_stopped;
+diff -ruN a/src/tests/test-modem-helpers.c b/src/tests/test-modem-helpers.c
+--- a/src/tests/test-modem-helpers.c	2026-10-13 15:27:03.128947881 +0800
++++ b/src/tests/test-modem-helpers.c	2026-10-13 15:27:03.128947881 +0800
+@@ -2197,6 +2197,8 @@
+ 
+     { "NW ACT 3, 2, 1",                         MM_3GPP_CGEV_NW_ACT_SECONDARY,   NULL, NULL,              2, 3, 1 },
+     { "+CGEV: NW ACT 3, 2, 1",                  MM_3GPP_CGEV_NW_ACT_SECONDARY,   NULL, NULL,              2, 3, 1 },
++    { "NW ACT 11, 17",                          MM_3GPP_CGEV_NW_ACT_SECONDARY,   NULL, NULL,             17,11, 0 },
++    { "+CGEV: NW ACT 11, 18",                   MM_3GPP_CGEV_NW_ACT_SECONDARY,   NULL, NULL,             18,11, 0 },
+ 
+     { "NW DEACT 3, 2, 1",                       MM_3GPP_CGEV_NW_DEACT_SECONDARY, NULL, NULL,              2, 3, 1 },
+     { "+CGEV: NW DEACT 3, 2, 1",                MM_3GPP_CGEV_NW_DEACT_SECONDARY, NULL, NULL,              2, 3, 1 },

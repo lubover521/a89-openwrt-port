@@ -1,0 +1,19 @@
+[Unit]
+Description=E5 NAT and firewall for the LAN (br0) and the uplink
+Documentation=file:///usr/share/doc/e5-linux/README.md
+# After the baseband link exists, but it does not have to wait for it: the rule
+# only matches packets while sipa_eth0 is up.  (It used to Want unisoc-cpd;
+# that would now stop ModemManager's AT port, e5-sipc-wwan.service.)
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/e5/nat.nft
+ExecStop=/usr/sbin/nft delete table ip e5nat
+ExecStop=-/usr/sbin/nft delete table inet e5fw6
+ExecStop=-/usr/sbin/nft delete table inet e5in
+ExecStop=-/usr/sbin/nft delete table bridge e5mgmt
+
+[Install]
+WantedBy=multi-user.target

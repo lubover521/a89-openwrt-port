@@ -1,0 +1,514 @@
+{
+  "source_repository": "sprd-linux-devs/e5-linux",
+  "source_commit": "b7282af",
+  "files": {
+    "rootfs/overlay/etc/NetworkManager/conf.d/50-e5.conf": {
+      "path": "overlay/etc/NetworkManager/conf.d/50-e5.conf",
+      "source_sha256": "4e80c69441db69cc103d54c18ff874664c069ca9d468b91783d341f2d4454887"
+    },
+    "rootfs/overlay/etc/NetworkManager/dispatcher.d/50-e5-ipv6-share": {
+      "path": "overlay/etc/NetworkManager/dispatcher.d/50-e5-ipv6-share",
+      "source_sha256": "6256593e6ddf1fd983346ad847343e2c2daa03b6664d35f79b1e175753aed469"
+    },
+    "rootfs/overlay/etc/apt/sources.list.d/debian.sources": {
+      "path": "overlay/etc/apt/sources.list.d/debian.sources",
+      "source_sha256": "0a740ac8fd8b67e44d3694282461597f2e5e373f5ab8dc6d6415c815fbc3f3bd"
+    },
+    "rootfs/overlay/etc/dnsmasq.d/e5-hotspot.conf": {
+      "path": "overlay/etc/dnsmasq.d/e5-hotspot.conf",
+      "source_sha256": "ee6796a12e7cd895f4a8d5f9644caef404b06eb4e7ffe0e3e7f624fc6747b324"
+    },
+    "rootfs/overlay/etc/e5/mobile-data.conf": {
+      "path": "overlay/etc/e5/mobile-data.conf",
+      "source_sha256": "7ef42cdaa945a4b57cdfd8be9e5a5e72b2e3337743cab4344f34f95326c00998"
+    },
+    "rootfs/overlay/etc/e5/nat.nft": {
+      "path": "overlay/etc/e5/nat.nft",
+      "source_sha256": "9e69665d9bdc039bb5537b08b0d2319d3fe2ce10670a57f882d151dc03020b05"
+    },
+    "rootfs/overlay/etc/e5linux/default-boot": {
+      "path": "overlay/etc/e5linux/default-boot",
+      "source_sha256": "d745fba1cb70ab9dc02a80eeba8a1864a0f32b2941e008c0af389be7b56ba830"
+    },
+    "rootfs/overlay/etc/environment": {
+      "path": "overlay/etc/environment",
+      "source_sha256": "58442b4ee4a69c06c34a94f83d5f34d35e0c833e7be76582f1e10253a369da95"
+    },
+    "rootfs/overlay/etc/fstab": {
+      "path": "overlay/etc/fstab",
+      "source_sha256": "7ba046750645f75782c03c366266786f4ed889a1cfdb226c70a808123b1780cb"
+    },
+    "rootfs/overlay/etc/modprobe.d/e5-audio.conf": {
+      "path": "overlay/etc/modprobe.d/e5-audio.conf",
+      "source_sha256": "e8ae574e1de21ce73319cfd140e7651e12deeaace2677b37f6752f5f62315961"
+    },
+    "rootfs/overlay/etc/pam.d/phosh": {
+      "path": "overlay/etc/pam.d/phosh",
+      "source_sha256": "7ffc62fe1666d69c076b5be6278e52ba66c8a81991d85adc1e5607af2fd71df9"
+    },
+    "rootfs/overlay/etc/sysctl.d/10-e5-forward.conf": {
+      "path": "overlay/etc/sysctl.d/10-e5-forward.conf",
+      "source_sha256": "49431ed7774f578d46de0c35e80a9400527f2faa159ed60612884255db503e6d"
+    },
+    "rootfs/overlay/etc/sysctl.d/10-e5-printk.conf": {
+      "path": "overlay/etc/sysctl.d/10-e5-printk.conf",
+      "source_sha256": "0800feedccf9354ad4486c524d4833744f59b70e9cca2204f693aebea370d232"
+    },
+    "rootfs/overlay/etc/sysctl.d/10-e5-zram.conf": {
+      "path": "overlay/etc/sysctl.d/10-e5-zram.conf",
+      "source_sha256": "968e7cf320d6ed3d384edfa3019b16fe25d4b8a12314d42bfc013381f6339b93"
+    },
+    "rootfs/overlay/etc/systemd/logind.conf.d/10-e5-power.conf": {
+      "path": "overlay/etc/systemd/logind.conf.d/10-e5-power.conf",
+      "source_sha256": "851c70a6e3b7e9bf0d4480032973ca35d1f10eb5d77388996fc4de3903c7aee9"
+    },
+    "rootfs/overlay/etc/systemd/network/10-e5-sipa-eth.link": {
+      "path": "overlay/etc/systemd/network/10-e5-sipa-eth.link",
+      "source_sha256": "ad53d8ef3374f9783e9c5063f6438a2ea559521de14cb03a7dc2aa9ef7163df7"
+    },
+    "rootfs/overlay/etc/systemd/network/10-e5-usb0.network": {
+      "path": "overlay/etc/systemd/network/10-e5-usb0.network",
+      "source_sha256": "412eaeb9c6fe67a9d67d0f64e9be7f82f5c0d748b7edd996d426d67984833a1c"
+    },
+    "rootfs/overlay/etc/systemd/network/20-e5-wlan0.network": {
+      "path": "overlay/etc/systemd/network/20-e5-wlan0.network",
+      "source_sha256": "d3a2a4684f05d5580af6b358c133c0f8a88183081842c69460915f9288277eac"
+    },
+    "rootfs/overlay/etc/systemd/sleep.conf.d/10-e5-no-suspend.conf": {
+      "path": "overlay/etc/systemd/sleep.conf.d/10-e5-no-suspend.conf",
+      "source_sha256": "2d05a9bac6a9db0a717d80c642191330a7a69e3c8c4d97418bdef7305987b928"
+    },
+    "rootfs/overlay/etc/systemd/system.conf.d/10-e5-fast-shutdown.conf": {
+      "path": "overlay/etc/systemd/system.conf.d/10-e5-fast-shutdown.conf",
+      "source_sha256": "9861f79415b504a0141b70eb95c1a8510b9d556e992f578f128d9de7cdfa699c"
+    },
+    "rootfs/overlay/etc/systemd/system.conf.d/10-e5-watchdog.conf": {
+      "path": "overlay/etc/systemd/system.conf.d/10-e5-watchdog.conf",
+      "source_sha256": "6e1c685917f8cdd057a8ee3e657f5ad83ed6350b3f8003573aaf4af7965bbc41"
+    },
+    "rootfs/overlay/etc/systemd/system/ModemManager.service.d/50-e5.conf": {
+      "path": "overlay/etc/systemd/system/ModemManager.service.d/50-e5.conf",
+      "source_sha256": "06b1eb228c44d5a9a98a7474f7facc39e800f9de52720bc7ede1a0740dde5725"
+    },
+    "rootfs/overlay/etc/systemd/system/NetworkManager-wait-online.service.d/50-e5.conf": {
+      "path": "overlay/etc/systemd/system/NetworkManager-wait-online.service.d/50-e5.conf",
+      "source_sha256": "e9f19f81314cfdeacee037d16916f93d90e43e70fb654b7472bda76ab137415f"
+    },
+    "rootfs/overlay/etc/systemd/system/alsa-restore.service": {
+      "path": "overlay/etc/systemd/system/alsa-restore.service",
+      "source_sha256": "96e86d9578b3317e0b82992d5ba3b39027a91f9764f12b5b6ec08b0d2a587716"
+    },
+    "rootfs/overlay/etc/systemd/system/dnsmasq.service": {
+      "path": "overlay/etc/systemd/system/dnsmasq.service",
+      "source_sha256": "d164e37b5702a6a3c941a50e7b71e896608c0b4d9ee7d87d0da97370f1c0f5d2"
+    },
+    "rootfs/overlay/etc/systemd/system/e5-atd.service": {
+      "path": "overlay/etc/systemd/system/e5-atd.service",
+      "source_sha256": "7efb994d085ab5e836345801bbaa07dcd7b22e76973553264146defd54d2b187"
+    },
+    "rootfs/overlay/etc/systemd/system/e5-audio.service": {
+      "path": "overlay/etc/systemd/system/e5-audio.service",
+      "source_sha256": "2795b33c8180672ee89c31b1b27b7ec38f0b1038d3eb86a444e52bd859a82ddf"
+    },
+    "rootfs/overlay/etc/systemd/system/e5-bearer-up.service": {
+      "path": "overlay/etc/systemd/system/e5-bearer-up.service",
+      "source_sha256": "17e93f9f8523986506959adabc9123a70973b23d96f4ac1c4d7f915a2b26f79c"
+    },
+    "rootfs/overlay/etc/systemd/system/e5-bearer-watch.service": {
+      "path": "overlay/etc/systemd/system/e5-bearer-watch.service",
+      "source_sha256": "c815cad7c1d5714f7a9c409bcbc2059b0347b7812b0b9cfc086fbda8fdbdac9a"
+    },
+    "rootfs/overlay/etc/systemd/system/e5-bearer-watch.timer": {
+      "path": "overlay/etc/systemd/system/e5-bearer-watch.timer",
+      "source_sha256": "b5fb582e0543a233ae2d14d562a751db9f64007e3a4907cd0066c9703a0ea745"
+    },
+    "rootfs/overlay/etc/systemd/system/e5-boot-ok.service": {
+      "path": "overlay/etc/systemd/system/e5-boot-ok.service",
+      "source_sha256": "d5e88633cc2a0ddbe958c23b7b943fcadc784532a6d57d40b48e44b4cbc6ff28"
+    },
+    "rootfs/overlay/etc/systemd/system/e5-bt-attach.service": {
+      "path": "overlay/etc/systemd/system/e5-bt-attach.service",
+      "source_sha256": "678f80e6b24effa67e10c09e96024f1e01a14b39f6251c6c27a71144886c62a4"
+    },
+    "rootfs/overlay/etc/systemd/system/e5-cp_diskserver.service": {
+      "path": "overlay/etc/systemd/system/e5-cp_diskserver.service",
+      "source_sha256": "3d1d3ea775b15cdbfc1ab6d33d8fef4a5e63e15105f6bf021966da8005ef9237"
+    },
+    "rootfs/overlay/etc/systemd/system/e5-fixups.service": {
+      "path": "overlay/etc/systemd/system/e5-fixups.service",
+      "source_sha256": "6d37f31a3138b3423f5dbc680e0890d2fbdcf9fca1ce53b25a3ac955ce3f7171"
+    },
+    "rootfs/overlay/etc/systemd/system/e5-gadget-guard.service": {
+      "path": "overlay/etc/systemd/system/e5-gadget-guard.service",
+      "source_sha256": "d840d095a29065c5922f633e6be29f1ff0ceb2c66fdfe5149174f844d41c33df"
+    },
+    "rootfs/overlay/etc/systemd/system/e5-mobile-data-watch.service": {
+      "path": "overlay/etc/systemd/system/e5-mobile-data-watch.service",
+      "source_sha256": "e1ceab9204ef2d4efde415450fc5ebbbbba1a50b9f4b50c2494bfe0262f1cd0d"
+    },
+    "rootfs/overlay/etc/systemd/system/e5-mobile-data.service": {
+      "path": "overlay/etc/systemd/system/e5-mobile-data.service",
+      "source_sha256": "3a92ca4c0bb9c1a4866c8c23820c1d8a958ec96837813e5c1768719b771bf29e"
+    },
+    "rootfs/overlay/etc/systemd/system/e5-nat.service": {
+      "path": "overlay/etc/systemd/system/e5-nat.service",
+      "source_sha256": "398e240add3b9c952277109c73c45a7820ebada5404264ad24f1ed49ab7a0125"
+    },
+    "rootfs/overlay/etc/systemd/system/e5-net-bridge.service": {
+      "path": "overlay/etc/systemd/system/e5-net-bridge.service",
+      "source_sha256": "762e36eb8ccb82214d9dbe1585eff3f6f5150e0a0c60d6c03ecb60a3d728f76d"
+    },
+    "rootfs/overlay/etc/systemd/system/e5-refnotify.service": {
+      "path": "overlay/etc/systemd/system/e5-refnotify.service",
+      "source_sha256": "cd1113cffa6b23ed214f1079a8b9025ee6705a0c3fc20bb3fbd0bc4547e1d070"
+    },
+    "rootfs/overlay/etc/systemd/system/e5-regdb-load.service": {
+      "path": "overlay/etc/systemd/system/e5-regdb-load.service",
+      "source_sha256": "138bb3f25db42c7af16689bd998444ae68e3814b61de5f7d39e641ea9bfd057e"
+    },
+    "rootfs/overlay/etc/systemd/system/e5-sipc-wwan.service": {
+      "path": "overlay/etc/systemd/system/e5-sipc-wwan.service",
+      "source_sha256": "fa960edfe38274a6cc98bfb94d2e0bb5d430846913c191cc530030c94095a7b0"
+    },
+    "rootfs/overlay/etc/systemd/system/e5-telnetd.service": {
+      "path": "overlay/etc/systemd/system/e5-telnetd.service",
+      "source_sha256": "c2da9e0d952c2a478b5e32a51438204ec0ff60aaa95d1e488d1c1d22ea87b7b5"
+    },
+    "rootfs/overlay/etc/systemd/system/e5-usb-watch.service": {
+      "path": "overlay/etc/systemd/system/e5-usb-watch.service",
+      "source_sha256": "0419e85ed01b4ca1935cb75a9199eab3277120d71c44369096b4c1c35dcc4fe6"
+    },
+    "rootfs/overlay/etc/systemd/system/e5-vendor.service": {
+      "path": "overlay/etc/systemd/system/e5-vendor.service",
+      "source_sha256": "dd6c09b27de3cffc18a43fea24f9c033e0c921cd32593ee47f6a1d2da27093fe"
+    },
+    "rootfs/overlay/etc/systemd/system/e5-zram.service": {
+      "path": "overlay/etc/systemd/system/e5-zram.service",
+      "source_sha256": "5667770403484259fe04aa306027310adab1a2a357dd8c6a4ef04419c9d98adb"
+    },
+    "rootfs/overlay/etc/systemd/system/getty@ttyGS0.service.d/10-e5.conf": {
+      "path": "overlay/etc/systemd/system/getty@ttyGS0.service.d/10-e5.conf",
+      "source_sha256": "3a17f9780a30ecc7708797cdfc106bf9df2d0503eb25db30030dad42dc09d487"
+    },
+    "rootfs/overlay/etc/systemd/system/gotty.service": {
+      "path": "overlay/etc/systemd/system/gotty.service",
+      "source_sha256": "3801e9920e7dd1403ed51e16c6ab3a85e2261c4712f2914a8975002eb26b76e3"
+    },
+    "rootfs/overlay/etc/systemd/system/systemd-networkd-wait-online.service.d/10-e5.conf": {
+      "path": "overlay/etc/systemd/system/systemd-networkd-wait-online.service.d/10-e5.conf",
+      "source_sha256": "22d1157fe48d777dc2929827297d57f37016d174bb49a407f321c7b69353301f"
+    },
+    "rootfs/overlay/etc/systemd/system/ufi-tools.service": {
+      "path": "overlay/etc/systemd/system/ufi-tools.service",
+      "source_sha256": "b9f768ed53986ca2abde7242a11a46516c7c293892da77b1a339140a2e405ee5"
+    },
+    "rootfs/overlay/etc/systemd/user/e5-capture.service": {
+      "path": "overlay/etc/systemd/user/e5-capture.service",
+      "source_sha256": "a8765d87c0580b8199b9ee5e40141a70f21425b42c4d6bd83b39094b8c0d5970"
+    },
+    "rootfs/overlay/etc/tmpfiles.d/e5-rcu.conf": {
+      "path": "overlay/etc/tmpfiles.d/e5-rcu.conf",
+      "source_sha256": "1ba35f0a055e9bad9b29c6912cbf2b85012cf2e6d3e6e08f80d459e17219b9e0"
+    },
+    "rootfs/overlay/etc/udev/rules.d/60-e5-dma-heap.rules": {
+      "path": "overlay/etc/udev/rules.d/60-e5-dma-heap.rules",
+      "source_sha256": "c9a2a3ab5864a4a6a003e02c31fe64b88db4b1157905ded460e315a9399ff807"
+    },
+    "rootfs/overlay/etc/udev/rules.d/78-e5-mm-sipc.rules": {
+      "path": "overlay/etc/udev/rules.d/78-e5-mm-sipc.rules",
+      "source_sha256": "0942960e774c1ee2915984add9d2cfa662bb1bcb3906dac97154e5676ee0340b"
+    },
+    "rootfs/overlay/etc/udev/rules.d/79-e5-voice-pipe.rules": {
+      "path": "overlay/etc/udev/rules.d/79-e5-voice-pipe.rules",
+      "source_sha256": "b355f1118c2269431d65c17732becdeec6c74ac399a95cfabfe5268cb27552e0"
+    },
+    "rootfs/overlay/etc/udev/rules.d/90-alsa-restore.rules": {
+      "path": "overlay/etc/udev/rules.d/90-alsa-restore.rules",
+      "source_sha256": "4257db4d64acc2b6dc453f9630621afbed766e7dfd3c727bec44fbaecac5f022"
+    },
+    "rootfs/overlay/etc/unisoc-cpd/BASEBAND-CONTRACTS.md": {
+      "path": "overlay/etc/unisoc-cpd/BASEBAND-CONTRACTS.md",
+      "source_sha256": "34c587095125a33494e573440ac96a007cc479f9f411d6c068761f85fa904344"
+    },
+    "rootfs/overlay/etc/unisoc-cpd/README.md": {
+      "path": "overlay/etc/unisoc-cpd/README.md",
+      "source_sha256": "ad9bf24e526a36293179076586350532da00a9d12b090a8233910abf36e072c1"
+    },
+    "rootfs/overlay/etc/unisoc-cpd/VERSION": {
+      "path": "overlay/etc/unisoc-cpd/VERSION",
+      "source_sha256": "58f923abf2615fba270acb8dea8c65f252e31a3884d381de796ccf484b283ae3"
+    },
+    "rootfs/overlay/etc/unisoc-cpd/mu300.toml": {
+      "path": "overlay/etc/unisoc-cpd/mu300.toml",
+      "source_sha256": "c9aac68b88cd58789c19ff44ba18a050d2aee2b47dba5fe14562d3daa6857d9e"
+    },
+    "rootfs/overlay/mnt/vendor/wcn/.keep": {
+      "path": "overlay/mnt/vendor/wcn/.keep",
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "rootfs/overlay/usr/bin/ufi-tools": {
+      "path": "overlay/usr/bin/ufi-tools",
+      "source_sha256": "163ecd3a54af58c49c86714d6fb3d155969d51ad33467a59a117b5b17c74cc1a"
+    },
+    "rootfs/overlay/usr/bin/ufi_req": {
+      "path": "overlay/usr/bin/ufi_req",
+      "source_sha256": "3134916fd7700cc0691354131b6194613e1b55cdf603600af6147f62df354fc4"
+    },
+    "rootfs/overlay/usr/lib/NetworkManager/system-connections/Mobile.nmconnection": {
+      "path": "overlay/usr/lib/NetworkManager/system-connections/Mobile.nmconnection",
+      "source_sha256": "06af3a511217a1e603001c1de6450a8ff492995c01d913eb3aa96a9970283e00"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/__init__.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/__init__.py",
+      "source_sha256": "514b8fc3e7899f8f529ae101ae09af33d53398cfdbc74ee4970c55546bdf7062"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/__main__.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/__main__.py",
+      "source_sha256": "803a11bd1a4b3a000c99301f552c28638f72a22ae2bb1673f9e87024fb57b58f"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/api/__init__.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/api/__init__.py",
+      "source_sha256": "a60c5d68eecec76369e50c1b5a50bbd1625d11d66edd7d4f9506dc5012ac9ce7"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/api/at_api.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/api/at_api.py",
+      "source_sha256": "14eb481bcf504b432d422bd8bac99d89620d8c300d86024cea6c8b6cb24882b1"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/api/base.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/api/base.py",
+      "source_sha256": "8c6778ecd0666a000df23e15bab6df98b6c9d0f2eb22aa2bec676a13a943c770"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/api/config_api.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/api/config_api.py",
+      "source_sha256": "cd903c36ef62faf0507e136f9e5d6423b6ad7997e9b5c644460daf382834aa43"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/api/control_api.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/api/control_api.py",
+      "source_sha256": "3c2b857fb8dd27fbffe2ef2284cf990e1d09079145cfaf435d7cf671f5555562"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/api/media_api.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/api/media_api.py",
+      "source_sha256": "1d9e9816afbe4a97156814884808f287e41d62dacea751a76e52a15fd9bdfe10"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/api/misc_api.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/api/misc_api.py",
+      "source_sha256": "0cab293d11ebe191882ad8d194fa6657095c17571d80b4f64378df0438c74f38"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/api/proxy_api.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/api/proxy_api.py",
+      "source_sha256": "977159714f6b71dcf4ca455fb5929bc556145375646e149dfb40cf527d855f93"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/api/shell_api.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/api/shell_api.py",
+      "source_sha256": "a910b571c3fe94891100f713713cc4c9b6213d9fa1e94b0d2ed5e198d9f23f18"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/api/task_api.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/api/task_api.py",
+      "source_sha256": "6de963dad172917e8b60ae74d62a81f2e14d82cf177e5287471250b21d7aed56"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/api/ui_compat.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/api/ui_compat.py",
+      "source_sha256": "5dcd4f92c77111e7155fc87dbd7657ec3fcc61dafb963ec96876d2769a0c77d5"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/app.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/app.py",
+      "source_sha256": "436e2d1b3774b51a634b11db0b1a4ea87522f9e9d5ffc9454f7846cd79365a17"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/at.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/at.py",
+      "source_sha256": "c8abeaa3388a7367e2c2aab0f8657b2ef82dffec4a0a5d723ae3abd791ca7fa9"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/auth.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/auth.py",
+      "source_sha256": "faf27845f66d9646f4486258cbf691fc140a9d1a826d76f3977dfd7f9804ef95"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/cli.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/cli.py",
+      "source_sha256": "abce5399ed1bd8b3d9838f9ba024947b501efc9b794eb4473ffc0e5b1b1115a3"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/config.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/config.py",
+      "source_sha256": "9828a92965132bbc7bc94e5fe41fad5bc5b5054654809a5d5aeba0d3917c531f"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/control.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/control.py",
+      "source_sha256": "62341cb44f2d2d8ba5b50aaf177e82b94bceb2b3e6172db1645b23d5906ea62b"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/forward.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/forward.py",
+      "source_sha256": "f4bdb6bbc809e12e7afbafd853644d264db185cff6685e990db65c91788368b9"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/httpd.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/httpd.py",
+      "source_sha256": "53136f8495d683159ef99af0f6c021a9a146c4d31fd0a29211622c1d4de3d129"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/modem.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/modem.py",
+      "source_sha256": "035e4cf5c2b22d379573c3f84a97ec32a1210755b3d22f49a2217ccb4b41551f"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/req.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/req.py",
+      "source_sha256": "5c9c42302f316e6eb0f2bec6986ec4f376196e7a1490f83861cf38a9df266491"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/shell.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/shell.py",
+      "source_sha256": "185266448972620faa0aca0767552791caec9bfa4efd0e98fdf0707f54cb0527"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/store.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/store.py",
+      "source_sha256": "fb43693601486b8fcc2aa5231c16a86a8a3148c664d00b5945777a3cd191feac"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/sysinfo.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/sysinfo.py",
+      "source_sha256": "da88ff54b098b0e257d91efdce7dc90f05ced20aa807e84093014ecfae14dc96"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/tasks.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/tasks.py",
+      "source_sha256": "af72cdd3b43dec159b61036b37d83913974ba321692aa32490293a81d12ccf5a"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/traffic.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/traffic.py",
+      "source_sha256": "075abd1e278ccd0c7fb5b1e7167670f8b04a358aaf834ece0630a22833fe46b9"
+    },
+    "rootfs/overlay/usr/lib/ufi-tools/ufitools/uifields.py": {
+      "path": "overlay/usr/lib/ufi-tools/ufitools/uifields.py",
+      "source_sha256": "bccd6a302bfd27725fac6aef5a1b489d452a17c406390df057fef15e3f11aa15"
+    },
+    "rootfs/overlay/usr/local/bin/gotty": {
+      "path": "overlay/usr/local/bin/gotty",
+      "source_sha256": "e2e1b868cfecda63402ae56c22f0414e367a04cf1d3f16c02cae6cd68fd911aa"
+    },
+    "rootfs/overlay/usr/local/bin/unisoc-cpd": {
+      "path": "overlay/usr/local/bin/unisoc-cpd",
+      "source_sha256": "cac93f535230a4bfd2a2eb2c1d2dd0714270c3a7732f9b79afd46012be53c4db"
+    },
+    "rootfs/overlay/usr/local/sbin/e5-boot-ok": {
+      "path": "overlay/usr/local/sbin/e5-boot-ok",
+      "source_sha256": "b3d56edec255e37468e7e4d24f0e981015180347d9cfc557b97a9220d9f48554"
+    },
+    "rootfs/overlay/usr/local/sbin/e5-debian-update": {
+      "path": "overlay/usr/local/sbin/e5-debian-update",
+      "source_sha256": "846e2371835580d2cf96a8c7fc837cd594d64610e5badefad15b4af5d132a75b"
+    },
+    "rootfs/overlay/usr/local/sbin/e5-zram": {
+      "path": "overlay/usr/local/sbin/e5-zram",
+      "source_sha256": "e4e2ca7ced38a668928b567352f5efa13de7c005246a55be51b3fabc4e69282f"
+    },
+    "rootfs/overlay/usr/share/dbus-1/services/org.mobian_project.CallAudio.service": {
+      "path": "overlay/usr/share/dbus-1/services/org.mobian_project.CallAudio.service",
+      "source_sha256": "559295e4c9f2685bb4ab55e14fee251a1207ebd7060022ae78a211079c822109"
+    },
+    "rootfs/overlay/usr/share/doc/ufi-tools/README.md": {
+      "path": "overlay/usr/share/doc/ufi-tools/README.md",
+      "source_sha256": "0c7ee932e6734f62071da05740251aaa88ced5c637bdf188f97ea58d39b0a470"
+    },
+    "rootfs/overlay/usr/share/ufi-tools/www-linux/ufi-linux-shim.js": {
+      "path": "overlay/usr/share/ufi-tools/www-linux/ufi-linux-shim.js",
+      "source_sha256": "99e20da62c94d1fc82ba94f4e276040f6c2cc4a572a513a6155cb57934a79d90"
+    },
+    "rootfs/overlay/usr/share/ufi-tools/www/favicon.webp": {
+      "path": "overlay/usr/share/ufi-tools/www/favicon.webp",
+      "source_sha256": "f50d36d311237aa1775e11686091c522cc150a3fa21d9aaff451e5c27ed9ee52"
+    },
+    "rootfs/overlay/usr/share/ufi-tools/www/icons/icon-192.webp": {
+      "path": "overlay/usr/share/ufi-tools/www/icons/icon-192.webp",
+      "source_sha256": "9769c3a6621b448b69d8c88a0c6b0a5a2f15446db691da791bf6f75308070011"
+    },
+    "rootfs/overlay/usr/share/ufi-tools/www/icons/icon-512.webp": {
+      "path": "overlay/usr/share/ufi-tools/www/icons/icon-512.webp",
+      "source_sha256": "f50d36d311237aa1775e11686091c522cc150a3fa21d9aaff451e5c27ed9ee52"
+    },
+    "rootfs/overlay/usr/share/ufi-tools/www/img/donate.jpg": {
+      "path": "overlay/usr/share/ufi-tools/www/img/donate.jpg",
+      "source_sha256": "ff3dfcfdee1735c2a345e1287077c1859bd7ce49f3abda1b5b08b6528b80022b"
+    },
+    "rootfs/overlay/usr/share/ufi-tools/www/index.html": {
+      "path": "overlay/usr/share/ufi-tools/www/index.html",
+      "source_sha256": "48983604cadf8c338c61f489ba2fb6ebe2580c84bb0ca1d68d22f442fe77cf74"
+    },
+    "rootfs/overlay/usr/share/ufi-tools/www/lang/en.json": {
+      "path": "overlay/usr/share/ufi-tools/www/lang/en.json",
+      "source_sha256": "22853c8b0d0226bdf631befada014849fa5d0c41b391c45ad35cb8b552acd9cb"
+    },
+    "rootfs/overlay/usr/share/ufi-tools/www/lang/ja.json": {
+      "path": "overlay/usr/share/ufi-tools/www/lang/ja.json",
+      "source_sha256": "fb4f4e887b12f3dd2e5e4490bfa5fa43562cc5946588e1e594259b2410861a90"
+    },
+    "rootfs/overlay/usr/share/ufi-tools/www/lang/vi.json": {
+      "path": "overlay/usr/share/ufi-tools/www/lang/vi.json",
+      "source_sha256": "255d8dbde079d98f5317a41200be6800d4333e3392056c31955a372edb0022ab"
+    },
+    "rootfs/overlay/usr/share/ufi-tools/www/lang/zh.json": {
+      "path": "overlay/usr/share/ufi-tools/www/lang/zh.json",
+      "source_sha256": "d83065f4e2f569940a3a79bc809aa30b7be6c81a166987f35f95b5f6e922b22d"
+    },
+    "rootfs/overlay/usr/share/ufi-tools/www/manifest.json": {
+      "path": "overlay/usr/share/ufi-tools/www/manifest.json",
+      "source_sha256": "b2d42ea5bed5a80b326d3db213a76933f0b22f2ece0feee8591df1e3634a3743"
+    },
+    "rootfs/overlay/usr/share/ufi-tools/www/robots.txt": {
+      "path": "overlay/usr/share/ufi-tools/www/robots.txt",
+      "source_sha256": "633b9a99b105e86a49242f916b070566f4a4448139d8accf0e613b3b8b3bc4c9"
+    },
+    "rootfs/overlay/usr/share/ufi-tools/www/script/charts.js": {
+      "path": "overlay/usr/share/ufi-tools/www/script/charts.js",
+      "source_sha256": "61ea3b7aafc30d278161d605040787dfdaa6fb03e1b4b92e8388905b1b37015d"
+    },
+    "rootfs/overlay/usr/share/ufi-tools/www/script/draglist.js": {
+      "path": "overlay/usr/share/ufi-tools/www/script/draglist.js",
+      "source_sha256": "5017ab0324c45d0e202735a0d43cf3cca0ff740b134ba1e043bbcdde469118d2"
+    },
+    "rootfs/overlay/usr/share/ufi-tools/www/script/i18n.js": {
+      "path": "overlay/usr/share/ufi-tools/www/script/i18n.js",
+      "source_sha256": "45b6fbd93ffe29c5f3098e3d27412c6300ab632e43753e86896733b88faa187e"
+    },
+    "rootfs/overlay/usr/share/ufi-tools/www/script/lib/chart.js": {
+      "path": "overlay/usr/share/ufi-tools/www/script/lib/chart.js",
+      "source_sha256": "bce154080959c574be0bb6b1a924ff32f08ebc6ff460c159171f51c53802c844"
+    },
+    "rootfs/overlay/usr/share/ufi-tools/www/script/lib/crypto.js": {
+      "path": "overlay/usr/share/ufi-tools/www/script/lib/crypto.js",
+      "source_sha256": "eb95161654a150000bf4dc760d7a9cfc8dfe32d475efcbd9fb079b9cac40574f"
+    },
+    "rootfs/overlay/usr/share/ufi-tools/www/script/lib/filesaver.js": {
+      "path": "overlay/usr/share/ufi-tools/www/script/lib/filesaver.js",
+      "source_sha256": "2a27a4490c4f22467d6564404ad524fa828869b5304d461da8ec5e7a1ca7f8e2"
+    },
+    "rootfs/overlay/usr/share/ufi-tools/www/script/lib/sortable.js": {
+      "path": "overlay/usr/share/ufi-tools/www/script/lib/sortable.js",
+      "source_sha256": "6a6fb8da98991d18c15f36b93058037e71486ffb4bb38f4857607fbf92218f07"
+    },
+    "rootfs/overlay/usr/share/ufi-tools/www/script/main.js": {
+      "path": "overlay/usr/share/ufi-tools/www/script/main.js",
+      "source_sha256": "f17bfd6b3946e4e2e97e0ba03eb7d8008f4eb8ad168faafdd017f3b6d33b8fbe"
+    },
+    "rootfs/overlay/usr/share/ufi-tools/www/script/polyfill.min.js": {
+      "path": "overlay/usr/share/ufi-tools/www/script/polyfill.min.js",
+      "source_sha256": "d36e5d7328268d21c6941039a7b6a15c7ed7414f60dbee72d2231d11ac9bdaf3"
+    },
+    "rootfs/overlay/usr/share/ufi-tools/www/script/requests.js": {
+      "path": "overlay/usr/share/ufi-tools/www/script/requests.js",
+      "source_sha256": "f244a05da23d527c47ecac45ea87ac10ef7abf67e817ae4c480ccb5a2305c879"
+    },
+    "rootfs/overlay/usr/share/ufi-tools/www/script/theme.js": {
+      "path": "overlay/usr/share/ufi-tools/www/script/theme.js",
+      "source_sha256": "e15484e3dae30961329dbc63d806848ccfb40e75095cf9b1463030ce9aa6a7d2"
+    },
+    "rootfs/overlay/usr/share/ufi-tools/www/script/utils.js": {
+      "path": "overlay/usr/share/ufi-tools/www/script/utils.js",
+      "source_sha256": "30374f3a611e5be7b831e5a34833d68d800a620cc53571077d678ad454734031"
+    },
+    "rootfs/overlay/usr/share/ufi-tools/www/service-worker.js": {
+      "path": "overlay/usr/share/ufi-tools/www/service-worker.js",
+      "source_sha256": "c5f01b696016ae9044cdf400f6d66649b3163801aef7008c4a89ba28c47deb8f"
+    },
+    "rootfs/overlay/usr/share/ufi-tools/www/style/style.css": {
+      "path": "overlay/usr/share/ufi-tools/www/style/style.css",
+      "source_sha256": "57b49eb69dd755919cc3a9f3aa6a439905886c978f3ad50fff8c298a48a2abbb"
+    },
+    "rootfs/overlay/var/lib/ufi-tools/config.json": {
+      "path": "overlay/var/lib/ufi-tools/config.json",
+      "source_sha256": "16893255209a34e334de4ab7649bbe2c6263c8fa9e37627a70f23144021821bc"
+    }
+  }
+}

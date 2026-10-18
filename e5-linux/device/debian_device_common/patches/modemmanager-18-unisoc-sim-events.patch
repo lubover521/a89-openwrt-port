@@ -1,0 +1,236 @@
+Description: Event-driven Unisoc SIM detection through the existing MM owner
+ Confirm ECIND type 3 with CPIN before using the existing SIM swap lifecycle.
+ Retain the AT port to receive insertion events while no SIM is installed.
+ No polling, radio resets or extra normal initialization commands.
+Author: e5-linux
+Forwarded: no
+
+--- a/src/plugins/unisoc/mm-broadband-modem-unisoc.c
++++ b/src/plugins/unisoc/mm-broadband-modem-unisoc.c
+@@ -98,6 +98,9 @@
+     guint voice_poll_id;
+     guint voice_event_id;
+     gint voice_fd;
++    gboolean sim_events_enabled;
++    gboolean sim_check_running;
++    gboolean sim_check_again;
+ } MMBroadbandModemUnisocPrivate;
+ 
+ static void iface_modem_init (MMIfaceModemInterface *iface);
+@@ -106,6 +109,7 @@
+ static void iface_modem_voice_init (MMIfaceModemVoiceInterface *iface);
+ 
+ static MMIfaceModemMessagingInterface *iface_modem_messaging_parent;
++static MMIfaceModemInterface *iface_modem_parent;
+ 
+ G_DEFINE_TYPE_EXTENDED (MMBroadbandModemUnisoc, mm_broadband_modem_unisoc, MM_TYPE_BROADBAND_MODEM, 0,
+                         G_ADD_PRIVATE (MMBroadbandModemUnisoc)
+@@ -1268,6 +1272,171 @@
+     }
+ }
+ 
++/* Stock impl-ril onSimStatusChanged(): ECIND type 3 asks for a card
++ * status refresh, not an unconditional removal. SIM errors also use it. */
++static gboolean
++sim_ecind_changed (const gchar *text)
++{
++    guint type, value, cause = G_MAXUINT;
++    const gchar *p = text;
++
++    if (!power_parse_uint (&p, &type) || type != 3 || *p++ != ',' ||
++        !power_parse_uint (&p, &value))
++        return FALSE;
++    if (*p == ',') {
++        p++;
++        if (!power_parse_uint (&p, &cause))
++            return FALSE;
++    }
++    if (*p)
++        return FALSE;
++    if (value == 1)
++        return cause == 2 || cause == 34 || cause == 25 || cause == 1 || cause == 7;
++    return value == 0 || value == 2 || value == 100 || value == 4;
++}
++
++static gboolean
++sim_swap_finish (MMIfaceModem *self, GAsyncResult *res, GError **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
++
++static void
++sim_parent_check_ready (MMIfaceModem *self, GAsyncResult *res, GTask *task)
++{
++    GError *error = NULL;
++    if (!iface_modem_parent->check_for_sim_swap_finish (self, res, &error))
++        g_task_return_error (task, error);
++    else
++        g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++static void
++sim_pin_checked (MMBaseModem *self, GAsyncResult *res, GTask *task)
++{
++    GError *error = NULL;
++    const gchar *reply;
++    gboolean absent;
++    MMModemState state;
++    g_autoptr(MMBaseSim) sim = NULL;
++
++    reply = mm_base_modem_at_command_finish (self, res, &error);
++    absent = error && g_error_matches (error, MM_MOBILE_EQUIPMENT_ERROR,
++                                       MM_MOBILE_EQUIPMENT_ERROR_SIM_NOT_INSERTED);
++    if (!absent && (error || !reply || !strstr (reply, "+CPIN:"))) {
++        if (!error)
++            error = g_error_new (MM_CORE_ERROR, MM_CORE_ERROR_FAILED, "SIM state response unavailable");
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
++    g_clear_error (&error);
++    if (!get_private (MM_BROADBAND_MODEM_UNISOC (self))->sim_events_enabled) {
++        g_task_return_boolean (task, TRUE);
++        g_object_unref (task);
++        return;
++    }
++    g_object_get (self, MM_IFACE_MODEM_SIM, &sim, MM_IFACE_MODEM_STATE, &state, NULL);
++    if (absent) {
++        if (sim && state != MM_MODEM_STATE_FAILED)
++            mm_iface_modem_process_sim_event (MM_IFACE_MODEM (self));
++        g_task_return_boolean (task, TRUE);
++        g_object_unref (task);
++        return;
++    }
++    if (state == MM_MODEM_STATE_FAILED) {
++        mm_iface_modem_process_sim_event (MM_IFACE_MODEM (self));
++        g_task_return_boolean (task, TRUE);
++        g_object_unref (task);
++        return;
++    }
++    /* CPIN positively proved a card exists. Use MM's existing identity check
++     * and reprobe lifecycle, without another reset/reconnect state machine. */
++    iface_modem_parent->check_for_sim_swap (MM_IFACE_MODEM (self),
++                                           (GAsyncReadyCallback) sim_parent_check_ready, task);
++}
++
++static void
++sim_swap_check (MMIfaceModem *self, GAsyncReadyCallback callback, gpointer data)
++{
++    GTask *task = g_task_new (self, NULL, callback, data);
++    g_autofree gchar *command = g_strdup_printf ("+SPACTCARD=%u;+CPIN?", port_card ());
++    mm_base_modem_at_command (MM_BASE_MODEM (self), command, 5, FALSE,
++                              (GAsyncReadyCallback) sim_pin_checked, task);
++}
++
++static void sim_check_request (MMBroadbandModemUnisoc *self);
++static void
++sim_event_checked (MMIfaceModem *iface, GAsyncResult *res, gpointer data)
++{
++    MMBroadbandModemUnisoc *self = MM_BROADBAND_MODEM_UNISOC (iface);
++    MMBroadbandModemUnisocPrivate *priv = get_private (self);
++    g_autoptr(GError) error = NULL;
++
++    sim_swap_finish (iface, res, &error);
++    if (error)
++        mm_obj_dbg (self, "SIM event check deferred: %s", error->message);
++    priv->sim_check_running = FALSE;
++    if (priv->sim_check_again && priv->sim_events_enabled) {
++        priv->sim_check_again = FALSE;
++        sim_check_request (self);
++    }
++    g_object_unref (data);
++}
++
++static void
++sim_check_request (MMBroadbandModemUnisoc *self)
++{
++    MMBroadbandModemUnisocPrivate *priv = get_private (self);
++    MMModemState state;
++
++    if (!priv->sim_events_enabled)
++        return;
++    g_object_get (self, MM_IFACE_MODEM_STATE, &state, NULL);
++    /* Initial probing already reads CPIN. Do not insert competing queries
++     * ahead of that ordered SIM/mode/power plan. */
++    if (state == MM_MODEM_STATE_UNKNOWN || state == MM_MODEM_STATE_INITIALIZING)
++        return;
++    if (priv->sim_check_running) {
++        priv->sim_check_again = TRUE;
++        return;
++    }
++    priv->sim_check_running = TRUE;
++    sim_swap_check (MM_IFACE_MODEM (self),
++                                      (GAsyncReadyCallback) sim_event_checked, g_object_ref (self));
++}
++
++static void
++sim_ecind_received (MMPortSerialAt *port, GMatchInfo *info, gpointer data)
++{
++    g_autofree gchar *text = g_match_info_fetch (info, 1);
++    if (sim_ecind_changed (text))
++        sim_check_request (MM_BROADBAND_MODEM_UNISOC (data));
++}
++
++static void
++sim_hot_swap_setup (MMIfaceModem *iface, GAsyncReadyCallback callback, gpointer data)
++{
++    MMBroadbandModemUnisoc *self = MM_BROADBAND_MODEM_UNISOC (iface);
++    GTask *task = g_task_new (iface, NULL, callback, data);
++    GError *error = NULL;
++    if (!mm_broadband_modem_sim_hot_swap_ports_context_init (MM_BROADBAND_MODEM (self), &error))
++        g_task_return_error (task, error);
++    else {
++        get_private (self)->sim_events_enabled = TRUE;
++        g_task_return_boolean (task, TRUE);
++    }
++    g_object_unref (task);
++}
++
++static void
++sim_hot_swap_cleanup (MMIfaceModem *iface)
++{
++    get_private (MM_BROADBAND_MODEM_UNISOC (iface))->sim_events_enabled = FALSE;
++    mm_broadband_modem_sim_hot_swap_ports_context_reset (MM_BROADBAND_MODEM (iface));
++}
++
+ static void
+ setup_ports (MMBroadbandModem *self)
+ {
+@@ -1277,6 +1446,7 @@
+     g_autoptr(GRegex) vendor = NULL;
+     g_autoptr(GRegex) call = NULL;
+     g_autoptr(GRegex) sppcodata = NULL;
++    g_autoptr(GRegex) sim_ecind = NULL;
+ 
+     MM_BROADBAND_MODEM_CLASS (mm_broadband_modem_unisoc_parent_class)->setup_ports (self);
+ 
+@@ -1315,6 +1485,10 @@
+     /* Added last so this specific handler runs before the broad vendor sink. */
+     mm_port_serial_at_add_unsolicited_msg_handler (primary, sppcodata,
+                                                    sppcodata_received, self, NULL);
++    sim_ecind = g_regex_new ("\\r\\n\\+ECIND:[[:space:]]*([^\\r\\n]*)\\r\\n",
++                             G_REGEX_RAW | G_REGEX_OPTIMIZE, 0, NULL);
++    mm_port_serial_at_add_unsolicited_msg_handler (primary, sim_ecind,
++                                                   sim_ecind_received, self, NULL);
+ }
+ 
+ /*****************************************************************************/
+@@ -1863,7 +2037,6 @@
+ /* E5 card-addressed PDU submit through the existing single AT port owner.
+  * Modem.Command's normal authorization applies. The PDU is queued raw
+  * immediately after the prompt, as in mm-base-sms, without SPSWDATA. */
+-static MMIfaceModemInterface *iface_modem_parent;
+ 
+ /* A foreign CMTI index has no slot identifier. CNMI on this CP can route
+  * SIM2 indications to SIM1's command/URC ring. The shared receive worker
+@@ -2138,6 +2311,9 @@
+     iface->load_signal_quality_finish = modem_load_signal_quality_finish;
+     iface->get_cell_info = modem_get_cell_info;
+     iface->get_cell_info_finish = modem_get_cell_info_finish;
++    iface->setup_sim_hot_swap = sim_hot_swap_setup;
++    iface->setup_sim_hot_swap_finish = sim_swap_finish;
++    iface->cleanup_sim_hot_swap = sim_hot_swap_cleanup;
+     iface->load_sim_slots = modem_load_sim_slots;
+     iface->load_sim_slots_finish = modem_load_sim_slots_finish;
+     iface->set_primary_sim_slot = modem_set_primary_sim_slot;

@@ -1,0 +1,80 @@
+Description: Serialize Unisoc hangup and reject stale post-hangup snapshots
+Author: e5-linux
+Forwarded: no
+
+--- a/src/mm-base-call.c
++++ b/src/mm-base-call.c
+@@ -228,6 +228,19 @@
+         return;
+     }
+ 
++    /* A hangup must settle before another ATD, including requests arriving
++     * through another UI or HFP. Incoming answers are not throttled. */
++    if (g_object_get_data (G_OBJECT (modem), "e5-dual-sim-voice")) {
++        gint64 *ended = g_object_get_data (G_OBJECT (modem), "e5-voice-hangup-at");
++        if (g_object_get_data (G_OBJECT (modem), "e5-voice-hangup-pending") ||
++            (ended && g_get_monotonic_time () - *ended < 2 * G_USEC_PER_SEC)) {
++            mm_dbus_method_invocation_return_error_literal (ctx->invocation, MM_CORE_ERROR, MM_CORE_ERROR_IN_PROGRESS,
++                                                            "Previous call is ending; wait 2 seconds before dialing");
++            handle_start_context_free (ctx);
++            return;
++        }
++    }
++
+     mm_obj_info (ctx->self, "processing user request to start voice call...");
+ 
+     /* Disallow non-emergency calls when in emergency-only state */
+@@ -668,6 +681,13 @@
+ {
+     GError *error = NULL;
+ 
++    if (g_object_get_data (G_OBJECT (ctx->modem), "e5-dual-sim-voice")) {
++        gint64 *ended = g_new (gint64, 1);
++        *ended = g_get_monotonic_time ();
++        g_object_set_data_full (G_OBJECT (ctx->modem), "e5-voice-hangup-at", ended, g_free);
++        g_object_set_data (G_OBJECT (ctx->modem), "e5-voice-hangup-pending", NULL);
++    }
++
+     /* we set it as terminated even if we got an error reported */
+     mm_base_call_change_state (self, MM_CALL_STATE_TERMINATED, MM_CALL_STATE_REASON_TERMINATED);
+ 
+@@ -712,6 +732,20 @@
+                                                         "Hanging up call is not supported by this modem");
+         handle_hangup_context_free (ctx);
+         return;
++    }
++
++    if (g_object_get_data (G_OBJECT (modem), "e5-dual-sim-voice")) {
++        gint64 *ended;
++        if (g_object_get_data (G_OBJECT (modem), "e5-voice-hangup-pending")) {
++            mm_dbus_method_invocation_return_error_literal (ctx->invocation, MM_CORE_ERROR, MM_CORE_ERROR_IN_PROGRESS,
++                                                            "A hangup is already in progress");
++            handle_hangup_context_free (ctx);
++            return;
++        }
++        ended = g_new (gint64, 1);
++        *ended = g_get_monotonic_time ();
++        g_object_set_data_full (G_OBJECT (modem), "e5-voice-hangup-at", ended, g_free);
++        g_object_set_data (G_OBJECT (modem), "e5-voice-hangup-pending", GINT_TO_POINTER (1));
+     }
+ 
+     mm_obj_info (ctx->self, "processing user request to hangup voice call...");
+--- a/src/mm-iface-modem-voice.c
++++ b/src/mm-iface-modem-voice.c
+@@ -495,6 +495,16 @@
+         (info->state != MM_CALL_STATE_DIALING && info->state != MM_CALL_STATE_RINGING_OUT &&
+          info->state != MM_CALL_STATE_ACTIVE && info->state != MM_CALL_STATE_HELD))
+         return FALSE;
++    /* A CLCC requested before Hangup can finish afterwards. Never resurrect
++     * that stale call; require a fresh snapshot after the CP settles. */
++    {
++        gint64 *ended = g_object_get_data (G_OBJECT (self), "e5-voice-hangup-at");
++        gint64 *snapshot = g_object_get_data (G_OBJECT (self), "e5-voice-snapshot-start");
++        if (g_object_get_data (G_OBJECT (self), "e5-voice-hangup-pending") ||
++            (ended && (!snapshot || *snapshot <= *ended ||
++                       g_get_monotonic_time () - *ended < 2 * G_USEC_PER_SEC)))
++            return FALSE;
++    }
+     call = MM_IFACE_MODEM_VOICE_GET_IFACE (self)->create_call (self, MM_CALL_DIRECTION_OUTGOING, info->number);
+     mm_gdbus_call_set_sim_slot (MM_GDBUS_CALL (call), info->sim_slot);
+     mm_base_call_set_index (call, info->index);

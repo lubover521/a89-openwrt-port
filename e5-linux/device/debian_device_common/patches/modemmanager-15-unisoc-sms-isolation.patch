@@ -1,0 +1,157 @@
+--- a/src/plugins/unisoc/mm-broadband-modem-unisoc.c
++++ b/src/plugins/unisoc/mm-broadband-modem-unisoc.c
+@@ -1792,6 +1792,130 @@
+  * Modem.Command's normal authorization applies. The PDU is queued raw
+  * immediately after the prompt, as in mm-base-sms, without SPSWDATA. */
+ static MMIfaceModemInterface *iface_modem_parent;
++
++/* A foreign CMTI index has no slot identifier. CNMI on this CP can route
++ * SIM2 indications to SIM1's command/URC ring. The shared receive worker
++ * resolves CCID + storage explicitly for BOTH cards; generic CMGR(index)
++ * cannot. Keep CNMI/CDS and all IMS/voice support, but avoid duplicate,
++ * unscoped reads when the durable dual-SIM receiver is installed. */
++static void
++messaging_events_ready (MMIfaceModemMessaging *self, GAsyncResult *res, GTask *task)
++{
++    GError *error = NULL;
++    if (!iface_modem_messaging_parent->setup_unsolicited_events_finish (self, res, &error))
++        g_task_return_error (task, error);
++    else {
++        if (g_file_test ("/usr/libexec/e5-sms-receive", G_FILE_TEST_IS_EXECUTABLE)) {
++            g_autoptr(GRegex) regex = mm_3gpp_cmti_regex_get ();
++            MMPortSerialAt *ports[] = {
++                mm_base_modem_peek_port_primary (MM_BASE_MODEM (self)),
++                mm_base_modem_peek_port_secondary (MM_BASE_MODEM (self))
++            };
++            guint i;
++            for (i = 0; i < G_N_ELEMENTS (ports); i++)
++                if (ports[i])
++                    mm_port_serial_at_add_unsolicited_msg_handler (ports[i], regex, NULL, NULL, NULL);
++            mm_obj_info (self, "SMS storage indices are handled by the card-scoped receiver");
++        }
++        g_task_return_boolean (task, TRUE);
++    }
++    g_object_unref (task);
++}
++static void
++messaging_events_setup (MMIfaceModemMessaging *self, GAsyncReadyCallback callback, gpointer data)
++{
++    iface_modem_messaging_parent->setup_unsolicited_events (self,
++        (GAsyncReadyCallback) messaging_events_ready, g_task_new (self, NULL, callback, data));
++}
++static gboolean
++messaging_events_finish (MMIfaceModemMessaging *self, GAsyncResult *res, GError **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
++
++typedef struct {
++    gchar *response;
++    GError *error;
++} ScopedSmsCommand;
++static void scoped_sms_free (ScopedSmsCommand *ctx)
++{
++    g_free (ctx->response);
++    g_clear_error (&ctx->error);
++    g_free (ctx);
++}
++static void scoped_sms_restored (MMBaseModem *self, GAsyncResult *res, GTask *task)
++{
++    ScopedSmsCommand *ctx = g_task_get_task_data (task);
++    GError *error = NULL;
++    mm_base_modem_at_command_finish (self, res, &error);
++    if (error) {
++        mm_obj_warn (self, "could not restore data card AT context: %s", error->message);
++        if (!ctx->error) ctx->error = g_steal_pointer (&error);
++        g_clear_error (&error);
++    }
++    if (ctx->error)
++        g_task_return_error (task, g_steal_pointer (&ctx->error));
++    else
++        g_task_return_pointer (task, ctx->response, NULL);
++    g_object_unref (task);
++}
++static void scoped_sms_ready (MMBaseModem *self, GAsyncResult *res, GTask *task)
++{
++    ScopedSmsCommand *ctx = g_task_get_task_data (task);
++    const gchar *response = mm_base_modem_at_command_finish (self, res, &ctx->error);
++    g_autofree gchar *command = g_strdup_printf ("+SPACTCARD=%u", port_card ());
++    ctx->response = g_strdup (response);
++    /* Restore after success AND CMS/CME failure, before exposing completion.
++     * Only select this AT channel's card: no CFUN, SFUN, IMS or data switch. */
++    mm_base_modem_at_command (self, command, 5, FALSE,
++                              (GAsyncReadyCallback) scoped_sms_restored, task);
++}
++static gboolean scoped_sms_command (const gchar *arg)
++{
++    static const gchar *safe[] = {
++        "+CMGL", "+CMGR", "+CMGD", "+CMGF", "+CPMS",
++        "+CNMI", "+CSCA", "+CSCS", "+CSMS"
++    };
++    const gchar *tail, *name;
++    const gchar *prefix = "+SPACTCARD=";
++    gboolean seen = FALSE, quoted;
++    gsize length, i;
++    if (!g_str_has_prefix (arg, prefix)) return FALSE;
++    arg += strlen (prefix);
++    if ((arg[0] != '0' && arg[0] != '1') || arg[1] != ';') return FALSE;
++    tail = arg + 2;
++    /* Check EVERY command, not just the first. A later CMGS/CMGW may
++     * enter a prompt: restoring then would be sent as the SMS payload.
++     * Unknown commands retain their original handling too. Quoted
++     * semicolons are parameters, not command boundaries. */
++    while (*tail) {
++        while (g_ascii_isspace (*tail)) tail++;
++        if (!*tail) break;
++        if (!g_ascii_strncasecmp (tail, "AT", 2)) tail += 2;
++        while (g_ascii_isspace (*tail)) tail++;
++        name = tail;
++        if (*tail++ != '+') return FALSE;
++        while (g_ascii_isalnum (*tail)) tail++;
++        length = tail - name;
++        for (i = 0; i < G_N_ELEMENTS (safe); i++)
++            if (strlen (safe[i]) == length && !g_ascii_strncasecmp (name, safe[i], length)) break;
++        if (i == G_N_ELEMENTS (safe)) return FALSE;
++        while (g_ascii_isspace (*tail)) tail++;
++        if (g_str_equal (safe[i], "+CPMS") && *tail != '?') return FALSE;
++        if (*tail && *tail != '=' && *tail != '?' && *tail != ';') return FALSE;
++        quoted = FALSE;
++        for (; *tail; tail++) {
++            if (*tail == '\r' || *tail == '\n' || *tail == '\032' || *tail == '\033') return FALSE;
++            if (*tail == '"') quoted = !quoted;
++            if (*tail == ';' && !quoted) break;
++        }
++        if (quoted) return FALSE;
++        seen = TRUE;
++        if (*tail) tail++;
++    }
++    return seen;
++}
++
+ typedef struct {
+     MMIfacePortAt *port;
+     gchar *payload;
+@@ -1853,6 +1977,14 @@
+         g_task_set_source_tag (task, e5_command_finish);
+         g_task_return_pointer (task, (gpointer)"+E5SMS: 1", NULL);
+         g_object_unref (task);
++        return;
++    }
++    if (scoped_sms_command (arg)) {
++        task = g_task_new (self, NULL, callback, user_data);
++        g_task_set_source_tag (task, e5_command_finish);
++        g_task_set_task_data (task, g_new0 (ScopedSmsCommand, 1), (GDestroyNotify) scoped_sms_free);
++        mm_base_modem_at_command (MM_BASE_MODEM (self), arg, timeout, FALSE,
++                                  (GAsyncReadyCallback) scoped_sms_ready, task);
+         return;
+     }
+     if (!g_str_has_prefix (arg, "+E5SMS=")) {
+@@ -1951,6 +2083,8 @@
+ {
+     iface_modem_messaging_parent = g_type_interface_peek_parent (iface);
+ 
++    iface->setup_unsolicited_events = messaging_events_setup;
++    iface->setup_unsolicited_events_finish = messaging_events_finish;
+     iface->setup_sms_format = messaging_setup_sms_format;
+     iface->setup_sms_format_finish = messaging_setup_sms_format_finish;
+ }
