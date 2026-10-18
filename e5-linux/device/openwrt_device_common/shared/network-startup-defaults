@@ -1,0 +1,17 @@
+#!/bin/sh
+set -e
+profile=$(cat /etc/e5/device-profile 2>/dev/null)
+case "$profile" in t551m|e5|m8) ;; *) exit 0 ;; esac
+python3 /opt/e5/t551m-network-startup --root / --profile "$profile"
+# Migrate the image's original default once. Explicit custom initial APNs and
+# later user changes are preserved. Normal APN/auth/IP settings stay in WAN.
+marker=/etc/e5/t551m-network-startup-v1
+if [ ! -f "$marker" ]; then
+    if [ "$(uci -q get network.wan.proto)" = modemmanager ] &&
+       [ "$(uci -q get network.wan.init_epsbearer)" = default ]; then
+        uci set network.wan.init_epsbearer=keep
+        uci commit network
+    fi
+    touch "$marker"
+fi
+exit 0

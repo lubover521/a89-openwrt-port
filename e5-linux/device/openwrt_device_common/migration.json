@@ -1,0 +1,926 @@
+{
+  "source_repository": "sprd-linux-devs/e5-linux",
+  "source_commit": "b7282af",
+  "files": {
+    "devices/t551m/at-client.c": {
+      "path": "shared/at-client.c",
+      "source_sha256": "37826b21d9de0bdd04b7ea0c51857ff89955531118be2d9f62020c7eff9bc0f1"
+    },
+    "devices/t551m/at-service": {
+      "path": "shared/at-service",
+      "source_sha256": "cee80dda1339c93bdaea4b68da296d18b3f89f1d40dca2ad2e699e7b097e6ac6"
+    },
+    "devices/t551m/atd.py": {
+      "path": "shared/atd.py",
+      "source_sha256": "4b5def201ecd6b6fb7fed7505aa538415ee61c56e0604807bdfa363d6e8b8fc9"
+    },
+    "devices/t551m/build-at-client.py": {
+      "path": "shared/build-at-client.py",
+      "source_sha256": "c70f56f5add5424298ffb665c4bdc59e6eed13e5fd99cd0c4661a90c97de981d"
+    },
+    "devices/t551m/build-charge-art.py": {
+      "path": "shared/build-charge-art.py",
+      "source_sha256": "84d732ee9c239d4c5fcc310ce355247bea78eeb5cd8775af9306a1f9882e8f1c"
+    },
+    "devices/t551m/charge-art.zip": {
+      "path": "shared/charge-art.zip",
+      "source_sha256": "1a8d0eebf9bca9e02ba79fae662667ff6c90e1a3de9a0bdecb75695d945a0465"
+    },
+    "devices/t551m/charge-mode-service": {
+      "path": "shared/charge-mode-service",
+      "source_sha256": "0663a9701ab322c0666f05de3ac47ab50fbbb162ae3417fef6b1fc25a4c652d4"
+    },
+    "devices/t551m/charge-mode.py": {
+      "path": "shared/charge-mode.py",
+      "source_sha256": "5b85f39b98cea001fd811a28ed3b87f83d34d4ad1f06fb9b9f59214f6dd0d935"
+    },
+    "devices/t551m/charge-screen.py": {
+      "path": "shared/charge-screen.py",
+      "source_sha256": "0a48d2dea70ce657b01ba9bec3f1d73b4f0870e650beddc341329f86a42b7d47"
+    },
+    "devices/t551m/network-startup-defaults": {
+      "path": "shared/network-startup-defaults",
+      "source_sha256": "1bc2ba9db3bda3e714bd95ddf3a782d2f5f3af09a6fbde7bf1d888340682e947"
+    },
+    "devices/t551m/network-startup.py": {
+      "path": "shared/network-startup.py",
+      "source_sha256": "1fefc9f4376e5f30cd86d244cca7fa5f0b52238584ce9b2a313e8f1c73c80445"
+    },
+    "devices/t551m/nv-prepare.py": {
+      "path": "shared/nv-prepare.py",
+      "source_sha256": "e567ef923bb1f5066834aae3064c4de70772567013e721aa67f9d00d857a4d14"
+    },
+    "devices/t551m/nv-stop.py": {
+      "path": "shared/nv-stop.py",
+      "source_sha256": "12c63b82030a53a462ee661c2fe3b8b8226b09f91ece88f4cb8c58e15e000902"
+    },
+    "devices/t551m/nv-verify.py": {
+      "path": "shared/nv-verify.py",
+      "source_sha256": "6e370dd7481d891bb12f2b316f1f47d8c19841d4980e1a175d726a0833b6465a"
+    },
+    "devices/t551m/test_at.py": {
+      "path": "tests/test_at.py",
+      "source_sha256": "45b78a018d79ca5c775bf65044b8abd4816ec01310483c2855bbcf5510fc2ed4"
+    },
+    "devices/t551m/test_at_client.py": {
+      "path": "tests/test_at_client.py",
+      "source_sha256": "34e6af9af23b32039f1f2254857a06c916d5d6b0a270b3a1056d82738d41288b"
+    },
+    "devices/t551m/test_at_routing.py": {
+      "path": "tests/test_at_routing.py",
+      "source_sha256": "578ad3f161cd11436aa66a80f9dae735354f5bd300581499d8db2856478cbf96"
+    },
+    "devices/t551m/test_boot_replay.py": {
+      "path": "tests/test_boot_replay.py",
+      "source_sha256": "515a0aa9cd5793d8f4df6ec0e0ebd94e6f4f404c09fb6d576b2a393cccf06dc5"
+    },
+    "devices/t551m/test_cell_progressive.py": {
+      "path": "tests/test_cell_progressive.py",
+      "source_sha256": "ddf5e9e970ade9ffdbcfec467e20f99df7c5f36b4f2cdb50565852938690b557"
+    },
+    "devices/t551m/test_charge_mode.py": {
+      "path": "tests/test_charge_mode.py",
+      "source_sha256": "8494181f43e3fa8a0da02052e1446b6bca90c510885b1179aa56b247f5e70ef3"
+    },
+    "devices/t551m/test_charge_screen.py": {
+      "path": "tests/test_charge_screen.py",
+      "source_sha256": "a5e860aedb63ef968cb573c8949b9b8a1c8945334ee8963699b7b43518dfa2bb"
+    },
+    "devices/t551m/test_cpu_browser.py": {
+      "path": "tests/test_cpu_browser.py",
+      "source_sha256": "5021d534d1e04ffd1115de04046929c590587edc3309166aa7829a3cfa9ee45c"
+    },
+    "devices/t551m/test_cpu_control.py": {
+      "path": "tests/test_cpu_control.py",
+      "source_sha256": "70075a274bc2b6cd93dce3e05507df5f8b36b6254fa746d3fd0ff26b3187042a"
+    },
+    "devices/t551m/test_dashboard_dns.sh": {
+      "path": "tests/test_dashboard_dns.sh",
+      "source_sha256": "04069a8e0a187e2265eba32eba10b352afac29fa26511448af502f151a515a1e"
+    },
+    "devices/t551m/test_dashboard_rates.py": {
+      "path": "tests/test_dashboard_rates.py",
+      "source_sha256": "23ff7a90c9211522e1f1643d08dd09479d2db750a29910237453ecf6556e49b5"
+    },
+    "devices/t551m/test_dashboard_refresh.py": {
+      "path": "tests/test_dashboard_refresh.py",
+      "source_sha256": "93995f56e051814f2501fe84a6f622b4e6d4e97d1073a3c23354a07c8959ab20"
+    },
+    "devices/t551m/test_data_sim.py": {
+      "path": "tests/test_data_sim.py",
+      "source_sha256": "d4e2a59ed909032cff214b417d0d0ff09e650306805c18581ae5a7086b547786"
+    },
+    "devices/t551m/test_data_sim_browser.py": {
+      "path": "tests/test_data_sim_browser.py",
+      "source_sha256": "54d8b44cb060de80b8a50336959b8510358d8b2aa0c4fa913fb1cb144b5cc57c"
+    },
+    "devices/t551m/test_device_usb.py": {
+      "path": "tests/test_device_usb.py",
+      "source_sha256": "e92a8f481650cb447fc4c07d5d8c7d4a09da30d0f927fdea26c8fc15ba994e91"
+    },
+    "devices/t551m/test_device_usb_browser.py": {
+      "path": "tests/test_device_usb_browser.py",
+      "source_sha256": "95e35529f123e24441749ae5f3ffc44874a571d53e998801a3194ecf545ca1ea"
+    },
+    "devices/t551m/test_dual_traffic.py": {
+      "path": "tests/test_dual_traffic.py",
+      "source_sha256": "41f4643eae720b065caba4cf9e07242638db7b3160f56d426e63a76f4bf1a509"
+    },
+    "devices/t551m/test_feature_i18n.js": {
+      "path": "tests/test_feature_i18n.js",
+      "source_sha256": "d2046dce0a6d0db684123db1672374667017b8a92cf0cb37ab0d4562290eb631"
+    },
+    "devices/t551m/test_forward_browser.py": {
+      "path": "tests/test_forward_browser.py",
+      "source_sha256": "577447c2e74322b44faa5151c2cdcf96be3597e6eb3116f643b78a3b3d1175ef"
+    },
+    "devices/t551m/test_forward_native.py": {
+      "path": "tests/test_forward_native.py",
+      "source_sha256": "548a696e17f8add5a018298420632edf1cffdb513ff092f152dc1b0d342a7f1d"
+    },
+    "devices/t551m/test_forward_transport.py": {
+      "path": "tests/test_forward_transport.py",
+      "source_sha256": "01b2da51ac39016046c9c6ec94e80072a90e66669c3ace57e469020de28983f8"
+    },
+    "devices/t551m/test_locks.py": {
+      "path": "tests/test_locks.py",
+      "source_sha256": "a8d8d1a26a6aa1b0093c30b437132fee9c8261ddc46dd85d1a766ee5f8f1c897"
+    },
+    "devices/t551m/test_locks_frontend.js": {
+      "path": "tests/test_locks_frontend.js",
+      "source_sha256": "9c25320f23567fe2ff11c4e31a2677c1b4e1ca757415855fb22c28282465dbc4"
+    },
+    "devices/t551m/test_network_startup.py": {
+      "path": "tests/test_network_startup.py",
+      "source_sha256": "3cfd0205e3fa128d4d98bcc32aded2e5d6c402b068cbcd56dc213db249bccd07"
+    },
+    "devices/t551m/test_nv.py": {
+      "path": "tests/test_nv.py",
+      "source_sha256": "8c8da8b3236c98e2c0883ba6936a8db63f28d06d1c8a3812a538e3493e884fc4"
+    },
+    "devices/t551m/test_rpc_isolation.py": {
+      "path": "tests/test_rpc_isolation.py",
+      "source_sha256": "dff97a1b043d1532534b489b6a063cfef3c6c6d716823b95659142943c9b7a3e"
+    },
+    "devices/t551m/test_sim_at_scope.py": {
+      "path": "tests/test_sim_at_scope.py",
+      "source_sha256": "bea9c52f0060bc12ef779b66cfc7b3d21515424533f953d6a7dcb7585b6a6414"
+    },
+    "devices/t551m/test_traffic_browser.py": {
+      "path": "tests/test_traffic_browser.py",
+      "source_sha256": "24b7f158a23236422ac5eba331de956a363c2a6f5428923d9e8434ef0e2fbc9f"
+    },
+    "devices/t551m/test_ui.py": {
+      "path": "tests/test_ui.py",
+      "source_sha256": "6eca9c6d01481eddeab9bed952a392775990178063d709d09f89c22e15d89cde"
+    },
+    "devices/t551m/test_wifi_address.py": {
+      "path": "tests/test_wifi_address.py",
+      "source_sha256": "022e7a597ffbe4ca0cd76984615b216a858961047ea0de81c53d5d12635747b5"
+    },
+    "devices/t551m/ui-cleanup.py": {
+      "path": "shared/ui-cleanup.py",
+      "source_sha256": "17327c16d96c7cc6ce455e59eba65522aa0d41dc8963c71ff62cabd573ca8919"
+    },
+    "devices/t551m/ui-compat.py": {
+      "path": "shared/ui-compat.py",
+      "source_sha256": "9b2664fc3d3eacf97c869af00c39ce03cebb7f497abab4b6f4213cfa919897b8"
+    },
+    "devices/t551m/ui-defaults": {
+      "path": "shared/ui-defaults",
+      "source_sha256": "3c022fa13df5ddbcad77cfa2a59fa5b6c5875e1cdc088f39dee27b2f62b730c2"
+    },
+    "devices/t551m/ui.py": {
+      "path": "shared/ui.py",
+      "source_sha256": "c76c30bd3563e08f740d637a35d7306e5a3ede510202586f27df3921821b728f"
+    },
+    "devices/t551m/usb-host-network.modules": {
+      "path": "shared/usb-host-network.modules",
+      "source_sha256": "75032df651d3ca1abd7e275dd65045bbadb346dc0a6c098ade41024129b498be"
+    },
+    "devices/t551m/usb-host-storage.modules": {
+      "path": "shared/usb-host-storage.modules",
+      "source_sha256": "56083a22eff444cb627b989044a884c4a22ff1507fd72831edcd579950b5fcce"
+    },
+    "devices/t551m/usb-service": {
+      "path": "shared/usb-service",
+      "source_sha256": "c5492fe1f5ec95823c6d2c9eed8793af047088e15fdb04af3a13fada400f234d"
+    },
+    "devices/t551m/wifi-address-defaults": {
+      "path": "shared/wifi-address-defaults",
+      "source_sha256": "7fe23884262d16f4d122604a9c4bd41e3bd1e18cf194cb1f6b20abe061737ac1"
+    },
+    "openwrt/luci-app-t551m/Makefile": {
+      "path": "luci-app-t551m/Makefile",
+      "source_sha256": "c60c9eec3b592f7c6568403e594194321a157ddee8054aa3124b88cb8ff08fd8"
+    },
+    "openwrt/luci-app-t551m/README.md": {
+      "path": "luci-app-t551m/README.md",
+      "source_sha256": "f34c4c16433c188a266eafcbf2f07310f971c49317859b44bdf405aea60f15e5"
+    },
+    "openwrt/luci-app-t551m/htdocs/luci-static/resources/mu300/common.js": {
+      "path": "luci-app-t551m/htdocs/luci-static/resources/mu300/common.js",
+      "source_sha256": "702495644447e56c9ef3fa927f26642fcce5a2b180009cc013edc7d2c7aca55c"
+    },
+    "openwrt/luci-app-t551m/htdocs/luci-static/resources/mu300/data-sim.js": {
+      "path": "luci-app-t551m/htdocs/luci-static/resources/mu300/data-sim.js",
+      "source_sha256": "a747bb30caabea0f2e22032c8fee0660a5ea5979a730fa1df20519e01981961f"
+    },
+    "openwrt/luci-app-t551m/htdocs/luci-static/resources/view/mu300/at.js": {
+      "path": "luci-app-t551m/htdocs/luci-static/resources/view/mu300/at.js",
+      "source_sha256": "8b38229d6dea76064312189711d0be3d3afdeac020a31c772932740744844e05"
+    },
+    "openwrt/luci-app-t551m/htdocs/luci-static/resources/view/mu300/cpu.js": {
+      "path": "luci-app-t551m/htdocs/luci-static/resources/view/mu300/cpu.js",
+      "source_sha256": "090f1773ac2ded7dec09ca9f8218977cc11242319147d78eb120eaa8be1fb50e"
+    },
+    "openwrt/luci-app-t551m/htdocs/luci-static/resources/view/mu300/device.js": {
+      "path": "luci-app-t551m/htdocs/luci-static/resources/view/mu300/device.js",
+      "source_sha256": "4605f323b714a75acdae9eb2b6381b590e0e931eb89fc6c2316f3ccf2e05b0c2"
+    },
+    "openwrt/luci-app-t551m/htdocs/luci-static/resources/view/mu300/forward.css": {
+      "path": "luci-app-t551m/htdocs/luci-static/resources/view/mu300/forward.css",
+      "source_sha256": "07375ba1777753ba02572fa93d317de9fdc084e4739190c665776f80c3058ca9"
+    },
+    "openwrt/luci-app-t551m/htdocs/luci-static/resources/view/mu300/forward.js": {
+      "path": "luci-app-t551m/htdocs/luci-static/resources/view/mu300/forward.js",
+      "source_sha256": "b126641f339eb73aa3ac0faa025c601e232b58975324a48b9541ee9fb3ce8add"
+    },
+    "openwrt/luci-app-t551m/htdocs/luci-static/resources/view/mu300/home.js": {
+      "path": "luci-app-t551m/htdocs/luci-static/resources/view/mu300/home.js",
+      "source_sha256": "99ee482052ce091c2e8e1ed48035733551a2d6c11f11ddd67cd0ebce65528603"
+    },
+    "openwrt/luci-app-t551m/htdocs/luci-static/resources/view/mu300/locks.js": {
+      "path": "luci-app-t551m/htdocs/luci-static/resources/view/mu300/locks.js",
+      "source_sha256": "de0b8cfdab73241aa9e65f073c0a096c7caf4fd001b10de8f0fd89672c4a0a03"
+    },
+    "openwrt/luci-app-t551m/htdocs/luci-static/resources/view/mu300/settings.js": {
+      "path": "luci-app-t551m/htdocs/luci-static/resources/view/mu300/settings.js",
+      "source_sha256": "61b2fd98c2db6b1151cb7e1578fd896cfe6265276c486bea8bf76ae6368dda37"
+    },
+    "openwrt/luci-app-t551m/htdocs/luci-static/resources/view/mu300/sim.js": {
+      "path": "luci-app-t551m/htdocs/luci-static/resources/view/mu300/sim.js",
+      "source_sha256": "bbae0d90eecea890678f1908297752c04ad6e85f85dd9b809dd92c747155ad2f"
+    },
+    "openwrt/luci-app-t551m/htdocs/luci-static/resources/view/mu300/sms.css": {
+      "path": "luci-app-t551m/htdocs/luci-static/resources/view/mu300/sms.css",
+      "source_sha256": "3fbf839274f0db043c0d1395d045fe232417a93c796885fc8131728de6924a96"
+    },
+    "openwrt/luci-app-t551m/htdocs/luci-static/resources/view/mu300/sms.js": {
+      "path": "luci-app-t551m/htdocs/luci-static/resources/view/mu300/sms.js",
+      "source_sha256": "d850052dfef54835268e0e8f1d3ae635a90f6aad8a16bc60a0a07093897e5022"
+    },
+    "openwrt/luci-app-t551m/htdocs/luci-static/resources/view/mu300/sounds.js": {
+      "path": "luci-app-t551m/htdocs/luci-static/resources/view/mu300/sounds.js",
+      "source_sha256": "68bb181042ab1a1363ee89b2280388891ff2fdd993fa6d0efb1ac80f64d93ea4"
+    },
+    "openwrt/luci-app-t551m/htdocs/luci-static/resources/view/mu300/traffic.js": {
+      "path": "luci-app-t551m/htdocs/luci-static/resources/view/mu300/traffic.js",
+      "source_sha256": "6e43498ed69469f586d019d97269b3a5a78c3d38e7e6eb4601354bf8a30efb2f"
+    },
+    "openwrt/luci-app-t551m/lmo/mu300.en.lmo": {
+      "path": "luci-app-t551m/lmo/mu300.en.lmo",
+      "source_sha256": "3904664556806019a26e786695b211e4e848e244c0ba1043cb30b33da94d8d14"
+    },
+    "openwrt/luci-app-t551m/lmo/mu300.tr.lmo": {
+      "path": "luci-app-t551m/lmo/mu300.tr.lmo",
+      "source_sha256": "729aa6d4709b14e88b3c64fd40790c74593fa14e8f73f7736a83eab90d8d3b01"
+    },
+    "openwrt/luci-app-t551m/po/en/mu300.po": {
+      "path": "luci-app-t551m/po/en/mu300.po",
+      "source_sha256": "055d15300bca9d0c3d3f9d0aa7ea066de21f202a33099053edddba8f6bb6ed15"
+    },
+    "openwrt/luci-app-t551m/po/tr/mu300.po": {
+      "path": "luci-app-t551m/po/tr/mu300.po",
+      "source_sha256": "dee59e19ffdd20a0711a9b918f0625ef9bd142e5831848600ccfe1ac12bcbca7"
+    },
+    "openwrt/luci-app-t551m/root/etc/config/unisoc_modem": {
+      "path": "luci-app-t551m/root/etc/config/unisoc_modem",
+      "source_sha256": "a4ff86b57edb3bbe28d6360b8435a08e8f3a5b133742888cf14013ce5dd34a56"
+    },
+    "openwrt/luci-app-t551m/root/etc/hotplug.d/iface/90-unisoc-usb-host": {
+      "path": "luci-app-t551m/root/etc/hotplug.d/iface/90-unisoc-usb-host",
+      "source_sha256": "d634d7a2ec33d36d140c529c6e5b1e68f94089662caab2f2f573b8ef2c68a610"
+    },
+    "openwrt/luci-app-t551m/root/etc/hotplug.d/net/90-unisoc-usb-host": {
+      "path": "luci-app-t551m/root/etc/hotplug.d/net/90-unisoc-usb-host",
+      "source_sha256": "175b9ca0f44187c00a54ee8030973f6e5c5d2726e39592d6c2540ed101b18a5d"
+    },
+    "openwrt/luci-app-t551m/root/etc/init.d/e5-cpu": {
+      "path": "luci-app-t551m/root/etc/init.d/e5-cpu",
+      "source_sha256": "18df50407914f13c6738b4bfab82d0f9d77eb7521ff828595138c991856a28fc"
+    },
+    "openwrt/luci-app-t551m/root/etc/init.d/unisoc-modem-ui": {
+      "path": "luci-app-t551m/root/etc/init.d/unisoc-modem-ui",
+      "source_sha256": "a4c751c103734f0057aec13471c8a157d271a478e3399eda5cfd73039ce96e94"
+    },
+    "openwrt/luci-app-t551m/root/etc/init.d/unisoc-sms-forward": {
+      "path": "luci-app-t551m/root/etc/init.d/unisoc-sms-forward",
+      "source_sha256": "72a2ae22f9eb78b163c098e8e55a77734009fdf203d32e2da5cb0827dff0445c"
+    },
+    "openwrt/luci-app-t551m/root/etc/init.d/unisoc-traffic": {
+      "path": "luci-app-t551m/root/etc/init.d/unisoc-traffic",
+      "source_sha256": "c621a2e94d230122d3a617b11fe611d842625c35472dff30a39f09efd63aa12a"
+    },
+    "openwrt/luci-app-t551m/root/lib/upgrade/keep.d/e5-cpu": {
+      "path": "luci-app-t551m/root/lib/upgrade/keep.d/e5-cpu",
+      "source_sha256": "1f5d4c5ee499e961dcac4d5a08a44cd591f1d83bc98b98151bee86819fbe1141"
+    },
+    "openwrt/luci-app-t551m/root/lib/upgrade/keep.d/e5-sounds": {
+      "path": "luci-app-t551m/root/lib/upgrade/keep.d/e5-sounds",
+      "source_sha256": "4de032a7927d8e9a530cdaf4be1a4deb6c05ec59f964b8ece897282d70151232"
+    },
+    "openwrt/luci-app-t551m/root/lib/upgrade/keep.d/unisoc-forward": {
+      "path": "luci-app-t551m/root/lib/upgrade/keep.d/unisoc-forward",
+      "source_sha256": "b35dd223e5dad2d2df7083955c44edbf7548a6c9a02e025bd2cb6d279702b9af"
+    },
+    "openwrt/luci-app-t551m/root/lib/upgrade/keep.d/unisoc-traffic": {
+      "path": "luci-app-t551m/root/lib/upgrade/keep.d/unisoc-traffic",
+      "source_sha256": "7d9c46a2ba69422e17f8f0252dfe61ca647d21e75135706e711b376c57c4f3b2"
+    },
+    "openwrt/luci-app-t551m/root/usr/libexec/rpcd/e5-cpu": {
+      "path": "luci-app-t551m/root/usr/libexec/rpcd/e5-cpu",
+      "source_sha256": "f9df61313aa58b6ef3659f1c0e2a0fcd354a170fe7290451153a9ae1ca52ed04"
+    },
+    "openwrt/luci-app-t551m/root/usr/libexec/rpcd/e5-sounds": {
+      "path": "luci-app-t551m/root/usr/libexec/rpcd/e5-sounds",
+      "source_sha256": "79623d421397dbd6bdc21eeb7c6bb2f30fcf4247c2e523dc6d8036f563808771"
+    },
+    "openwrt/luci-app-t551m/root/usr/libexec/rpcd/mu300dash": {
+      "path": "luci-app-t551m/root/usr/libexec/rpcd/mu300dash",
+      "source_sha256": "c25927e645c33d8c743e5ff262d2fbbc448213aa05bf4e8cec49edae7498f749"
+    },
+    "openwrt/luci-app-t551m/root/usr/libexec/unisoc-modem/action": {
+      "path": "luci-app-t551m/root/usr/libexec/unisoc-modem/action",
+      "source_sha256": "0709f3a24ba41a6a79ee1fc2736a2a5f46e21295580b0c8b8ff98f4b23e4e3c7"
+    },
+    "openwrt/luci-app-t551m/root/usr/libexec/unisoc-modem/at": {
+      "path": "luci-app-t551m/root/usr/libexec/unisoc-modem/at",
+      "source_sha256": "0051827e95e4adb7c3ec54e8de4b206ebd14522b1ae7bfc93436c0376b06b563"
+    },
+    "openwrt/luci-app-t551m/root/usr/libexec/unisoc-modem/boot-replay": {
+      "path": "luci-app-t551m/root/usr/libexec/unisoc-modem/boot-replay",
+      "source_sha256": "3b51293802cbbcedf80c3f8891e9855ec576c9ce6fe29e363c379c457bf381bb"
+    },
+    "openwrt/luci-app-t551m/root/usr/libexec/unisoc-modem/cell": {
+      "path": "luci-app-t551m/root/usr/libexec/unisoc-modem/cell",
+      "source_sha256": "d1ff7d72f176c66b65d323956bea3b06e9037ad51d0a023270af6ba5acf25423"
+    },
+    "openwrt/luci-app-t551m/root/usr/libexec/unisoc-modem/cpu-control": {
+      "path": "luci-app-t551m/root/usr/libexec/unisoc-modem/cpu-control",
+      "source_sha256": "67f7edc39ded2b08e57a2e15dbd6a95bbe186bc89286fbce096414ee635670aa"
+    },
+    "openwrt/luci-app-t551m/root/usr/libexec/unisoc-modem/dashboard-info": {
+      "path": "luci-app-t551m/root/usr/libexec/unisoc-modem/dashboard-info",
+      "source_sha256": "60baebf83fc1a54fa220f5c85194b5b237431fea46bb2a4970f582273664890f"
+    },
+    "openwrt/luci-app-t551m/root/usr/libexec/unisoc-modem/data-sim": {
+      "path": "luci-app-t551m/root/usr/libexec/unisoc-modem/data-sim",
+      "source_sha256": "a809f29b930bd4e2b036fb926065760cdde11fa92528b6deff9f966dd2c43296"
+    },
+    "openwrt/luci-app-t551m/root/usr/libexec/unisoc-modem/device-usb": {
+      "path": "luci-app-t551m/root/usr/libexec/unisoc-modem/device-usb",
+      "source_sha256": "1885ea0b413870fe3fc91de8ecacec09153734e72574658666824ff3c2649df2"
+    },
+    "openwrt/luci-app-t551m/root/usr/libexec/unisoc-modem/forward-native": {
+      "path": "luci-app-t551m/root/usr/libexec/unisoc-modem/forward-native",
+      "source_sha256": "d3f377547861f65d3a6988c4622c4ba13c8b01894a49873fcae51a182fc57386"
+    },
+    "openwrt/luci-app-t551m/root/usr/libexec/unisoc-modem/forward-template.uc": {
+      "path": "luci-app-t551m/root/usr/libexec/unisoc-modem/forward-template.uc",
+      "source_sha256": "9e3895f3c91f94ed625cb1cdee3fbc9d9509728a7d1008773fb8cd201c2436c4"
+    },
+    "openwrt/luci-app-t551m/root/usr/libexec/unisoc-modem/hotspot": {
+      "path": "luci-app-t551m/root/usr/libexec/unisoc-modem/hotspot",
+      "source_sha256": "e89bc9ef02df8d9fba0c3551d1ae72c98e25646bebf2af05c0989669478b647c"
+    },
+    "openwrt/luci-app-t551m/root/usr/libexec/unisoc-modem/hotspot.uc": {
+      "path": "luci-app-t551m/root/usr/libexec/unisoc-modem/hotspot.uc",
+      "source_sha256": "8db507751e195a72d3b9fadcba795e925832c15df78e900457e551cdd60d2edf"
+    },
+    "openwrt/luci-app-t551m/root/usr/libexec/unisoc-modem/lock": {
+      "path": "luci-app-t551m/root/usr/libexec/unisoc-modem/lock",
+      "source_sha256": "7502ad1d782d4f1680fb9fb0fecc0cacec70bdf91cd8e07a430ef05cfd643ddb"
+    },
+    "openwrt/luci-app-t551m/root/usr/libexec/unisoc-modem/lock-control": {
+      "path": "luci-app-t551m/root/usr/libexec/unisoc-modem/lock-control",
+      "source_sha256": "dcf97b6cc4c894afdf0a4cf48d72515ff7af81b6254bc2c1f3aaef5bb480842a"
+    },
+    "openwrt/luci-app-t551m/root/usr/libexec/unisoc-modem/operator.uc": {
+      "path": "luci-app-t551m/root/usr/libexec/unisoc-modem/operator.uc",
+      "source_sha256": "771016ccb333fed348108da65430e573437b48d0ee9c84e4ba942c40928df07b"
+    },
+    "openwrt/luci-app-t551m/root/usr/libexec/unisoc-modem/sms-forward": {
+      "path": "luci-app-t551m/root/usr/libexec/unisoc-modem/sms-forward",
+      "source_sha256": "e555dfe3bf8e7c89950877b13279b1813650dfc62fecca03bf5a121b7a181160"
+    },
+    "openwrt/luci-app-t551m/root/usr/libexec/unisoc-modem/t551m-at": {
+      "path": "luci-app-t551m/root/usr/libexec/unisoc-modem/t551m-at",
+      "source_sha256": "2574d0494c9c9790b3bf6a93a61a9fa78acdb83030a0670d552cb9ce6820f4f3"
+    },
+    "openwrt/luci-app-t551m/root/usr/libexec/unisoc-modem/t551m-radio-restart": {
+      "path": "luci-app-t551m/root/usr/libexec/unisoc-modem/t551m-radio-restart",
+      "source_sha256": "e292b4930ac27ce28385a6dbae663def688d38c813c8cc91d51f3d3dbb703395"
+    },
+    "openwrt/luci-app-t551m/root/usr/libexec/unisoc-modem/t551m-registration": {
+      "path": "luci-app-t551m/root/usr/libexec/unisoc-modem/t551m-registration",
+      "source_sha256": "a9d4eb9d379333820b7335bdadafa40682a20fed5aa1621175cca0a75ff2f69a"
+    },
+    "openwrt/luci-app-t551m/root/usr/libexec/unisoc-modem/t551m-sms": {
+      "path": "luci-app-t551m/root/usr/libexec/unisoc-modem/t551m-sms",
+      "source_sha256": "8487756df05cae4ffca79b27460bd2067413c96ccc9e150145ba2a340312a6c9"
+    },
+    "openwrt/luci-app-t551m/root/usr/libexec/unisoc-modem/traffic": {
+      "path": "luci-app-t551m/root/usr/libexec/unisoc-modem/traffic",
+      "source_sha256": "30dfe3ebc09be73f1727c7aa799ad9fc794bc20eb9394353dca02ffb70ad2514"
+    },
+    "openwrt/luci-app-t551m/root/usr/libexec/unisoc-modem/traffic-core.uc": {
+      "path": "luci-app-t551m/root/usr/libexec/unisoc-modem/traffic-core.uc",
+      "source_sha256": "15b58e36f3b00753082b0dea38ced456f9e15ee98323b7391e038b8670d7b003"
+    },
+    "openwrt/luci-app-t551m/root/usr/libexec/unisoc-modem/wifi-station-metrics": {
+      "path": "luci-app-t551m/root/usr/libexec/unisoc-modem/wifi-station-metrics",
+      "source_sha256": "8eeaa6010c7d1d8c31a3aa2ca583703541a41b26ce352376603ff16b8ae4aba7"
+    },
+    "openwrt/luci-app-t551m/root/usr/share/doc/luci-app-t551m/MU300-LICENSE": {
+      "path": "luci-app-t551m/root/usr/share/doc/luci-app-t551m/MU300-LICENSE",
+      "source_sha256": "27f276ceb52f141a9632e0ca13841f829e2a5342b6e6133dd3833358cda84fd7"
+    },
+    "openwrt/luci-app-t551m/root/usr/share/luci/menu.d/e5-cpu.json": {
+      "path": "luci-app-t551m/root/usr/share/luci/menu.d/e5-cpu.json",
+      "source_sha256": "f9981196f59809cc33faf43b39d98b9a90f1d0e9fec92c1f3c4bb8c4b6d0c2b1"
+    },
+    "openwrt/luci-app-t551m/root/usr/share/luci/menu.d/e5-sounds.json": {
+      "path": "luci-app-t551m/root/usr/share/luci/menu.d/e5-sounds.json",
+      "source_sha256": "dfac7e1c7e2f689794ab08c9e6965bcd4642947909cf3ce23d84fdfac6c062e5"
+    },
+    "openwrt/luci-app-t551m/root/usr/share/luci/menu.d/luci-app-mu300.json": {
+      "path": "luci-app-t551m/root/usr/share/luci/menu.d/luci-app-mu300.json",
+      "source_sha256": "94b0a1adb3be4dbc2be7d4db41517c5ef24a5152e0dccea8772908f9e46a41c7"
+    },
+    "openwrt/luci-app-t551m/root/usr/share/rpcd/acl.d/e5-cpu.json": {
+      "path": "luci-app-t551m/root/usr/share/rpcd/acl.d/e5-cpu.json",
+      "source_sha256": "eaef28c02738e0b4707fefcd2faf33d220be11176e8eef2031e24f30392f1ff7"
+    },
+    "openwrt/luci-app-t551m/root/usr/share/rpcd/acl.d/e5-sounds.json": {
+      "path": "luci-app-t551m/root/usr/share/rpcd/acl.d/e5-sounds.json",
+      "source_sha256": "4c16d29666c26fb720aa7e47d14d87acb6b0339aef67489459fffd2f35ef6dbb"
+    },
+    "openwrt/luci-app-t551m/root/usr/share/rpcd/acl.d/luci-app-mu300.json": {
+      "path": "luci-app-t551m/root/usr/share/rpcd/acl.d/luci-app-mu300.json",
+      "source_sha256": "7fca1b5abbf444a99410421f11b0e6daaa66db690d9414d1f9f2bdbe828520cc"
+    },
+    "openwrt/overlay/etc/config/e5-audio": {
+      "path": "overlay/etc/config/e5-audio",
+      "source_sha256": "2df05a4b8c2b32b8c11b1454a56cc3e334735d101ae80dc219bd3df8c529d13b"
+    },
+    "openwrt/overlay/etc/config/e5-bluetooth": {
+      "path": "overlay/etc/config/e5-bluetooth",
+      "source_sha256": "745955c7a015a5ecb9c3bd96040a846f059b0b8438e6140d9da62cd76a6ae65b"
+    },
+    "openwrt/overlay/etc/config/e5-charge": {
+      "path": "overlay/etc/config/e5-charge",
+      "source_sha256": "692425499cd898feded85ce338a7d86f9da7e398207056e8371f2155e18614b6"
+    },
+    "openwrt/overlay/etc/config/e5-notify": {
+      "path": "overlay/etc/config/e5-notify",
+      "source_sha256": "69dfb13d420cbb5e0409e8e6c6cf5beb54f2b4214b267653293ab5115ab67910"
+    },
+    "openwrt/overlay/etc/config/e5-sim": {
+      "path": "overlay/etc/config/e5-sim",
+      "source_sha256": "ca4225a36696dad34170c26625a4a66391e7eb522cffc6a70ec5c27b6cd83db3"
+    },
+    "openwrt/overlay/etc/hotplug.d/iface/10-e5-usb0": {
+      "path": "overlay/etc/hotplug.d/iface/10-e5-usb0",
+      "source_sha256": "0929a0a98a7dbc07a240cfc139672a8f0bb6d496f4a2aa4851a403f975aa6a21"
+    },
+    "openwrt/overlay/etc/hotplug.d/iface/90-e5-ttyd": {
+      "path": "overlay/etc/hotplug.d/iface/90-e5-ttyd",
+      "source_sha256": "f9765994914d05cfbcd2282088a6f029611d6ec20b16d2822e8b77548c66e5bb"
+    },
+    "openwrt/overlay/etc/hotplug.d/wwan/26-e5-sipa-eth": {
+      "path": "overlay/etc/hotplug.d/wwan/26-e5-sipa-eth",
+      "source_sha256": "bc3dd563243d0e8d2ead77876d915a036ebbeff15b89c3a1eaff6b98b85f39db"
+    },
+    "openwrt/overlay/etc/init.d/e5-apn-auto": {
+      "path": "overlay/etc/init.d/e5-apn-auto",
+      "source_sha256": "d681662f5d2b28247ca7cfa0191f789fd4c63eb5632a817df5e97a81d1a2690b"
+    },
+    "openwrt/overlay/etc/init.d/e5-audio": {
+      "path": "overlay/etc/init.d/e5-audio",
+      "source_sha256": "3405438c5c6135805a938f4a0d81e14b46e50e4b7797e04555ac697913d11a4b"
+    },
+    "openwrt/overlay/etc/init.d/e5-board-identity": {
+      "path": "overlay/etc/init.d/e5-board-identity",
+      "source_sha256": "953f0999b776e39f6537fdf0b64bf116a7755d52d3ca86b311d9e027784fca12"
+    },
+    "openwrt/overlay/etc/init.d/e5-boot-ok": {
+      "path": "overlay/etc/init.d/e5-boot-ok",
+      "source_sha256": "ccda4c1ef40e2ce3bdc5bea5daf98cbe1bae327fed335b3731e7b03a3ff396bc"
+    },
+    "openwrt/overlay/etc/init.d/e5-bt": {
+      "path": "overlay/etc/init.d/e5-bt",
+      "source_sha256": "6c8120bde88a8ab8b6011a00a5da493465c937eaddde2af5cab78202b1da4b44"
+    },
+    "openwrt/overlay/etc/init.d/e5-charge": {
+      "path": "overlay/etc/init.d/e5-charge",
+      "source_sha256": "7d5d536ecd79fd869e2b768798a4496befa53a87c405ffdf705e477ffd8c67a2"
+    },
+    "openwrt/overlay/etc/init.d/e5-hfp": {
+      "path": "overlay/etc/init.d/e5-hfp",
+      "source_sha256": "1ac4154c3fba45952e23a93dd839a0bb7ce6026296093aeea45f89b3d7717688"
+    },
+    "openwrt/overlay/etc/init.d/e5-hw": {
+      "path": "overlay/etc/init.d/e5-hw",
+      "source_sha256": "cbea2b8c92a6a1a1ad83c21d29ff543160daa9c37d41ddbdc1268f3073c281b4"
+    },
+    "openwrt/overlay/etc/init.d/e5-luci": {
+      "path": "overlay/etc/init.d/e5-luci",
+      "source_sha256": "1c05bae3b1d4d008ece1650b6aa594af3162c0df61703c97bba58d9e99944ab5"
+    },
+    "openwrt/overlay/etc/init.d/e5-modemd": {
+      "path": "overlay/etc/init.d/e5-modemd",
+      "source_sha256": "15333e67b2687bd8bc3c3e09e331fd8a59cfc0b1bdebd5c018ca07b009e71bb4"
+    },
+    "openwrt/overlay/etc/init.d/e5-pulseaudio": {
+      "path": "overlay/etc/init.d/e5-pulseaudio",
+      "source_sha256": "cea7a851ff94e6c6b596bfac630cb0563b10d59e8e77074cd1fc7545f7305b7b"
+    },
+    "openwrt/overlay/etc/init.d/e5-sipc-wwan": {
+      "path": "overlay/etc/init.d/e5-sipc-wwan",
+      "source_sha256": "8f664878ff5db4893f030bd057a3f5403c75ebdabab17f58f31b80635bb3dee8"
+    },
+    "openwrt/overlay/etc/init.d/e5-sms-notify": {
+      "path": "overlay/etc/init.d/e5-sms-notify",
+      "source_sha256": "f18737531e5d766c8e2338c2185be749e2317a86dc12ccd670f4d40cda3d7ca9"
+    },
+    "openwrt/overlay/etc/init.d/e5-telnetd": {
+      "path": "overlay/etc/init.d/e5-telnetd",
+      "source_sha256": "94b1f0c118b797ea46fe68e8b56c1c61e5cde4b3d5b2a599f914dfc5c933d610"
+    },
+    "openwrt/overlay/etc/init.d/e5-usb-watch": {
+      "path": "overlay/etc/init.d/e5-usb-watch",
+      "source_sha256": "222634fd52f4b94cd13645d53e4bc9c2940730fdc4dd4e67750dc9bf07d74bbf"
+    },
+    "openwrt/overlay/etc/init.d/e5-vendor": {
+      "path": "overlay/etc/init.d/e5-vendor",
+      "source_sha256": "390d5416a619f97b59fdbaec98bbd2ae009d9d08b346fb2356ad609d6fab1df2"
+    },
+    "openwrt/overlay/etc/init.d/e5-voice-audio": {
+      "path": "overlay/etc/init.d/e5-voice-audio",
+      "source_sha256": "a9da0027d2c9bb514c81ba78ca2fd2545c7582dd8660aac215df1f72e99c2fe6"
+    },
+    "openwrt/overlay/etc/pulse/system.pa": {
+      "path": "overlay/etc/pulse/system.pa",
+      "source_sha256": "fe70488867fb600b92082ae7493bf749d02ae5056aca479eab7a9a923aa1d35b"
+    },
+    "openwrt/overlay/etc/sysctl.d/10-e5-printk.conf": {
+      "path": "overlay/etc/sysctl.d/10-e5-printk.conf",
+      "source_sha256": "582ca5d7fa5be97a85eed52577708ff04b961eb833059bb9d67457453011f706"
+    },
+    "openwrt/overlay/etc/uci-defaults/90-e5": {
+      "path": "overlay/etc/uci-defaults/90-e5",
+      "source_sha256": "a2ba905c357325e663a61447c003f60bdb0d4e4ffd80866e7ea3e3991fd2b8b1"
+    },
+    "openwrt/overlay/etc/uci-defaults/91-e5-wireless": {
+      "path": "overlay/etc/uci-defaults/91-e5-wireless",
+      "source_sha256": "0d33aecc3d69f83207f6edcb642bdc30353ee52567bb4feb8254c0218cdc5a6e"
+    },
+    "openwrt/overlay/etc/uci-defaults/92-e5-default-boot": {
+      "path": "overlay/etc/uci-defaults/92-e5-default-boot",
+      "source_sha256": "8a6d1228a3ebe470957a185eba9cf08d62df50057782bbc5127100343632e125"
+    },
+    "openwrt/overlay/etc/uci-defaults/93-e5-luci": {
+      "path": "overlay/etc/uci-defaults/93-e5-luci",
+      "source_sha256": "ba4e2a70f9e26ba0fca07ae486d498d1e214c43bcd1430510612736974462f9c"
+    },
+    "openwrt/overlay/etc/uci-defaults/94-e5-bluetooth": {
+      "path": "overlay/etc/uci-defaults/94-e5-bluetooth",
+      "source_sha256": "df3f294ffb29e05a99766601ee265898b5f4cd8217cf0bfc6609a66a738d696b"
+    },
+    "openwrt/overlay/etc/uci-defaults/95-e5-sms-forward": {
+      "path": "overlay/etc/uci-defaults/95-e5-sms-forward",
+      "source_sha256": "36c77d87d0e492884eb74a4e7f06066da52c90c1986ea9622c0dd97707ebb9ee"
+    },
+    "openwrt/overlay/etc/uci-defaults/96-e5-usb-ipv4": {
+      "path": "overlay/etc/uci-defaults/96-e5-usb-ipv4",
+      "source_sha256": "2c68b85139552620c3a582f6af651b1c074963d31db6631be4a90189eba22754"
+    },
+    "openwrt/overlay/etc/uci-defaults/97-e5-hostname": {
+      "path": "overlay/etc/uci-defaults/97-e5-hostname",
+      "source_sha256": "cea22b96fbb702ed7d145c4d05de86d14baf9ca7a7b08e26211b9a2db72feebe"
+    },
+    "openwrt/overlay/lib/preinit/05_e5_debian_root": {
+      "path": "overlay/lib/preinit/05_e5_debian_root",
+      "source_sha256": "3ca2cbd828b2332806167f144d7750714bbaa63c3bddbd488f2de8e433240671"
+    },
+    "openwrt/overlay/lib/udev/rules.d/78-mm-e5-sipc.rules": {
+      "path": "overlay/lib/udev/rules.d/78-mm-e5-sipc.rules",
+      "source_sha256": "4eb7a531e7b2f51b7d1c450b37cee532b6efd2c0ebaa86644313b58fae5d1806"
+    },
+    "openwrt/overlay/usr/lib/e5/e5_call_events.py": {
+      "path": "overlay/usr/lib/e5/e5_call_events.py",
+      "source_sha256": "f4bd7addc705476f576c573ab30d6840459e7abda62c774fd34a0d46bfa46369"
+    },
+    "openwrt/overlay/usr/lib/e5/e5_call_volume.py": {
+      "path": "overlay/usr/lib/e5/e5_call_volume.py",
+      "source_sha256": "0cefd6b5579acc2a93b12980aabe8704dfeb31e5893716356bf4119876a9b652"
+    },
+    "openwrt/overlay/usr/lib/e5/e5_screen_rpc.py": {
+      "path": "overlay/usr/lib/e5/e5_screen_rpc.py",
+      "source_sha256": "34c8da8ea3efc39e11a494412c589ec6f6c4d161e29921f7b53621ad510f45f4"
+    },
+    "openwrt/overlay/usr/lib/e5/e5_sounds.py": {
+      "path": "overlay/usr/lib/e5/e5_sounds.py",
+      "source_sha256": "34431479d73415943e486e1850a08e4109f3833360b8e2a6de20665444859a20"
+    },
+    "openwrt/overlay/usr/lib/e5/sms_pdu.py": {
+      "path": "overlay/usr/lib/e5/sms_pdu.py",
+      "source_sha256": "3a0edbb752b27f077f04b980311174dd4cb8b9adb88d21df15290d3fe69f3a41"
+    },
+    "openwrt/overlay/usr/lib/e5/vendor/README": {
+      "path": "overlay/usr/lib/e5/vendor/README",
+      "source_sha256": "9647f24adb8425c7744b74c2be486a06fe36e93b20652094eaf7fe2d50af2406"
+    },
+    "openwrt/overlay/usr/lib/e5/vendor/dbus-next.LICENSE": {
+      "path": "overlay/usr/lib/e5/vendor/dbus-next.LICENSE",
+      "source_sha256": "c454ab6b8e0653a8eab828a8cbaaa368a1bbfba982178bb18b6177e311eae4cc"
+    },
+    "openwrt/overlay/usr/lib/e5/vendor/dbus_next-0.2.3-py3-none-any.whl": {
+      "path": "overlay/usr/lib/e5/vendor/dbus_next-0.2.3-py3-none-any.whl",
+      "source_sha256": "58948f9aff9db08316734c0be2a120f6dc502124d9642f55e90ac82ffb16a18b"
+    },
+    "openwrt/overlay/usr/libexec/e5-apn-auto": {
+      "path": "overlay/usr/libexec/e5-apn-auto",
+      "source_sha256": "e34a089ea0d7fbb3f630b311e9aacdb383aee1432a335dffce4353876f728b2b"
+    },
+    "openwrt/overlay/usr/libexec/e5-bt-autostart": {
+      "path": "overlay/usr/libexec/e5-bt-autostart",
+      "source_sha256": "dd444ef7ea0f6ca92ade0c3d3862454c62528104ee06dd111bc7e6d19e59d8ab"
+    },
+    "openwrt/overlay/usr/libexec/e5-bt-check": {
+      "path": "overlay/usr/libexec/e5-bt-check",
+      "source_sha256": "a01ea42d739a0711a9386a13f452b227da8a3e9c66a2d5c27e70627b5440645c"
+    },
+    "openwrt/overlay/usr/libexec/e5-bt-connect": {
+      "path": "overlay/usr/libexec/e5-bt-connect",
+      "source_sha256": "8d4553285bb9bf22535ce1c5e2eb966e200a57147d3d53379cb3491605b24f0f"
+    },
+    "openwrt/overlay/usr/libexec/e5-call-volume": {
+      "path": "overlay/usr/libexec/e5-call-volume",
+      "source_sha256": "ba9135b3110c44e3c6ad58e9e377af7e0185a349971102760f2a852ed271a5b0"
+    },
+    "openwrt/overlay/usr/libexec/e5-charge": {
+      "path": "overlay/usr/libexec/e5-charge",
+      "source_sha256": "63e1ec66451e2dc1a50c0b430eb837710a54f9918c57b7a8d39635d7213168cf"
+    },
+    "openwrt/overlay/usr/libexec/e5-container-setup": {
+      "path": "overlay/usr/libexec/e5-container-setup",
+      "source_sha256": "483fb5baa9bd2cfeb083ee29202eb93511c47a20dd5cd0d3cd2a6b722a46d704"
+    },
+    "openwrt/overlay/usr/libexec/e5-dockerd": {
+      "path": "overlay/usr/libexec/e5-dockerd",
+      "source_sha256": "99a83a0ecfc1067d59265e62e3449085668591bd8aaae29c0147b129df92ce14"
+    },
+    "openwrt/overlay/usr/libexec/e5-gpt": {
+      "path": "overlay/usr/libexec/e5-gpt",
+      "source_sha256": "9b52feb355ab0e7d4286561ee82a2a2bfa77dfa8aa0d2efae4762f10a5cd812f"
+    },
+    "openwrt/overlay/usr/libexec/e5-hfp": {
+      "path": "overlay/usr/libexec/e5-hfp",
+      "source_sha256": "7114e3712f07d416118e8d7089510e90d031e876b76efbdb55869876c21db953"
+    },
+    "openwrt/overlay/usr/libexec/e5-luci-revision": {
+      "path": "overlay/usr/libexec/e5-luci-revision",
+      "source_sha256": "d1021df52498d62bb76639b03a06e2150d5c573ca8db17383ddcdb31adefb7d0"
+    },
+    "openwrt/overlay/usr/libexec/e5-notification-sound": {
+      "path": "overlay/usr/libexec/e5-notification-sound",
+      "source_sha256": "dcb9911e4445342d0b95aa267105d07bc25bbadd8b75c1bf08f0fdfc74c46869"
+    },
+    "openwrt/overlay/usr/libexec/e5-sms": {
+      "path": "overlay/usr/libexec/e5-sms",
+      "source_sha256": "f399d16a1a7e96def7fa40dc5382c7de679c3c03d29a04d8f316811722ef5665"
+    },
+    "openwrt/overlay/usr/libexec/e5-sms-notify": {
+      "path": "overlay/usr/libexec/e5-sms-notify",
+      "source_sha256": "4cefa13a3415db0d62ca8ce914721722b0991abf1c7dcc53d500ab8aa000cb05"
+    },
+    "openwrt/overlay/usr/libexec/e5-sms-receive": {
+      "path": "overlay/usr/libexec/e5-sms-receive",
+      "source_sha256": "b12c7c9ceedde3f10c5a8b9f90d7fc37c6198ceccf6b087f4c36eeae1cfd213b"
+    },
+    "openwrt/overlay/usr/libexec/e5-sms-send": {
+      "path": "overlay/usr/libexec/e5-sms-send",
+      "source_sha256": "934b2258b19a48c3a2d0524b36216db242310e35d83545fd50d69bffa06d7902"
+    },
+    "openwrt/overlay/usr/libexec/e5-sysupgrade": {
+      "path": "overlay/usr/libexec/e5-sysupgrade",
+      "source_sha256": "511987b260e5b3a8fb73682445a395bab60b1032a813b9d62b51d25194719e34"
+    },
+    "openwrt/overlay/usr/libexec/e5-ttyd-bind": {
+      "path": "overlay/usr/libexec/e5-ttyd-bind",
+      "source_sha256": "90ef325c2004ea60707667a5503876b04dedb094d0be8b36e34ac22e0616ae1c"
+    },
+    "openwrt/overlay/usr/libexec/e5-usb-watch": {
+      "path": "overlay/usr/libexec/e5-usb-watch",
+      "source_sha256": "42ff24cbd6cde6203200f75aec44a74b77df48562b3fc87e370e083f8cd0f8e9"
+    },
+    "openwrt/overlay/usr/libexec/e5-voice-audio": {
+      "path": "overlay/usr/libexec/e5-voice-audio",
+      "source_sha256": "51d7a125ab9b608af9911ffce72ea3b458608b6b752c0a471d3820e3335330a1"
+    },
+    "openwrt/overlay/usr/libexec/e5-volume": {
+      "path": "overlay/usr/libexec/e5-volume",
+      "source_sha256": "6981d0f203bf88ef8f154700d7b06deef7212328d2440f5eafee418954095531"
+    },
+    "openwrt/overlay/usr/sbin/e5-sim": {
+      "path": "overlay/usr/sbin/e5-sim",
+      "source_sha256": "c80c773b9303e9f90319a2374fca8cf5cbab89e90aedfda06dfbd2f2c27c7a12"
+    },
+    "openwrt/overlay/usr/share/e5/beep.wav": {
+      "path": "overlay/usr/share/e5/beep.wav",
+      "source_sha256": "6c2b497cb3d5d8e39d2b76190305ca34e6c8634aaa5c5b790924c6b6f0e146c9"
+    },
+    "openwrt/overlay/usr/share/e5/call.wav": {
+      "path": "overlay/usr/share/e5/call.wav",
+      "source_sha256": "4be818acc24f160c2a44d771d2990d58b77b2d2e2f70b9a5caead6d3e175852c"
+    },
+    "openwrt/overlay/usr/share/e5/ding.wav": {
+      "path": "overlay/usr/share/e5/ding.wav",
+      "source_sha256": "06a07454d654fb8702f82accce2be5e926b7780c2cd78ddd2012f88dffdbf874"
+    },
+    "openwrt/overlay/usr/share/e5/mgmt.nft": {
+      "path": "overlay/usr/share/e5/mgmt.nft",
+      "source_sha256": "4ca46d744fb068d2a1707da643c42326d62c467c14b2afccf32417b43386be71"
+    },
+    "openwrt/overlay/usr/share/luci/menu.d/luci-app-e5-bluetooth.json": {
+      "path": "overlay/usr/share/luci/menu.d/luci-app-e5-bluetooth.json",
+      "source_sha256": "6443918c5499398aa1165e96b3d242318eaf1e00014d7bcb5952458aeed5f4f0"
+    },
+    "openwrt/overlay/usr/share/luci/menu.d/luci-app-e5-sms.json": {
+      "path": "overlay/usr/share/luci/menu.d/luci-app-e5-sms.json",
+      "source_sha256": "fa8e983d943f589b4cdb0dfaba3a2e6a80fe1631ad6393c6f17c62bd5f0cc027"
+    },
+    "openwrt/overlay/usr/share/rpcd/acl.d/luci-app-e5-bluetooth.json": {
+      "path": "overlay/usr/share/rpcd/acl.d/luci-app-e5-bluetooth.json",
+      "source_sha256": "73611e4038f80c9833a9bcfc96a9a63f8961f6afcb954ed2874d08500ab1c77d"
+    },
+    "openwrt/overlay/usr/share/rpcd/acl.d/luci-app-e5-sms.json": {
+      "path": "overlay/usr/share/rpcd/acl.d/luci-app-e5-sms.json",
+      "source_sha256": "1c81c2e2165cb4f1cb9dfe36c6a37fcd157daab2801af619c61d329168b0ad82"
+    },
+    "openwrt/overlay/usr/share/rpcd/ucode/e5-sms.uc": {
+      "path": "overlay/usr/share/rpcd/ucode/e5-sms.uc",
+      "source_sha256": "fdf11c74c970c63352669f5ff587338137cab3e2c37e5ddf4a0f7cfce681a053"
+    },
+    "openwrt/overlay/www/luci-static/resources/modemmanager_helper.js": {
+      "path": "overlay/www/luci-static/resources/modemmanager_helper.js",
+      "source_sha256": "e5da0149f7dd21b93fa1c7c3e0677066bfe2536d7f579a7fda21906ac19a2e6c"
+    },
+    "openwrt/overlay/www/luci-static/resources/view/e5-bluetooth/settings.js": {
+      "path": "overlay/www/luci-static/resources/view/e5-bluetooth/settings.js",
+      "source_sha256": "b5a4963d68873b7b408589732e05511a08f14b4a3c3b1e7f7868a3f0e73a3b80"
+    },
+    "openwrt/overlay/www/luci-static/resources/view/e5-sms/sms.css": {
+      "path": "overlay/www/luci-static/resources/view/e5-sms/sms.css",
+      "source_sha256": "cfd6bcfc24ed6433b32e575214699f8d4c0b018b0824cc0bea1eb6a3d8ab9221"
+    },
+    "openwrt/overlay/www/luci-static/resources/view/e5-sms/sms.js": {
+      "path": "overlay/www/luci-static/resources/view/e5-sms/sms.js",
+      "source_sha256": "a76953423a40c7caada8958cd08b23634c6ba4539cc917db070d8d21ff9bdf11"
+    },
+    "openwrt/overlay/www/luci-static/resources/view/modemmanager/status.js": {
+      "path": "overlay/www/luci-static/resources/view/modemmanager/status.js",
+      "source_sha256": "7edb916b3b2d4598af6fb295e5e790d33402bf33381eae280fed9e4b5ff2df59"
+    },
+    "openwrt/src/e5-ctl-raw.c": {
+      "path": "src/e5-ctl-raw.c",
+      "source_sha256": "807a9f13012d7efea0a34a0187f927e9d0fd25cfe257f60a020fedcca86aa004"
+    },
+    "openwrt/src/e5-modemd.c": {
+      "path": "src/e5-modemd.c",
+      "source_sha256": "0dcb001df3d1e25eed0d293ec0d404543a6e1f8f98d405a3dd221496fe2c3114"
+    },
+    "openwrt/src/e5-sim-probe.c": {
+      "path": "src/e5-sim-probe.c",
+      "source_sha256": "a649f3ba798de5522e724579178ea9f5d7c47efb0582eb773c4c47484f175d72"
+    },
+    "openwrt/src/e5-vibrate.c": {
+      "path": "src/e5-vibrate.c",
+      "source_sha256": "a64760cd1dad951de44521e0c769f4f392d91f7146f1c2419690f1b6619f3185"
+    },
+    "openwrt/src/logdw.c": {
+      "path": "src/logdw.c",
+      "source_sha256": "d2074f402bf311134486f47a34595d8927e53448c932ebd714170955e6cc17cd"
+    },
+    "openwrt/src/make-sounds.py": {
+      "path": "src/make-sounds.py",
+      "source_sha256": "2e86626a64fb5691918c310856450691411e0e92e0c8356390a6de12aacd96b2"
+    },
+    "openwrt/tests/call-events.py": {
+      "path": "tests/call-events.py",
+      "source_sha256": "6cf5cd54347ae8211be83865514eadf2237785a5e20e28b3b7619eac1c9e8be2"
+    },
+    "openwrt/tests/call-volume.py": {
+      "path": "tests/call-volume.py",
+      "source_sha256": "90ac0aca454ec53f5863fa344da6eff107558b9dbeb5176e644eefc960c68c3f"
+    },
+    "openwrt/tests/data-priority-hook.py": {
+      "path": "tests/data-priority-hook.py",
+      "source_sha256": "e7e6a9f09d62be102a8712e2d62b529880e0220b940757fa0176483713146113"
+    },
+    "openwrt/tests/dual-sms-routing.sh": {
+      "path": "tests/dual-sms-routing.sh",
+      "source_sha256": "1d1b3fe4ad4fd6de4c3096a30e2cf1e9de443bd7a69eb5bceb455af3164ab074"
+    },
+    "openwrt/tests/dual-sms-send.py": {
+      "path": "tests/dual-sms-send.py",
+      "source_sha256": "993d95bdd1ad7d3728241a8e1e071541ad6323edf2e32e2be762d68daf478e21"
+    },
+    "openwrt/tests/dual-sms.py": {
+      "path": "tests/dual-sms.py",
+      "source_sha256": "d7d127c29c611bbd8b10dd3f833bb45091add33b10c9b7ed6f67424aa9ee40d9"
+    },
+    "openwrt/tests/flash-diagnostics.py": {
+      "path": "tests/flash-diagnostics.py",
+      "source_sha256": "b1fee317cb6b69291b75e95c8e700da41eb360a4aca76879d0eaaa36d27c7631"
+    },
+    "openwrt/tests/gpt-plan.py": {
+      "path": "tests/gpt-plan.py",
+      "source_sha256": "87758730bef05add07af1c962caf6a0b1d5cfa060d388c178adb05457e172e40"
+    },
+    "openwrt/tests/hfp.py": {
+      "path": "tests/hfp.py",
+      "source_sha256": "5c604a31033eb7f748077bf5559cd6a908a6984adc02a06c25435a806a0c1020"
+    },
+    "openwrt/tests/image-keep-config.py": {
+      "path": "tests/image-keep-config.py",
+      "source_sha256": "c981f3aa978abe740085a0fb2df398564c38c1d99c5a4a9d2d91d45022d8d17e"
+    },
+    "openwrt/tests/luci-home-confirm.cjs": {
+      "path": "tests/luci-home-confirm.cjs",
+      "source_sha256": "b2c24a5356a14494ff3287cface73f2fa72e6d7e0a3c58fbb00efbb5f394b64e"
+    },
+    "openwrt/tests/luci-sim-slots.cjs": {
+      "path": "tests/luci-sim-slots.cjs",
+      "source_sha256": "442e35899f39263602e626d50ccacb08f68022f039e34cf26e3b633ca77151b7"
+    },
+    "openwrt/tests/luci-sms.cjs": {
+      "path": "tests/luci-sms.cjs",
+      "source_sha256": "e9404768040a29e26e7b152e6d6f9a7a7f10e70169a1efeb7af191ca2cbcc8d1"
+    },
+    "openwrt/tests/notification-sounds.py": {
+      "path": "tests/notification-sounds.py",
+      "source_sha256": "35934b859f14109b882253edd4e8586fe4379a08863471cf7e7933cdedd898b5"
+    },
+    "openwrt/tests/screen-profiles.py": {
+      "path": "tests/screen-profiles.py",
+      "source_sha256": "51bc8df9bbfe971f5c01f518a57d3a5dc0b972befa2922c6c52b792862fe110c"
+    },
+    "openwrt/tests/screen-rpc-startup.py": {
+      "path": "tests/screen-rpc-startup.py",
+      "source_sha256": "c3f2522b3f181dfe79c3f37d30c854fa33bb3ec49ffdefc4571951b040b6cb37"
+    },
+    "openwrt/tests/screen-rpc.py": {
+      "path": "tests/screen-rpc.py",
+      "source_sha256": "75a99b4cc8003daa95a01df45368429c263b1c807b3b360bb5603bb4c155b227"
+    },
+    "openwrt/tests/sim-lock.py": {
+      "path": "tests/sim-lock.py",
+      "source_sha256": "50f89542d5e7cfbb91493871adcbcec889bc658c064240fc1ab7866419cbc622"
+    },
+    "openwrt/tests/sim-power.py": {
+      "path": "tests/sim-power.py",
+      "source_sha256": "b81f89f24f46b107bea7e3f6fd955e5d600d420751699050163740ceedc9cab1"
+    },
+    "openwrt/tests/sim-probe.py": {
+      "path": "tests/sim-probe.py",
+      "source_sha256": "2ee7583c250d269502c1dda0ed92c05599a0b9c174f33eecd6bc23a43e08cb75"
+    },
+    "openwrt/tests/sms-list.sh": {
+      "path": "tests/sms-list.sh",
+      "source_sha256": "4aedc1cb79e091e55e9d4e6d15d141137b9db42c1ea3b34007b0004b564c805c"
+    },
+    "openwrt/tests/voice-audio.py": {
+      "path": "tests/voice-audio.py",
+      "source_sha256": "1b24ebec91650f0843ce8ae086c1f7e547928eb743856901fd9bbba7f65a39b3"
+    },
+    "openwrt/tests/voice-identity.py": {
+      "path": "tests/voice-identity.py",
+      "source_sha256": "081a472b9543200c80a4424687f374d2bcf4e28de1ff780117996b66844c6830"
+    },
+    "openwrt/tests/voice-recovery.py": {
+      "path": "tests/voice-recovery.py",
+      "source_sha256": "18c6e4a76dc5679cc1af3a0347044de8f6b515894e83ba8adea664065258c900"
+    },
+    "openwrt/tests/voice-urc.py": {
+      "path": "tests/voice-urc.py",
+      "source_sha256": "b7ad5a88d35fc23cbec45be47354db55483da0f1a966c5ee8746c1b0d4d1dc55"
+    },
+    "openwrt/tests/volume.py": {
+      "path": "tests/volume.py",
+      "source_sha256": "e5d01665b1d41a90b42608af2d7703e5b212ee38d1691af3037ec44ce30f2401"
+    }
+  }
+}

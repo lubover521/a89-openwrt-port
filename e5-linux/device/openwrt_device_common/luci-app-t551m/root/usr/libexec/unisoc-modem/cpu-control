@@ -1,0 +1,455 @@
+#!/usr/bin/python3
+"""CPU policies and passive CPU cooling, shared by LuCI and the info screen."""
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import subprocess
+import time
+
+
+# Whole 1 MiB SML images, including the vendor header. Both implement the
+# signed DVFS_INIT domain-byte ABI; see device/linux_device_common/kernel/cpufreq/README.md.
+VERIFIED_VOLTAGE_FIRMWARE = frozenset({
+    'c3ab5b763cbcfd09d1a4e8f598ed703c739a2081682f8278276dba4581cd1c44',
+    '51ab807ce7c13795e134031b81f6f6b904da38a771c166ce4e279f93dac72890',
+})
+VERIFIED_M8_VOLTAGE_FIRMWARE = frozenset({
+    '31425dab4aca8450757ac4207de419d06643b7204776fc7e8da5aab1d68814df',
+})
+VOLTAGE_CAPABILITY_CACHE = 'voltage-supported-v3'
+
+
+def read(path, default=''):
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return default
+
+
+def number(path, default=None):
+    try:
+        return int(read(path))
+    except ValueError:
+        return default
+
+
+def atomic_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + '.new')
+    with tmp.open('w') as stream:
+        os.chmod(tmp, 0o600)
+        json.dump(data, stream, separators=(',', ':'))
+        stream.flush()
+        os.fsync(stream.fileno())
+    tmp.replace(path)
+    fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+class Control:
+    def __init__(self, root=Path('/')):
+        self.root = root
+        self.cpu = root / 'sys/devices/system/cpu/cpufreq'
+        self.thermal = root / 'sys/class/thermal'
+        self.config = root / 'etc/e5-cpu.json'
+        self.runtime = root / 'run/e5-cpu'
+        self.voltage_config = root / 'etc/e5-cpu-voltage.json'
+        self.voltage_armed = root / 'etc/e5-cpu-voltage-armed.json'
+
+    def voltage_supported(self):
+        """Only enable the reverse-engineered ABI for verified SML firmware.
+
+        Both slots must match: the running secure monitor is selected before
+        Linux. No NV, DTBO, secure firmware or boot partitions are written.
+        """
+        cache = self.runtime / VOLTAGE_CAPABILITY_CACHE
+        if cache.exists():
+            return read(cache) == '1'
+        supported = False
+        compatible = read(self.root / 'sys/firmware/devicetree/base/compatible')
+        compatibles = compatible.split('\0')
+        verified = (VERIFIED_VOLTAGE_FIRMWARE if 'sprd,ums9621' in compatibles else
+                    VERIFIED_M8_VOLTAGE_FIRMWARE if 'sprd,ums9620' in compatibles else ())
+        if verified:
+            hashes = {}
+            for entry in (self.root / 'sys/class/block').glob('*/uevent'):
+                fields = dict(line.split('=', 1) for line in read(entry).splitlines() if '=' in line)
+                name = fields.get('PARTNAME')
+                if name not in ('sml_a', 'sml_b'):
+                    continue
+                try:
+                    with (self.root / 'dev' / entry.parent.name).open('rb') as stream:
+                        data = stream.read(1024 * 1024 + 1)
+                    hashes[name] = hashlib.sha256(data).hexdigest()
+                except OSError:
+                    pass
+            supported = (len(hashes) == 2 and
+                         len(set(hashes.values())) == 1 and
+                         hashes['sml_a'] in verified)
+        self.runtime.mkdir(parents=True, exist_ok=True)
+        cache.write_text('1' if supported else '0')
+        return supported
+
+    def voltage_profile(self):
+        if not self.voltage_config.exists():
+            return [0, 0, 0]
+        data = json.loads(self.voltage_config.read_text())
+        if not isinstance(data, dict) or set(data) != {'version', 'offsets'} or data['version'] != 1:
+            raise ValueError('Invalid voltage profile')
+        values = data['offsets']
+        if not isinstance(values, list) or len(values) != 3:
+            raise ValueError('Expected three voltage domains')
+        for value in values:
+            self.validate_voltage(value)
+        return values
+
+    @staticmethod
+    def validate_voltage(value):
+        if type(value) is not int or not -50000 <= value <= 25000 or value % 3125:
+            raise ValueError('Voltage offset must be -50000..25000 uV in 3125 uV steps')
+
+    def load_driver(self):
+        if list(self.cpu.glob('policy[0-9]*')):
+            return
+        release = read(self.root / 'proc/sys/kernel/osrelease')
+        driver = self.root / 'lib/modules' / release / 'sprd-cpufreq-v2-driver.ko'
+        if not release or not driver.exists():
+            return
+        offsets = [0, 0, 0]
+        try:
+            # A marker survives crashes, hard power loss and failed boots.
+            # Normal rc shutdown removes it; a stale marker disarms the profile.
+            if self.voltage_armed.exists():
+                raise ValueError('Unclean shutdown with custom voltage; restored factory voltage')
+            offsets = self.voltage_profile()
+            if any(offsets) and not self.voltage_supported():
+                raise ValueError('Secure firmware voltage ABI is not verified')
+        except (OSError, ValueError) as error:
+            offsets = [0, 0, 0]
+            if self.voltage_config.exists():
+                self.voltage_config.replace(self.voltage_config.with_suffix('.rejected.json'))
+            (self.runtime / 'voltage-error').write_text(str(error))
+            self.disarm_voltage()
+        commandline = read(self.root / 'sys/firmware/devicetree/base/chosen/bootargs')
+        if re.search(r'(?:^|\s)(?:sprdboot|androidboot)\.mode=charger(?:\s|\0|$)', commandline):
+            offsets = [0, 0, 0]
+        if any(offsets):
+            atomic_json(self.voltage_armed, {'offsets': offsets})
+        subprocess.run(['insmod', str(driver), 'voltage_offset_uv=' + ','.join(map(str, offsets))],
+                       check=True, capture_output=True, text=True)
+        if not list(self.cpu.glob('policy[0-9]*')):
+            raise ValueError('CPU driver failed to initialize; reboot to restore default voltage')
+
+    def disarm_voltage(self):
+        if self.voltage_armed.exists():
+            self.voltage_armed.unlink()
+            fd = os.open(self.voltage_armed.parent, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+
+    def snapshot(self):
+        policies = []
+        voltage_error = read(self.runtime / 'voltage-error') or None
+        try:
+            pending = self.voltage_profile()
+        except (OSError, ValueError) as error:
+            pending = [0, 0, 0]
+            voltage_error = str(error)
+        rails = {name: number(p / 'microvolts')
+                 for p in (self.root / 'sys/class/regulator').glob('regulator.*')
+                 if (name := read(p / 'name')).startswith(('vddcpu', 'vddsram'))}
+        for path in sorted(self.cpu.glob('policy[0-9]*')):
+            if not re.fullmatch(r'policy[0-9]+', path.name):
+                continue
+            freqs = [int(v) for v in read(path / 'scaling_available_frequencies').split() if v.isdigit()]
+            volts = []
+            for line in read(path / 'scaling_voltage_table').splitlines():
+                pair = line.split()
+                if len(pair) == 2 and all(v.isdigit() for v in pair):
+                    volts.append({'khz': int(pair[0]), 'uv': int(pair[1])})
+            domain = number(path / 'scaling_voltage_domain')
+            offset = number(path / 'scaling_voltage_offset')
+            editable = domain in (0, 1, 2) and offset is not None and self.voltage_supported()
+            # Verified SML routes domain 0/1/2 to PMIC CPU1/CPU2/CPU0.
+            # Regulator numbering does not follow Linux policy/domain numbering.
+            compatible = read(self.root / 'sys/firmware/devicetree/base/compatible').split('\0')
+            rail = (1, 2, 0)[domain] if editable and 'sprd,ums9621' in compatible else None
+            policies.append({
+                'id': path.name, 'cpus': read(path / 'related_cpus'),
+                'driver': read(path / 'scaling_driver'),
+                'current': number(path / 'cpuinfo_cur_freq', number(path / 'scaling_cur_freq')),
+                'min': number(path / 'scaling_requested_min_freq', number(path / 'scaling_min_freq')),
+                'max': number(path / 'scaling_requested_max_freq', number(path / 'scaling_max_freq')),
+                'effective_min': number(path / 'scaling_min_freq'),
+                'effective_max': number(path / 'scaling_max_freq'),
+                'hardware_min': number(path / 'cpuinfo_min_freq'),
+                'hardware_max': number(path / 'cpuinfo_max_freq'),
+                'frequencies': sorted(set(freqs)),
+                'governor': read(path / 'scaling_governor'),
+                'governors': read(path / 'scaling_available_governors').split(),
+                'voltages': volts,
+                'voltage_domain': domain, 'voltage_offset': offset,
+                'voltage_next': pending[domain] if domain in (0, 1, 2) else None,
+                'voltage_boot_writable': editable,
+                'voltage_actual': rails.get(f'vddcpu{rail}'),
+                'sram_voltage_actual': rails.get(f'vddsram{rail}'),
+            })
+        zones = []
+        for path in sorted(self.thermal.glob('thermal_zone[0-9]*')):
+            cooling = []
+            for link in path.glob('cdev[0-9]*'):
+                if not re.fullmatch(r'cdev[0-9]+', link.name) or not link.is_dir():
+                    continue
+                kind = read(link / 'type')
+                if kind.startswith('cpufreq'):
+                    cooling.append({'type': kind, 'state': number(link / 'cur_state'),
+                                    'max_state': number(link / 'max_state'),
+                                    'trip': number(path / (link.name + '_trip_point'))})
+            trips = []
+            for temp in sorted(path.glob('trip_point_*_temp')):
+                match = re.fullmatch(r'trip_point_(\d+)_temp', temp.name)
+                if not match:
+                    continue
+                index = int(match[1])
+                kind = read(path / f'trip_point_{index}_type')
+                trips.append({'id': index, 'type': kind, 'temp': number(temp),
+                              'throttles_cpu': any(c['trip'] == index for c in cooling),
+                              'hysteresis': number(path / f'trip_point_{index}_hyst'),
+                              'writable': kind == 'passive' and bool(cooling) and bool(temp.stat().st_mode & 0o200)})
+            if trips or cooling:
+                zones.append({'id': path.name, 'name': read(path / 'type'),
+                              'temp': number(path / 'temp'), 'trips': trips, 'cooling': cooling})
+        return {'ok': True, 'available': bool(policies), 'policies': policies, 'zones': zones,
+                'persistent': self.config.exists(), 'voltage_writable': False,
+                'voltage_boot_writable': any(p['voltage_boot_writable'] for p in policies),
+                'voltage_reboot_required': any(p['voltage_offset'] != p['voltage_next']
+                                              for p in policies if p['voltage_offset'] is not None),
+                'voltage_min': -50000, 'voltage_max': 25000, 'voltage_step': 3125,
+                'voltage_error': voltage_error,
+                'overclock_available': False,
+                'last_boot_error': read(self.runtime / 'boot-error') or None}
+
+    @staticmethod
+    def settings(state):
+        return {'policies': [{k: p[k] for k in ('id', 'cpus', 'min', 'max', 'governor')}
+                             for p in state['policies']],
+                'thermal': [{'zone': z['name'], 'trip': t['id'], 'temp': t['temp']}
+                            for z in state['zones'] for t in z['trips'] if t['writable']]}
+
+    def defaults(self):
+        path = self.runtime / 'defaults.json'
+        if not path.exists():
+            atomic_json(path, self.settings(self.snapshot()))
+        return json.loads(path.read_text())
+
+    def write(self, path, value):
+        with path.open('w') as stream:
+            stream.write(str(value) + '\n')
+        if path.name in ('scaling_min_freq', 'scaling_max_freq'):
+            requested = path.with_name(path.name.replace('scaling_', 'scaling_requested_'))
+            if requested.exists():
+                path = requested
+        # CPUFreq applies frequency QoS changes on a workqueue. An immediate
+        # read may still show the old limit even though the write succeeded.
+        deadline = time.monotonic() + 0.75
+        while read(path) != str(value):
+            if time.monotonic() >= deadline:
+                raise ValueError('Kernel did not accept ' + path.name)
+            time.sleep(0.02)
+
+    @staticmethod
+    def integer(value):
+        if type(value) is not int:
+            raise ValueError('Expected an integer')
+        return value
+
+    def apply(self, changes, persist=None):
+        if not isinstance(changes, dict) or set(changes) - {'policies', 'thermal'}:
+            raise ValueError('Unknown CPU setting')
+        if persist is not None and type(persist) is not bool:
+            raise ValueError('Invalid persistence flag')
+        state = self.snapshot()
+        self.defaults()
+        steps, seen = [], set()
+        next_voltage = None
+        for p in changes.get('policies', []):
+            if not isinstance(p, dict) or set(p) - {'id', 'cpus', 'min', 'max', 'governor', 'voltage_next'}:
+                raise ValueError('Invalid CPU policy')
+            current = next((v for v in state['policies'] if v['id'] == p.get('id')), None)
+            if not current or current['id'] in seen:
+                raise ValueError('CPU policy missing or repeated')
+            seen.add(current['id'])
+            if 'voltage_next' in p:
+                self.validate_voltage(p['voltage_next'])
+                if not current['voltage_boot_writable']:
+                    raise ValueError('Boot voltage adjustment unavailable for this kernel/firmware')
+                if next_voltage is None:
+                    next_voltage = self.voltage_profile()
+                next_voltage[current['voltage_domain']] = p['voltage_next']
+            if 'cpus' in p and p['cpus'] != current['cpus']:
+                raise ValueError('CPU topology changed; reset saved settings')
+            low = self.integer(p.get('min', current['min']))
+            high = self.integer(p.get('max', current['max']))
+            gov = p.get('governor', current['governor'])
+            if low not in current['frequencies'] or high not in current['frequencies'] or low > high:
+                raise ValueError('Choose supported frequencies with minimum <= maximum')
+            if gov not in current['governors']:
+                raise ValueError('Governor unavailable')
+            path = self.cpu / current['id']
+            # Crossing ranges require raising max first or lowering min first.
+            limits = [('scaling_min_freq', low), ('scaling_max_freq', high)]
+            if low > current['max']:
+                limits.reverse()
+            steps.extend((path / name, value) for name, value in limits)
+            steps.append((path / 'scaling_governor', gov))
+        proposed = {}
+        for item in changes.get('thermal', []):
+            if not isinstance(item, dict) or set(item) != {'zone', 'trip', 'temp'}:
+                raise ValueError('Invalid thermal setting')
+            index, temp = self.integer(item['trip']), self.integer(item['temp'])
+            zones = [z for z in state['zones'] if z['name'] == item['zone']]
+            if len(zones) != 1:
+                raise ValueError('CPU thermal zone unavailable or ambiguous')
+            zone = zones[0]
+            trip = next((t for t in zone['trips'] if t['id'] == index), None)
+            key = (zone['name'], index)
+            if key in proposed or not trip or not trip['writable']:
+                raise ValueError('Only writable passive CPU trips may be changed')
+            critical = [t['temp'] for t in zone['trips'] if t['type'] in ('critical', 'hot') and t['temp']]
+            ceiling = min([100000] + [t - 10000 for t in critical])
+            if not 40000 <= temp <= ceiling or temp % 1000:
+                raise ValueError('Temperature must use 1 C steps within the protected range')
+            proposed[key] = temp
+            steps.append((self.thermal / zone['id'] / f'trip_point_{index}_temp', temp))
+        for zone in state['zones']:
+            temps = [proposed.get((zone['name'], t['id']), t['temp'])
+                     for t in zone['trips'] if t['type'] == 'passive']
+            if any(b - a < 1000 for a, b in zip(temps, temps[1:])):
+                raise ValueError('Passive trip temperatures must increase by at least 1 C')
+        undo = []
+        previous_config = self.config.read_bytes() if self.config.exists() else None
+        previous_voltage = self.voltage_config.read_bytes() if self.voltage_config.exists() else None
+        try:
+            for path, value in steps:
+                requested = path.with_name(path.name.replace('scaling_', 'scaling_requested_'))
+                before = read(requested if requested.exists() else path)
+                if before != str(value):
+                    undo.append((path, before))
+                    self.write(path, value)
+            if persist is True or (persist is None and self.config.exists()):
+                atomic_json(self.config, self.settings(self.snapshot()))
+            elif persist is False:
+                self.config.unlink(missing_ok=True)
+            if next_voltage is not None:
+                atomic_json(self.voltage_config, {'version': 1, 'offsets': next_voltage})
+                (self.runtime / 'voltage-error').unlink(missing_ok=True)
+        except (OSError, ValueError) as error:
+            failures = []
+            for path, value in reversed(undo):
+                try:
+                    self.write(path, value)
+                except (OSError, ValueError):
+                    failures.append(path.name)
+            for path, previous in ((self.config, previous_config), (self.voltage_config, previous_voltage)):
+                try:
+                    current = path.read_bytes() if path.exists() else None
+                    if current == previous:
+                        continue
+                    if previous is None:
+                        path.unlink(missing_ok=True)
+                        fd = os.open(path.parent, os.O_RDONLY)
+                        try:
+                            os.fsync(fd)
+                        finally:
+                            os.close(fd)
+                    else:
+                        atomic_json(path, json.loads(previous))
+                except (OSError, ValueError):
+                    failures.append(path.name)
+            if failures:
+                raise ValueError(f'{error}; rollback failed: {", ".join(failures)}') from error
+            raise
+        return self.snapshot()
+
+    def set_item(self, item, value):
+        if item == 'persist':
+            return self.apply({}, value)
+        if item == 'reset':
+            result = self.apply(self.defaults(), False)
+            if self.voltage_config.exists():
+                atomic_json(self.voltage_config, {'version': 1, 'offsets': [0, 0, 0]})
+            return self.snapshot()
+        match = re.fullmatch(r'(policy\d+)_(min|max|governor|voltage_next)', item)
+        if match:
+            key = match[2]
+            if key != 'governor':
+                if not re.fullmatch(r'-?[0-9]+', str(value)):
+                    raise ValueError('Invalid frequency')
+                value = int(value)
+            return self.apply({'policies': [{'id': match[1], key: value}]})
+        match = re.fullmatch(r'(thermal_zone\d+)_trip(\d+)', item)
+        if match:
+            zone = next((z for z in self.snapshot()['zones'] if z['id'] == match[1]), None)
+            if not zone:
+                raise ValueError('Thermal zone unavailable')
+            return self.apply({'thermal': [{'zone': zone['name'], 'trip': int(match[2]),
+                                            'temp': self.integer(value) * 1000}]})
+        raise ValueError('Unsupported CPU setting')
+
+    def boot(self):
+        self.runtime.mkdir(parents=True, exist_ok=True)
+        self.load_driver()
+        self.defaults()
+        if self.config.exists():
+            try:
+                self.apply(json.loads(self.config.read_text()), None)
+                (self.runtime / 'boot-error').unlink(missing_ok=True)
+            except (OSError, ValueError) as error:
+                # Keep the rejected profile available for inspection, without
+                # repeatedly applying it on future boots.
+                self.config.replace(self.config.with_suffix('.rejected.json'))
+                (self.runtime / 'boot-error').write_text(str(error))
+                raise
+        return self.snapshot()
+
+
+def main():
+    method = sys.argv[1] if len(sys.argv) > 1 else 'get'
+    controller = Control()
+    controller.runtime.mkdir(parents=True, exist_ok=True)
+    with (controller.runtime / 'lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            if method == 'get':
+                result = controller.snapshot()
+            elif method == 'boot':
+                result = controller.boot()
+            elif method == 'shutdown':
+                controller.disarm_voltage()
+                result = {'ok': True}
+            elif method == 'apply':
+                request = json.load(sys.stdin)
+                result = controller.apply(request.get('changes', {}), request.get('persist'))
+            elif method == 'set':
+                request = json.loads(sys.argv[2]) if len(sys.argv) > 2 else json.load(sys.stdin)
+                result = controller.set_item(request.get('id', ''), request.get('value'))
+            elif method == 'reset':
+                result = controller.set_item('reset', None)
+            else:
+                raise ValueError('Unknown operation')
+        except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as error:
+            result = {'ok': False, 'error': str(error)}
+        print(json.dumps(result, separators=(',', ':')))
+
+
+if __name__ == '__main__':
+    main()

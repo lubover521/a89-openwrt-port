@@ -1,0 +1,22 @@
+# Shared OpenWrt runtime dependencies. openssl-util provides /usr/bin/openssl.
+wpad-basic-mbedtls
+wifi-scripts
+iwinfo
+iw
+ip-full
+bash
+mount-utils
+luci-proto-modemmanager
+dbus-utils
+alsa-utils
+curl
+ca-bundle
+openssl-util
+msmtp
+r8152-firmware
+python3
+
+# Shared web terminal; binding remains restricted by e5-ttyd-bind.
+ttyd
+luci-app-ttyd
+luci-i18n-ttyd-tr

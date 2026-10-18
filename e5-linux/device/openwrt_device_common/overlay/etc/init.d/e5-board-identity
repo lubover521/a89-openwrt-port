@@ -1,0 +1,24 @@
+#!/bin/sh /etc/rc.common
+# Display metadata supplied by the board profile, independent of SoC drivers.
+START=11
+
+start() {
+	local model
+	[ -r /etc/e5/device-model ] || return 0
+	IFS= read -r model < /etc/e5/device-model
+	[ -n "$model" ] || return 0
+	mkdir -p /tmp/sysinfo
+	printf '%s\n' "$model" > /tmp/sysinfo/model
+	# Keep the existing board id/network/radio data; only update its label.
+	ucode -e '
+		import { readfile, writefile, rename } from "fs";
+		let model = trim(readfile("/etc/e5/device-model") ?? "");
+		let board = json(readfile("/etc/board.json") ?? "{}");
+		if (!model || type(board) != "object") exit(1);
+		if (board.model?.name == model) exit(0);
+		board.model ??= {};
+		board.model.name = model;
+		if (!writefile("/etc/board.json.identity", sprintf("%J\n", board))) exit(1);
+		if (!rename("/etc/board.json.identity", "/etc/board.json")) exit(1);
+	'
+}

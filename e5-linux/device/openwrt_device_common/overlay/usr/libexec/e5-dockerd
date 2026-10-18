@@ -1,0 +1,27 @@
+#!/usr/bin/env python3
+"""Delegate cgroup v2 controllers before Docker probes its own capabilities."""
+import os
+from pathlib import Path
+import sys
+
+cgroup_root = Path('/sys/fs/cgroup')
+if (cgroup_root / 'cgroup.controllers').is_file():
+    relative = next(line[3:] for line in Path('/proc/self/cgroup').read_text().splitlines()
+                    if line.startswith('0::'))
+    current = cgroup_root / relative.lstrip('/')
+    # Enable ancestors only: the current leaf contains this process. The root
+    # cgroup is exempt from the no-internal-process rule; procd's intermediate
+    # service directories contain no processes. Existing limits stay unchanged.
+    ancestors = []
+    while current != cgroup_root:
+        current = current.parent
+        if current != cgroup_root and cgroup_root not in current.parents:
+            raise RuntimeError('Invalid cgroup path')
+        ancestors.append(current)
+    for parent in reversed(ancestors):
+        available = set((parent / 'cgroup.controllers').read_text().split())
+        enabled = set((parent / 'cgroup.subtree_control').read_text().split())
+        wanted = (available & {'cpu', 'cpuset', 'io', 'memory', 'pids'}) - enabled
+        if wanted:
+            (parent / 'cgroup.subtree_control').write_text(' '.join('+' + x for x in sorted(wanted)))
+os.execv('/usr/bin/dockerd', ['dockerd', *sys.argv[1:]])

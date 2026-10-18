@@ -1,0 +1,5 @@
+#!/bin/sh
+# TIMEOUT, COMMAND: nr2 by default, nr6/nr7 when a collector selects its slot.
+case ${1:-} in ''|*[!0-9]*) exit 2 ;; esac
+[ "$1" -ge 1 ] && [ "$1" -le 60 ] && [ "$#" = 2 ] || exit 2
+exec /opt/e5/e5-at -t "$1" "$2"

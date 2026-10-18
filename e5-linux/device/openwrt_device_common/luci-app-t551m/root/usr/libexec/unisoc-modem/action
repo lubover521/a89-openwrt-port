@@ -1,0 +1,101 @@
+#!/bin/sh
+# mu300-dash-act -- the dashboard's actions, one op per invocation:
+#   mu300-dash-act radio on|off     persistent, per-SIM RF control
+#   mu300-dash-act data up|down     netifd wan interface up/down (no AT in-band)
+#   mu300-dash-act wifi on|off      uci wireless disabled flag + wifi up/down
+#   mu300-dash-act modem-reset      the SFUN 5/3/2/4 sequence mobile-data uses for sim-reset
+#   mu300-dash-act vpn start|stop   /etc/init.d/mu300-vpn
+#   mu300-dash-act reboot           the whole box, after a 3 s grace for the HTTP reply
+#
+# Every op prints one JSON line on stdout. The rpcd backend (/usr/libexec/rpcd/mu300dash)
+# runs the slow ones via setsid and returns immediately: LuCI's /admin/ubus endpoint
+# kills a call after 30 s, and AT-heavy sequences must never run inside a request
+# anyway (they would starve the dial watchdog; same rule as the collector).
+#
+# All user RF controls share the SIM-management backend and saved policy.
+
+export PATH="$PATH:/opt/mu300/bin:/opt/mu300/busybox-bin:/usr/libexec/unisoc-modem:/usr/sbin:/sbin"
+
+DASH=/usr/libexec/unisoc-modem
+AT=${MU300_AT:-/usr/libexec/unisoc-modem/at}
+DATA_IFACE=$(uci -q get unisoc_modem.main.data_interface 2>/dev/null)
+DATA_IFACE=${DATA_IFACE:-wan}
+ok()   { printf '{"ok":1,"op":"%s"}\n' "$1"; }
+fail() { printf '{"ok":0,"op":"%s","error":%s}\n' "$1" "$(printf '%s' "$2" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\r\n' | sed 's/.*/"&"/')"; }
+
+
+case "${1:-}" in
+    data)
+        if [ -n "${MU300_SIM_SLOT:-}" ] && [ "$MU300_SIM_SLOT" != "$(cat /sys/module/sipc_wwan/parameters/card)" ]; then
+            fail data '该卡不是上网卡；此操作不会切换上网卡'; exit 1
+        fi ;;
+esac
+case "${1:-}:${2:-}" in
+    radio:on|radio:off)
+        slot=${MU300_SIM_SLOT:-$(cat /sys/module/sipc_wwan/parameters/card)}
+        case "$slot" in 0|1) ;; *) fail radio 'Invalid SIM slot'; exit 1;; esac
+        enabled=false; [ "$2" != on ] || enabled=true
+        printf '{"slot":"%s","enabled":%s,"confirm":true}\n' "$slot" "$enabled" | "$DASH/data-sim" radio
+        ;;
+    data:up)
+        "$DASH/radio-allowed" "$(cat /sys/module/sipc_wwan/parameters/card)" || { fail data 'This SIM radio is disabled by the user'; exit 1; }
+        ifup "$DATA_IFACE" 2>/dev/null
+        ok "data up"
+        ;;
+    data:down)
+        ifdown "$DATA_IFACE" 2>/dev/null
+        ok "data down"
+        ;;
+    wifi:on|wifi:off)
+        exec "$DASH/hotspot" "$2"
+        ;;
+    modem-reset:)
+        "$DASH/t551m-radio-restart" && ok "modem-reset" || fail "modem-reset" "ModemManager restart failed"
+        ;;
+    vpn:start|vpn:stop)
+        if [ -x /etc/init.d/mu300-vpn ]; then
+            /etc/init.d/mu300-vpn "$2" >/dev/null 2>&1
+            ok "vpn $2"
+        else
+            fail "vpn $2" "VPN integration is not provided by this platform"
+        fi
+        ;;
+    reboot:)
+        sleep 3   # the reply has to make it out first
+        reboot
+        ;;
+    os:linux-default)
+        if [ ! -x /opt/e5/e5-next-boot ]; then
+            fail "os linux-default" "启动控制不可用"
+        elif out=$(/opt/e5/e5-next-boot linux 2>&1); then
+            ok "os linux-default"
+        else
+            case "$out" in
+                *"rollback failed"*) message='启动控制回退失败，请检查启动设置' ;;
+                *"boot control busy"*) message='启动控制正忙，请稍后重试' ;;
+                *"invalid boot control block size"*) message='启动控制信息无效' ;;
+                *"misc verify failed"*) message='启动控制回读校验失败' ;;
+                *) message='默认启动设置失败，请重试' ;;
+            esac
+            fail "os linux-default" "$message"
+        fi
+        ;;
+    os:android)
+        # arm inline (fast, failures surface to the page); reboot DETACHED so
+        # the reply reaches the browser before the box goes down - a reboot
+        # inside the rpcd call kills the ubus reply pipe first
+        if [ ! -x /opt/e5/e5-next-boot ]; then
+            fail "os android" "dual-boot integration is not provided by this platform"
+        elif out=$(/opt/e5/e5-next-boot android 2>&1); then
+            ok "os android"
+            setsid sh -c 'sleep 3; reboot' >/dev/null 2>&1 &
+        else
+            fail "os android" "${out:-mu300-next-boot failed}"
+        fi
+        ;;
+    *)
+        echo "usage: $0 radio on|off | data up|down | wifi on|off | modem-reset | vpn start|stop | reboot | os android" >&2
+        printf '{"ok":0,"error":"unknown op"}\n'
+        exit 2
+        ;;
+esac

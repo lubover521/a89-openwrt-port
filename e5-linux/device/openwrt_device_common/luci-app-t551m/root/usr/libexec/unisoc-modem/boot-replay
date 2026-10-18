@@ -1,0 +1,61 @@
+#!/bin/sh
+# The MM wrapper runs `early` before starting the daemon. The UI service only
+# verifies after activation; it never writes settings or cycles the radio.
+cfg() { uci -q get "unisoc_modem.main.$1" 2>/dev/null || true; }
+AT_BIN=${UNISOC_AT_BIN:-/usr/libexec/unisoc-modem/at}
+LOCK_BIN=${UNISOC_LOCK_BIN:-/usr/libexec/unisoc-modem/lock}
+state=$(cfg state_dir); state=${state:-/etc/unisoc-modem/lock-state.d}
+marker=${UNISOC_REPLAY_MARKER:-/run/unisoc-modem-lock-replay-done}
+attempt=${marker}-attempted
+stage=${1:-verify}
+deadline=$(cfg replay_timeout); deadline=${deadline:-90}
+case $deadline in ''|*[!0-9]*) deadline=90 ;; esac
+
+have=0
+for dir in "$state" "$state/sim0" "$state/sim1"; do
+    [ "$dir" != "$state" ] || [ ! -f "$state/.per-sim-migrated" ] || continue
+    [ "$(cat "$dir/auto_apply" 2>/dev/null)" != off ] || continue
+    # Empty band/cell files explicitly request unlock and must also replay.
+    for k in volte vonr endc mode lte nr cell; do [ -f "$dir/$k" ] && have=1; done
+done
+[ "$have" = 1 ] || exit 0
+
+case "$stage" in
+    early)
+        [ -e "$marker" ] && exit 0
+        # One attempt per boot, including MM respawns. Failed early settings
+        # remain visible as errors, never retried after dialing has begun.
+        mkdir "$attempt" 2>/dev/null || exit 0
+        ;;
+    verify) ;;
+    *) exit 2 ;;
+esac
+
+read uptime rest < /proc/uptime
+end=$(( ${uptime%%.*} + deadline ))
+while :; do
+    read uptime rest < /proc/uptime
+    [ "${uptime%%.*}" -lt "$end" ] || break
+    if [ "$stage" = early ]; then
+        if "$AT_BIN" -t 3 AT 2>/dev/null | grep -qE '(^|[[:space:]])OK([[:space:]]|$)'; then
+            result=$("$LOCK_BIN" replay early)
+            status=$?
+            logger -t unisoc-modem "pre-dial lock replay: $result"
+            exit "$status"
+        fi
+    elif [ -e "$marker" ]; then
+        ready=$(mmcli -m any --timeout=3 --output-keyvalue 2>/dev/null |
+            awk '$1 == "modem.generic.state" { print $3 }')
+        case "$ready" in
+            enabled|searching|registered|disconnecting|connecting|connected)
+                result=$("$LOCK_BIN" verify)
+                status=$?
+                logger -t unisoc-modem "post-activation lock verification: $result"
+                exit "$status"
+                ;;
+        esac
+    fi
+    sleep 1
+done
+logger -t unisoc-modem "lock $stage timed out after ${deadline}s; no late replay"
+exit 1

@@ -1,0 +1,417 @@
+#!/usr/bin/python3
+"""USB CC policy and host Ethernet integration; hotplug driven, no polling daemon."""
+import fcntl
+import gzip
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+import time
+import uuid
+
+SYS = Path('/sys')
+RUN = Path('/run/unisoc-usb')
+CFG = 'unisoc_modem.usb'
+GADGET = Path('/sys/kernel/config/usb_gadget/linux')
+MODES = {'ncm': '0xa4a1', 'ecm': '0xa4a3', 'rndis': '0xa4a2'}
+ETHERNET = {'r8152', 'r8153_ecm', 'asix', 'ax88179_178a', 'cdc_ether',
+            'cdc_ncm', 'rndis_host', 'smsc75xx', 'smsc95xx'}
+
+
+def command(*args, required=True):
+    result = subprocess.run(args, text=True, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, timeout=12)
+    if required and result.returncode:
+        raise RuntimeError(result.stderr.strip() or '操作失败：' + args[0])
+    return result.stdout.strip()
+
+
+def read(path, default=''):
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return default
+
+
+def setting(key, default=''):
+    return command('uci', '-q', 'get', CFG + '.' + key, required=False) or default
+
+
+def save(key, value):
+    if not command('uci', '-q', 'get', CFG, required=False):
+        command('uci', 'set', CFG + '=device')
+    command('uci', 'set', CFG + '.' + key + '=' + value)
+    command('uci', 'commit', 'unisoc_modem')
+
+
+def role_path():
+    for path in sorted((SYS / 'bus/platform/devices').glob('*/usb_role_policy')):
+        if path.is_file():
+            return path
+    return None
+
+
+def role_now():
+    path = role_path()
+    if path:
+        return read(path.with_name('usb_role'), 'none')
+    # Automatic OTG kernels predating the manual policy ABI still report
+    # their actual attachment; do not pretend every system is a USB device.
+    for path in (SYS / 'class/extcon').glob('*/state'):
+        if 'USB-HOST=1' in read(path).splitlines():
+            return 'host'
+    for path in (SYS / 'class/udc').glob('*/state'):
+        if read(path) == 'configured':
+            return 'device'
+    return 'none'
+
+
+def job_read():
+    try:
+        return json.loads((RUN / 'role.json').read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def job_write(value):
+    tmp = RUN / 'role.json.new'
+    tmp.write_text(json.dumps(value) + '\n')
+    tmp.replace(RUN / 'role.json')
+
+
+def net_current():
+    link = GADGET / 'configs/c.1/f1'
+    return link.resolve().name.split('.')[0] if link.is_symlink() else ''
+
+
+def net_modes():
+    try:
+        with gzip.open('/proc/config.gz', 'rt') as stream:
+            config = set(stream.read().splitlines())
+        return [mode for mode in MODES if 'CONFIG_USB_CONFIGFS_' + mode.upper() + '=y' in config]
+    except (OSError, ValueError):
+        return [net_current()] if net_current() in MODES else []
+
+
+def save_net(mode, scope, enabled):
+    if mode not in MODES or scope not in ('once', 'permanent') or enabled not in ('0', '1'):
+        raise ValueError('无效的 USB 网络设置')
+    if mode not in net_modes():
+        raise ValueError('当前内核不支持所选 USB 网络协议')
+    # One commit for the whole selection; no re-enumeration while saving.
+    if not command('uci', '-q', 'get', CFG, required=False):
+        command('uci', 'set', CFG + '=device')
+    for key, value in [('net_mode', mode), ('net_scope', scope), ('net_auto', enabled)]:
+        command('uci', 'set', CFG + '.' + key + '=' + value)
+    command('uci', 'commit', 'unisoc_modem')
+    return dict(ok=1, reboot_required=1)
+
+
+def gadget_mode(mode):
+    """Change only our network function; preserve ACM, MACs and bridge ownership."""
+    current = net_current()
+    if mode not in MODES or current not in MODES:
+        raise ValueError('USB gadget 配置不可识别')
+    if current == mode:
+        return
+    g = GADGET
+    config = g / 'configs/c.1'
+    link = config / 'f1'
+    old_function = link.resolve()
+    serial_link = config / 'f2'
+    serial_function = serial_link.resolve()
+    if not serial_link.is_symlink() or serial_function.name != 'acm.GS0':
+        raise ValueError('USB 串口配置不可识别')
+    if set((g / 'functions').iterdir()) != {old_function, serial_function}:
+        raise ValueError('USB gadget 存在自定义函数，请先恢复默认配置')
+    if old_function.parent != (g / 'functions').resolve():
+        raise ValueError('USB gadget 网络函数路径异常')
+    # Don't edit a gadget customised into several configurations or links.
+    refs = [p for p in (g / 'configs').glob('*/*') if p.is_symlink() and p.resolve() == old_function]
+    if refs != [link]:
+        raise ValueError('USB gadget 存在额外网络配置，请先恢复默认配置')
+    udc = read(g / 'UDC')
+    if not udc:
+        raise RuntimeError('USB gadget 尚未绑定控制器')
+    bridge = (SYS / 'class/net/usb0/master')
+    master = bridge.resolve().name if bridge.exists() else ''
+    # This gadget implementation includes its C-string terminator in configfs.
+    macs = {key: read(old_function / key).rstrip('\x00') for key in ('dev_addr', 'host_addr')}
+    if not all(re.fullmatch(r'[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}', v) for v in macs.values()):
+        raise ValueError('USB gadget MAC 地址无效')
+    descriptors = {key: read(g / key) for key in ('idProduct', 'bDeviceClass', 'bDeviceSubClass', 'bDeviceProtocol')}
+    label = read(config / 'strings/0x409/configuration')
+
+    def configure(target, restore=False):
+        if read(g / 'UDC'):
+            (g / 'UDC').write_text('\n')
+        os_link = g / 'os_desc/c.1'
+        if os_link.is_symlink():
+            os_link.unlink()
+        (g / 'os_desc/use').write_text('0\n')
+        if link.is_symlink():
+            link.unlink()
+        if serial_link.is_symlink():
+            serial_link.unlink()
+        for name in MODES:
+            function = g / 'functions' / (name + '.usb0')
+            if function.exists():
+                function.rmdir()  # configfs removes its own attributes, never recursive.
+        function = g / 'functions' / (target + '.usb0')
+        function.mkdir()
+        (function / 'ifname').write_text('usb%d\n')
+        for key, value in macs.items():
+            (function / key).write_text(value + '\n')
+        values = descriptors if restore else dict(idProduct=MODES[target], bDeviceClass='0xef',
+                                                  bDeviceSubClass='0x02', bDeviceProtocol='0x01')
+        for key, value in values.items():
+            (g / key).write_text(value + '\n')
+        (config / 'strings/0x409/configuration').write_text(
+            (label if restore else 'Linux ' + target.upper() + ' + ACM console') + '\n')
+        if target == 'rndis':
+            (function / 'os_desc/interface.rndis/compatible_id').write_text('RNDIS\n')
+            (function / 'os_desc/interface.rndis/sub_compatible_id').write_text('5162001\n')
+            (g / 'os_desc/qw_sign').write_text('MSFT100\n')
+            (g / 'os_desc/b_vendor_code').write_text('0xcd\n')
+            os_link.symlink_to(config)
+            (g / 'os_desc/use').write_text('1\n')
+        link.symlink_to(function)
+        serial_link.symlink_to(serial_function)
+        # Binding creates the netdev. Hold the pull-up off until it has joined
+        # the original bridge, so RNDIS's first DHCP request is not lost.
+        (g / 'UDC').write_text(udc + '\n')
+        connect = SYS / 'class/udc' / udc / 'soft_connect'
+        connect.write_text('disconnect\n')
+        command('ip', 'link', 'set', 'dev', 'usb0', 'up')
+        if master:
+            command('ip', 'link', 'set', 'dev', 'usb0', 'master', master)
+        connect.write_text('connect\n')
+
+    # Existing recovery watcher honours this short exclusive lock too.
+    reset_lock = Path('/tmp/run/e5-usb-reset/lock')
+    reset_lock.parent.mkdir(parents=True, exist_ok=True)
+    reset_lock.mkdir()
+    try:
+        try:
+            configure(mode)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            try:
+                configure(current, restore=True)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as recovery:
+                raise RuntimeError(f'USB 模式切换失败：{error}；恢复失败：{recovery}') from error
+            raise RuntimeError(f'USB 模式切换失败，已恢复 {current.upper()}：{error}') from error
+    finally:
+        reset_lock.rmdir()
+
+
+def boot_net():
+    marker = RUN / 'net-boot.json'
+    if marker.exists():
+        return  # A service reload must not consume another one-boot choice.
+    enabled = setting('net_auto') == '1'
+    mode = setting('net_mode', 'ncm') if enabled else 'ncm'
+    try:
+        if mode not in net_modes():
+            raise ValueError('当前内核不支持所选 USB 网络协议')
+        gadget_mode(mode)
+        if enabled and setting('net_scope', 'permanent') == 'once':
+            save('net_auto', '0')
+        result = dict(mode=mode, error='')
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        result = dict(mode=net_current(), error=str(error))
+        command('logger', '-t', 'unisoc-usb', str(error), required=False)
+    temporary = marker.with_suffix('.new')
+    temporary.write_text(json.dumps(result) + '\n')
+    temporary.replace(marker)
+
+
+def state():
+    path = role_path()
+    job = job_read()
+    pending = bool(job.get('pending')) and time.time() - job.get('time', 0) < 20
+    error = job.get('error', '')
+    if job.get('pending') and not pending:
+        error = '角色切换超时，请重新应用'
+    supported = net_modes()
+    return dict(ok=1, role=role_now(), policy=read(path, 'auto') if path else 'auto',
+                role_auto=int(setting('role_auto') == '1'), host_supported=int(path is not None),
+                net_mode=setting('net_mode', 'ncm'), net_scope=setting('net_scope', 'permanent'),
+                net_auto=int(setting('net_auto') == '1'), net_available=int(len(supported) > 1),
+                net_current=net_current(), net_supported=supported,
+                net_boot=json.loads(read(RUN / 'net-boot.json', '{}')),
+                lan_auto=int(setting('lan_auto', '0') == '1'), pending=int(pending),
+                requested_role=job.get('role', ''), last_error=error)
+
+
+def queue_role(role, auto):
+    if role not in ('auto', 'host', 'device') or auto not in ('0', '1'):
+        raise ValueError('无效的 USB 角色设置')
+    if role != 'host' and auto != '0':
+        raise ValueError('只有主机模式支持开机自动应用')
+    if not role_path():
+        raise RuntimeError('当前内核未提供手动 USB 角色接口')
+    token = uuid.uuid4().hex
+    job_write(dict(pending=1, role=role, token=token, time=time.time(), error=''))
+    subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'apply-role', role, auto, token],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    return dict(ok=1, pending=1)
+
+
+def apply_role(role, auto, token):
+    job = job_read()
+    if job.get('token') != token:
+        return dict(ok=1, superseded=1)
+    try:
+        path = role_path()
+        if path is None:
+            raise RuntimeError('USB 角色接口不可用')
+        path.write_text(role + '\n')
+        if read(path) != role:
+            raise RuntimeError('内核未接受 USB 角色设置')
+        save('role_auto', auto)
+        job.update(pending=0, error='')
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        job.update(pending=0, error=str(error))
+    job_write(job)
+    return dict(ok=int(not job['error']), error=job['error'])
+
+
+def network_config():
+    config = {}
+    for line in command('uci', '-q', 'show', 'network', required=False).splitlines():
+        if '=' not in line:
+            continue
+        key, value = line.split('=', 1)
+        config[key] = shlex.split(value)
+    return config
+
+
+def bridge_info(config):
+    bridge = command('uci', '-q', 'get', 'unisoc_modem.main.lan_device', required=False) or 'br-lan'
+    for key, values in config.items():
+        if key.endswith('.name') and values == [bridge] and config.get(key[:-5] + '.type') == ['bridge']:
+            section = key[:-5]
+            return bridge, section, config.get(section + '.ports', [])
+    raise RuntimeError('未找到 LAN 网桥配置')
+
+
+def adapter(name):
+    if not re.fullmatch(r'[a-zA-Z0-9_.:-]{1,15}', name):
+        return None
+    path = SYS / 'class/net' / name
+    if read(path / 'type') != '1' or (path / 'phy80211').exists():
+        return None
+    device = path / 'device'
+    if (device / 'subsystem').resolve() != (SYS / 'bus/usb').resolve():
+        return None
+    driver = (device / 'driver').resolve().name
+    if driver not in ETHERNET:
+        return None
+    return dict(name=name, driver=driver, mac=read(path / 'address'),
+                carrier=int(read(path / 'carrier') == '1'),
+                master=(path / 'master').resolve().name if (path / 'master').exists() else '')
+
+
+def assigned_elsewhere(name, bridge, section, config, current):
+    if current and current != bridge:
+        return True
+    for key, values in config.items():
+        if key == section + '.ports':
+            continue
+        if key.endswith(('.device', '.ifname', '.ports')) and name in values:
+            return True
+    return False
+
+
+def adapters(config=None):
+    config = config if config is not None else network_config()
+    bridge, section, ports = bridge_info(config)
+    result = []
+    for path in sorted((SYS / 'class/net').iterdir()):
+        entry = adapter(path.name)
+        if entry:
+            entry['in_lan'] = int(entry['name'] in ports)
+            entry['bound'] = int(entry['master'] == bridge)
+            entry['managed_elsewhere'] = int(assigned_elsewhere(entry['name'], bridge, section, config, entry['master']))
+            result.append(entry)
+    return result
+
+
+def net_sync(selected=None):
+    config = network_config()
+    bridge, section, ports = bridge_info(config)
+    found = adapters(config)
+    if selected is not None and not any(d['name'] == selected for d in found):
+        raise ValueError('这不是支持的 USB 以太网卡')
+    changed = False
+    chosen = []
+    for device in found:
+        name = device['name']
+        if selected is not None and name != selected:
+            continue
+        if device['managed_elsewhere']:
+            if selected == name:
+                raise ValueError('该网卡已分配给其他网络，请先在网络设置中解除分配')
+            continue
+        if name not in ports:
+            if selected != name and setting('lan_auto', '0') != '1':
+                continue
+            command('uci', '-q', 'add_list', section + '.ports=' + name)
+            ports.append(name)
+            changed = True
+        chosen.append(name)
+    if changed:
+        command('uci', 'commit', 'network')
+        command('ubus', 'call', 'network', 'reload')
+    for name in chosen:
+        command('ip', 'link', 'set', 'dev', name, 'up')
+        command('ip', 'link', 'set', 'dev', name, 'master', bridge)
+    return dict(ok=1, attached=chosen)
+
+
+def main(args):
+    op = args[0] if args else 'get'
+    if op == 'get':
+        return state()
+    if op == 'net-list':
+        return dict(ok=1, devices=adapters(), role=role_now())
+    if op == 'set-role':
+        return queue_role(*args[1:])
+    if op == 'apply-role':
+        return apply_role(*args[1:])
+    if op == 'set-lan-auto':
+        if args[1:] not in (['0'], ['1']):
+            raise ValueError('无效的自动加入 LAN 设置')
+        save('lan_auto', args[1])
+        return net_sync() if args[1] == '1' else dict(ok=1)
+    if op in ('net-sync', 'hotplug', 'host-rescan'):
+        return net_sync()
+    if op == 'net-add':
+        return net_sync(args[1])
+    if op == 'boot':
+        boot_net()
+        if setting('role_auto') == '1' and role_path():
+            role_path().write_text('host\n')
+        return net_sync()
+    if op == 'set-net':
+        return save_net(*args[1:])
+    raise ValueError('未知的 USB 操作')
+
+
+if __name__ == '__main__':
+    try:
+        RUN.mkdir(mode=0o755, parents=True, exist_ok=True)
+        if sys.argv[1:2] == ['apply-role']:
+            time.sleep(0.4)  # Flush RPC acknowledgement before changing the management port.
+        with (RUN / 'lock').open('a') as lock:
+            if sys.argv[1:2] not in (['get'], ['net-list']):
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            result = main(sys.argv[1:])
+    except (OSError, ValueError, RuntimeError, TypeError, IndexError, subprocess.SubprocessError) as error:
+        result = dict(ok=0, error=str(error))
+    print(json.dumps(result, ensure_ascii=False))
+    sys.exit(0 if result.get('ok') else 1)

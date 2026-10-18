@@ -1,0 +1,7 @@
+{
+  "e5-cpu": {
+    "description": "CPU frequency policies and passive thermal thresholds",
+    "read": { "ubus": { "e5-cpu": ["get"] } },
+    "write": { "ubus": { "e5-cpu": ["apply", "reset"] } }
+  }
+}

@@ -1,0 +1,206 @@
+#!/usr/bin/python3
+"""Reevaluate unmet SIPC data requests when packet registration returns.
+
+The Android data controller reacts to PS registration/RAT changes separately
+from setup-error timers. Read ModemManager's cached D-Bus state and ask netifd
+to resume an enabled, idle WAN. Never issue AT commands or cycle the radio.
+"""
+import json
+import logging
+import os
+import selectors
+import signal
+import subprocess
+import fcntl
+from pathlib import Path
+
+
+def radio_allowed():
+    try:
+        flags = Path(os.environ.get('UNISOC_RADIO_POLICY', '/etc/e5/sim-radio')).read_text().strip()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    try:
+        slot = Path('/sys/module/sipc_wwan/parameters/card').read_text().strip()
+        return flags in ('0 0', '0 1', '1 0', '1 1') and slot in ('0', '1') and flags[int(slot)*2] == '1'
+    except OSError:
+        return False
+
+def query(args):
+    result = subprocess.run(args, capture_output=True, text=True, timeout=10,
+                            check=True)
+    return json.loads(result.stdout)
+
+
+def radio_key(modem):
+    generic, ps = modem.get('generic', {}), modem.get('3gpp', {})
+    if generic.get('device') != 'unisoc-sipc' or generic.get('plugin') != 'unisoc':
+        return None
+    if generic.get('state') not in ('registered', 'connected', 'connecting', 'disconnecting'):
+        return None
+    if ps.get('registration-state') not in ('home', 'roaming'):
+        return None
+    if ps.get('packet-service-state') != 'attached':
+        return None
+    rats = tuple(generic.get('access-technologies', []))
+    if not rats or all(r in ('unknown', '--') for r in rats):
+        return None
+    return (modem.get('dbus-path'), generic.get('primary-sim-slot'),
+            ps.get('registration-state'), ps.get('operator-code'), rats)
+
+
+def can_resume(interface):
+    if interface.get('proto') != 'modemmanager':
+        return False
+    if not interface.get('autostart'):
+        return False
+    if interface.get('available'):
+        return False  # Ordinary connected/failed setup remains netifd's job.
+    if interface.get('up') or interface.get('pending'):
+        return False
+    errors = [e.get('code', '') for e in interface.get('errors', [])]
+    # Existing PIN, SIM, APN and explicit mode errors still need user action.
+    return all(e in ('MM_CONNECT_FAILED', 'MM_3GPP_OPERATOR_REGISTRATION_FAILED',
+                     'MM_INTERFACE_RESTART', 'MM_FAILED_REASON_SIM_MISSING') for e in errors)
+
+
+class Recovery:
+    def __init__(self):
+        self.key = None
+        self.attempted = set()
+        self.voice_enable_attempt = None
+
+    def enable_other_sim_services(self):
+        # MM represents both SIMs' messaging/voice with one logical object.
+        # With the data SIM disabled, netifd deliberately never enables it.
+        # Enable only that logical object for the other allowed SIM: the
+        # Unisoc power hook leaves the disabled data RF untouched.
+        try:
+            flags = Path(os.environ.get('UNISOC_RADIO_POLICY', '/etc/e5/sim-radio')).read_text().strip()
+            own = Path('/sys/module/sipc_wwan/parameters/card').read_text().strip()
+            if flags not in ('0 0','0 1','1 0','1 1') or own not in ('0','1'):
+                return
+            if flags[int(own)*2] != '0' or flags[(1-int(own))*2] != '1':
+                return
+            modem = query(['mmcli','-m','unisoc-sipc','-J'])['modem']
+            if modem.get('generic',{}).get('state') != 'disabled':
+                self.voice_enable_attempt = None
+                return
+            key = (modem.get('dbus-path'),flags,own)
+            if key == self.voice_enable_attempt:
+                return
+            run = Path('/run/unisoc-data-sim')
+            run.mkdir(parents=True,exist_ok=True)
+            with (run/'switch.lock').open('a') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                self.voice_enable_attempt = key
+                subprocess.run(['mmcli','-m','unisoc-sipc','--timeout=60','--enable'],
+                               capture_output=True,timeout=65,check=True)
+        except (OSError,ValueError,KeyError,subprocess.SubprocessError):
+            return
+
+    def evaluate(self):
+        if not radio_allowed():
+            self.enable_other_sim_services()
+            self.key = None
+            self.attempted.clear()
+            return
+        modem = query(['mmcli', '-m', 'unisoc-sipc', '-J'])['modem']
+        key = radio_key(modem)
+        if key != self.key:
+            self.key = key
+            self.attempted.clear()
+        if key is None:
+            return
+        interfaces = query(['ubus', 'call', 'network.interface', 'dump'])['interface']
+        for status in interfaces:
+            name = status.get('interface')
+            if not name:
+                continue
+            if status.get('up'):
+                self.attempted.discard(name)
+                continue
+            if name in self.attempted or not can_resume(status):
+                continue
+            config = subprocess.run(['uci', '-q', 'get', 'network.' + name + '.device'],
+                                    capture_output=True, text=True, timeout=3)
+            if config.stdout.strip() != 'unisoc-sipc':
+                continue
+            # Mark before the call: its interface events must not create a loop.
+            self.attempted.add(name)
+            # Availability resumes autostart without changing a manual ifdown
+            # into user intent to connect, unlike the "up" method.
+            command = ['ubus', 'call', 'network.interface.' + name, 'notify_proto',
+                       '{"action":5,"available":true}']
+            subprocess.run(command,
+                           capture_output=True, timeout=10, check=True)
+            logging.info('%s: packet registration available; resuming data setup', name)
+
+
+def main():
+    logging.basicConfig(level=logging.INFO, format='e5-network-recovery: %(message)s')
+    children = []
+    selector = selectors.DefaultSelector()
+    # Only registration/RAT properties trigger queries. SignalQuality events
+    # must not turn this into another periodic cache/AT polling loop.
+    dbus = ['dbus-monitor', '--system',
+            "type='signal',sender='org.freedesktop.ModemManager1',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',arg0='org.freedesktop.ModemManager1.Modem.Modem3gpp'",
+            "type='signal',sender='org.freedesktop.ModemManager1',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',arg0='org.freedesktop.ModemManager1.Modem'",
+            "type='signal',sender='org.freedesktop.ModemManager1',interface='org.freedesktop.DBus.ObjectManager'",
+            "type='signal',interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='org.freedesktop.ModemManager1'"]
+    recovery = Recovery()
+    def stop(*_):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    try:
+        for command in (dbus, ['ubus', 'listen', 'network.interface']):
+            child = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL)
+            children.append(child)
+            os.set_blocking(child.stdout.fileno(), False)
+            selector.register(child.stdout, selectors.EVENT_READ,
+                              {'dbus': command is dbus, 'buffer': b''})
+        while True:
+            try:
+                recovery.evaluate()
+            except (KeyError, ValueError, OSError, subprocess.SubprocessError) as error:
+                logging.debug('state unavailable: %s', error)
+            # Sleep in the kernel until a registration or netifd event arrives.
+            relevant = False
+            while not relevant:
+                for selected, _ in selector.select():
+                    chunk = os.read(selected.fileobj.fileno(), 65536)
+                    if not chunk:
+                        return 1  # procd restarts subscriptions after bus loss
+                    if not selected.data['dbus']:
+                        relevant = True
+                        continue
+                    lines = (selected.data['buffer'] + chunk).split(b'\n')
+                    selected.data['buffer'] = lines.pop()
+                    relevant |= any(relevant_property(line) for line in lines)
+    finally:
+        selector.close()
+        for child in children:
+            if child.poll() is None:
+                child.terminate()
+            try:
+                child.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+            child.stdout.close()
+
+
+def relevant_property(line):
+    return any(token in line for token in (b'string "RegistrationState"',
+               b'string "PacketServiceState"', b'string "AccessTechnologies"',
+               b'string "State"', b'string "PrimarySimSlot"',
+               b'member=InterfacesAdded', b'member=InterfacesRemoved',
+               b'member=NameOwnerChanged'))
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

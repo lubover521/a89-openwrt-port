@@ -1,0 +1,34 @@
+#!/usr/bin/python3
+"""Volume key dispatch only. The voice observer owns all live mixer writes."""
+import json
+import sys
+
+sys.path.insert(0, '/usr/lib/e5')
+from e5_call_volume import MAX, Volume, call_status
+
+
+def main(args):
+    state = call_status()
+    if args[:1] == ['auto']:
+        if not state.get('active'): return 3  # e5-volume continues with media.
+        args = args[1:]
+    volume = Volume()
+    if not args:
+        level = volume.get()
+    elif args[0] in ('up', 'down') and len(args) == 1:
+        level = volume.change(args[0])
+    elif args[0] == 'set' and len(args) == 2 and args[1].isdigit():
+        level = volume.change('set', int(args[1]))
+    else:
+        raise ValueError('expected set 0-15, up or down')
+    print(json.dumps({'level': level, 'max': MAX, 'kind': 'call',
+                      'card': state.get('available', False),
+                      'output': state.get('route', 'receiver')}))
+    return 0
+
+
+if __name__ == '__main__':
+    try: sys.exit(main(sys.argv[1:]))
+    except (OSError, ValueError, RuntimeError) as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(1)

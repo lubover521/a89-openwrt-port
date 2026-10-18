@@ -1,0 +1,44 @@
+#!/bin/sh
+# New SMS on the E5 under OpenWrt: vibrate (and a sound, if asked), and count
+# it unread.
+#
+#   e5-sms-notify          listen (the procd service /etc/init.d/e5-sms-notify)
+#   e5-sms-notify read     the messages have been seen: unread 0
+#   e5-sms-notify test     what a new message does, without one
+#
+# The receive service tracks both SIM storages and driver SMS events.
+# Existing messages form a silent baseline; new messages on either SIM alert
+# once. Complete multipart messages are forwarded according to their origin
+# card. The persisted inbox survives a reboot. The unread state is a file
+# other programs read -- the info screen lights up and shows the message
+# (e5-notify.sms.screen) and marks it in its status bar:
+#   /tmp/run/e5-sms/unread   the paths of the unread messages, one per line
+# The E5 has no notification LED (the PMIC's LED outputs drive nothing).
+# A new message is forwarded as well when e5-notify.forward is enabled
+# (/usr/libexec/e5-sms forward, a webhook by curl).
+# Settings: /etc/config/e5-notify.
+STATE=/tmp/run/e5-sms
+UNREAD=$STATE/unread
+
+cfg() { uci -q get "e5-notify.sms.$1" || echo "$2"; }
+
+alert() {
+	# (the sound at the speaker volume, /usr/libexec/e5-volume; none at 0)
+	if [ "$(cfg sound 1)" = 1 ] && [ -x /usr/libexec/e5-notification-sound ]; then
+		setsid /usr/libexec/e5-notification-sound sms >/dev/null 2>&1 &
+	fi
+	[ "$(cfg vibrate 1)" = 1 ] && e5-vibrate $(cfg pattern "250 150 250")
+}
+
+mkdir -p "$STATE"
+touch "$UNREAD"
+
+case "${1:-}" in
+read)
+	exec /usr/libexec/e5-sms-receive read ;;
+test)
+	alert
+	exit 0 ;;
+esac
+
+exec /usr/libexec/e5-sms-receive serve

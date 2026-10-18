@@ -1,0 +1,8 @@
+dbus-next 0.2.3, pure Python D-Bus bindings, MIT licensed.
+Upstream: https://github.com/altdesktop/python-dbus-next
+Distribution: https://pypi.org/project/dbus-next/0.2.3/
+Wheel SHA256: 58948f9aff9db08316734c0be2a120f6dc502124d9642f55e90ac82ffb16a18b
+
+The unmodified wheel is imported directly by e5-hfp (zipimport), so target
+images do not need pip, GI, a compiler, or access to PyPI at runtime/build.
+Its license is included both in the wheel and alongside it.

@@ -1,0 +1,240 @@
+#!/bin/sh
+# Keep a Unisoc SIPC bearer address synchronized across mobility events.
+#
+# ModemManager owns the AT port and serializes --command requests.  The Unisoc
+# plugin writes CGEV/SPPCODATA notifications to the FIFO below; a 30 second
+# timer is only a lost-event safety check.  Refreshes never cycle CFUN,
+# CGACT or the data interface.  A persistently inactive context makes this
+# netifd-owned process exit so the ordinary protocol reconnect path runs once.
+
+libroot=${MODEMMANAGER_UNISOC_LIB_ROOT:-}
+. "$libroot/lib/functions.sh"
+. "$libroot/lib/netifd/netifd-proto.sh"
+
+config=${1:?network interface}
+modem=${2:?modem}
+bearer=${3:?bearer}
+ifname=${4:?data interface}
+cid=${5:?context id}
+ip4=$6
+prefix4=${7:-32}
+gateway4=$8
+dns1=$9
+shift 9
+dns2=$1
+metric=$2
+
+fifo=${MODEMMANAGER_UNISOC_EVENT_FIFO:-/run/modemmanager-unisoc-bearer.events}
+logtag=modemmanager-unisoc-renew
+last_refresh=0
+
+valid_ipv4() {
+	local value=$1 a b c d rest
+	IFS=. read -r a b c d rest <<-EOF
+	$value
+	EOF
+	[ -z "$rest" ] && [ -n "$d" ] || return 1
+	for value in "$a" "$b" "$c" "$d"; do
+		case "$value" in ''|*[!0-9]*) return 1 ;; esac
+		[ "$value" -le 255 ] || return 1
+	done
+	[ "$a.$b.$c.$d" != 0.0.0.0 ]
+}
+
+mask2prefix() {
+	local mask=$1 octet bits=0 seen_partial=0 IFS=.
+	for octet in $mask; do
+		[ "$seen_partial" = 0 ] || [ "$octet" = 0 ] || return 1
+		case "$octet" in
+			255) bits=$((bits + 8)) ;;
+			254) bits=$((bits + 7)); seen_partial=1 ;;
+			252) bits=$((bits + 6)); seen_partial=1 ;;
+			248) bits=$((bits + 5)); seen_partial=1 ;;
+			240) bits=$((bits + 4)); seen_partial=1 ;;
+			224) bits=$((bits + 3)); seen_partial=1 ;;
+			192) bits=$((bits + 2)); seen_partial=1 ;;
+			128) bits=$((bits + 1)); seen_partial=1 ;;
+			0) seen_partial=1 ;;
+			*) return 1 ;;
+		esac
+	done
+	echo "$bits"
+}
+
+context_active() {
+	local out
+	out=$(mmcli --modem="$modem" --command='AT+CGACT?' 2>/dev/null) || return 2
+	printf '%s\n' "$out" | tr -d '\r' |
+		grep -Eq "\\+CGACT:[[:space:]]*$cid,1([^0-9]|$)" && return 0
+	printf '%s\n' "$out" | tr -d '\r' |
+		grep -Eq "\\+CGACT:[[:space:]]*$cid,0([^0-9]|$)" && return 1
+	# A failed/empty AT read is not evidence that the bearer disconnected.
+	return 2
+}
+
+read_context() {
+	local out fields addrmask mask new_prefix
+	out=$(mmcli --modem="$modem" --command="AT+CGCONTRDP=$cid" 2>/dev/null) || return 1
+	fields=$(printf '%s\n' "$out" | awk -F, '
+		index($0, "+CGCONTRDP:") {
+			sub(/^.*\+CGCONTRDP:[[:space:]]*/, "", $1)
+			a=$4; gsub(/"/, "", a)
+			n=split(a, x, ".")
+			if (n == 8 && x[1]+0 > 0) {
+				g=$5; d1=$6; d2=$7
+				gsub(/[" ]/, "", g); gsub(/[" ]/, "", d1); gsub(/[" ]/, "", d2)
+				print a "|" g "|" d1 "|" d2
+				exit
+			}
+		}')
+	[ -n "$fields" ] || return 1
+	addrmask=${fields%%|*}
+	fields=${fields#*|}
+	NEW_GATEWAY4=${fields%%|*}
+	fields=${fields#*|}
+	NEW_DNS1=${fields%%|*}
+	NEW_DNS2=${fields#*|}
+	NEW_IP4=$(printf '%s\n' "$addrmask" | cut -d. -f1-4)
+	mask=$(printf '%s\n' "$addrmask" | cut -d. -f5-8)
+	valid_ipv4 "$NEW_IP4" || return 1
+	new_prefix=$(mask2prefix "$mask") || return 1
+	NEW_PREFIX4=${new_prefix:-32}
+}
+
+if [ "${MODEMMANAGER_UNISOC_TEST_PARSE:-0}" = 1 ]; then
+	read_context || exit 1
+	printf '%s|%s|%s|%s|%s\n' "$NEW_IP4" "$NEW_PREFIX4" "$NEW_GATEWAY4" "$NEW_DNS1" "$NEW_DNS2"
+	exit 0
+fi
+
+report() {
+	local mask maskbits
+	maskbits=$(( (0xffffffff << (32 - prefix4)) & 0xffffffff ))
+	mask=$(printf '%d.%d.%d.%d' $(( (maskbits >> 24) & 255 )) \
+		$(( (maskbits >> 16) & 255 )) $(( (maskbits >> 8) & 255 )) $(( maskbits & 255 )))
+	proto_init_update "$ifname" 1
+	# This is a complete replacement snapshot. keep=1 would accumulate the
+	# old address and DNS in netifd even after they were removed in the kernel.
+	proto_set_keep 0
+	proto_add_ipv4_address "$ip4" "$mask"
+	if [ -n "$gateway4" ]; then
+		proto_add_ipv4_route 0.0.0.0 0 "$gateway4" "$ip4"
+	else
+		proto_add_ipv4_route 0.0.0.0 0 "" "$ip4"
+	fi
+	[ -n "$dns1" ] && proto_add_dns_server "$dns1"
+	[ -n "$dns2" ] && proto_add_dns_server "$dns2"
+	[ -n "$metric" ] && json_add_int metric "$metric"
+	proto_send_update "$config"
+}
+
+refresh() {
+	local reason=$1 old old_ip old_prefix old_gateway old_dns1 old_dns2 try state
+	context_active
+	state=$?
+	[ "$state" -ne 2 ] || return 0
+	if [ "$state" = 1 ]; then
+		# DEACT and ACT commonly arrive as one handover burst.  Give the CP a
+		# bounded six seconds to finish it before asking netifd to reconnect.
+		try=0
+		while [ "$try" -lt 3 ]; do
+			try=$((try + 1))
+			sleep 2
+			context_active
+			state=$?
+			[ "$state" = 1 ] || break
+		done
+		[ "$state" -ne 2 ] || return 0
+		if [ "$state" = 1 ]; then
+			logger -t "$logtag" "$reason: PDP context $cid remains inactive after bounded handover grace"
+			return 2
+		fi
+	fi
+
+	try=0
+	while ! read_context; do
+		try=$((try + 1))
+		[ "$try" -ge 3 ] && {
+			logger -t "$logtag" "$reason: active PDP context has no usable address; keeping current state"
+			return 0
+		}
+		sleep 1
+	done
+
+	old="$ip4/$prefix4 $gateway4 $dns1 $dns2"
+	if [ "$old" = "$NEW_IP4/$NEW_PREFIX4 $NEW_GATEWAY4 $NEW_DNS1 $NEW_DNS2" ]; then
+		[ "$reason" = fallback ] || logger -t "$logtag" "$reason: bearer unchanged"
+		return 0
+	fi
+	old_ip=$ip4
+	old_prefix=$prefix4
+	old_gateway=$gateway4
+	old_dns1=$dns1
+	old_dns2=$dns2
+	ip4=$NEW_IP4
+	prefix4=$NEW_PREFIX4
+	gateway4=$NEW_GATEWAY4
+	dns1=$NEW_DNS1
+	dns2=$NEW_DNS2
+
+	# Put the replacement address in the kernel before withdrawing the old
+	# one.  netifd then adopts the complete new snapshot and owns it normally.
+	if ! { ip -4 addr add "$ip4/$prefix4" dev "$ifname" 2>/dev/null ||
+		ip -4 addr replace "$ip4/$prefix4" dev "$ifname"; } || ! report; then
+		ip4=$old_ip
+		prefix4=$old_prefix
+		gateway4=$old_gateway
+		dns1=$old_dns1
+		dns2=$old_dns2
+		logger -t "$logtag" "$reason: address update failed; retaining the previous snapshot for retry"
+		return 0
+	fi
+	# netifd applies route metrics, policy tables and defaultroute/peerdns
+	# choices. Do not insert an unconditional main-table default route here.
+	[ "$old_ip/$old_prefix" = "$ip4/$prefix4" ] ||
+		ip -4 addr del "$old_ip/${old_prefix:-32}" dev "$ifname" 2>/dev/null || true
+	logger -t "$logtag" "$reason: bearer updated $old -> $ip4/$prefix4 $gateway4 $dns1 $dns2"
+}
+
+cleanup() {
+	local rc=$1
+	trap - INT TERM EXIT USR1
+	[ -z "$timer_pid" ] || kill "$timer_pid" 2>/dev/null
+	exec 3>&-
+	rm -f "$fifo"
+	exit "$rc"
+}
+
+mkdir -p "${fifo%/*}"
+rm -f "$fifo"
+mkfifo -m 600 "$fifo" || exit 1
+exec 3<>"$fifo"
+(
+	trap '[ -z "$sleep_pid" ] || kill "$sleep_pid" 2>/dev/null; exit 0' INT TERM
+	trap '' USR1
+	while :; do
+		sleep 30 & sleep_pid=$!
+		wait "$sleep_pid" || exit 0
+		printf 'fallback\n'
+	done >"$fifo"
+) &
+timer_pid=$!
+trap 'cleanup 0' INT TERM
+trap 'cleanup $?' EXIT
+trap 'printf "manual-renew\n" >&3' USR1
+logger -t "$logtag" "watching CID $cid on $ifname"
+
+while :; do
+	event=fallback
+	IFS= read -r event <&3 || continue
+	now=$(date +%s)
+	if [ "$event" != fallback ]; then
+		[ $((now - last_refresh)) -lt 2 ] && continue
+		# Let a DEACT/ACT/MODIFY burst settle and perform one AT read.
+		sleep 1
+	fi
+	refresh "$event"
+	rc=$?
+	[ "$rc" -ne 2 ] || exit 2
+	last_refresh=$(date +%s)
+done

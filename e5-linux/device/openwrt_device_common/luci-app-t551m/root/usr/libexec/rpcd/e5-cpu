@@ -1,0 +1,8 @@
+#!/bin/sh
+case "$1:$2" in
+    list:) echo '{"get":{},"apply":{"changes":{},"persist":true},"reset":{}}' ;;
+    call:get) exec /usr/libexec/unisoc-modem/cpu-control get ;;
+    call:apply) exec /usr/libexec/unisoc-modem/cpu-control apply ;;
+    call:reset) exec /usr/libexec/unisoc-modem/cpu-control reset ;;
+    *) echo '{"ok":false,"error":"Unknown operation"}' ;;
+esac

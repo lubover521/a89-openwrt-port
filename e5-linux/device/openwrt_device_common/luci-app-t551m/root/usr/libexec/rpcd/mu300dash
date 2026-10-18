@@ -1,0 +1,427 @@
+#!/bin/sh
+# mu300dash -- the compatibility RPC object of luci-app-mu300.
+#
+# Called by LuCI as:  ubus call mu300dash <method> '{...}'
+#   rpcd runs this script as:  mu300dash call <method>   with the params JSON on stdin,
+#   and `mu300dash list` must print the method declaration blob.
+# The reply is one JSON line on stdout.
+#
+# Methods:
+#   status [refresh]  system snapshot (mu300-dash-info, fast, no AT) + the cellular
+#                     cache (mu300-dash-cell) with its age. A stale cache triggers a
+#                     background refresh (setsid) - the call itself NEVER waits for AT:
+#                     LuCI's /admin/ubus endpoint kills a call after 30 s, and an AT
+#                     round inside a page request starves the dial watchdog (V50 lesson).
+#   act op [arg]      mu300-dash-act; slow ops run detached via setsid and return
+#                     immediately ("started":1), fast ones run inline.
+#   at cmd            one raw AT command through mu300-at, with the same guards the
+#                     V50 panel used: must start with AT, no ";" command chaining, and
+#                     AT+SPENGMD=0,1,0 is hard-denied (it switches the port into
+#                     streaming mode and kills the AT channel until a reboot).
+#                     Reply includes the raw modem output; last 40 commands are kept
+#                     in the package runtime directory.
+#   at_history        that history, raw text.
+#
+# The AT lock wait is capped well below the 30 s endpoint limit so a busy channel
+# answers "busy" instead of dying; the frontend simply retries those.
+
+export PATH="$PATH:/opt/mu300/bin:/opt/mu300/busybox-bin:/usr/libexec/unisoc-modem:/usr/sbin:/sbin"
+
+DASH=${MU300_DASH_BIN:-/usr/libexec/unisoc-modem}
+# SMS uses the system's shared two-SIM pool through t551m-sms below.
+AT=${MU300_AT:-/usr/libexec/unisoc-modem/at}
+DIR=${MU300_DASH_DIR:-/tmp/unisoc-modem}
+CELL=$DIR/cell.json
+SIGF=$DIR/sig.json
+COLLECT_LCK=$DIR/collect.lck
+FAST_LCK=$DIR/fast.lck
+HIST=$DIR/at-history
+TTL=${MU300_DASH_TTL:-5}          # full tier: neighbours/QoS/operator
+TTL_FAST=${MU300_DASH_TTL_FAST:-1} # serving tier; refreshed only while a view requests it
+MU300_AT_LOCK_WAIT=12
+export MU300_AT_LOCK_WAIT
+
+INPUT=$(cat 2>/dev/null)
+inp() {  # inp JSONPATH [default] -> param value
+    _v=$(printf '%s' "$INPUT" | jsonfilter -e "$1" 2>/dev/null)
+    case $_v in ''|null) _v=${2-} ;; esac
+    printf '%s' "$_v"
+}
+# Scope is per request, never a persistent data-SIM selection. Detached workers
+# inherit the immutable slot and private cache path from this request.
+if [ "${1:-}" = call ]; then
+    case ${2:-} in
+        status|rates|cells|signal|act|at|at_history|lock_get|lock_set|lock_status|traffic_get|traffic_set)
+            selected=$(inp '@.slot')
+            case "$selected" in
+                '') selected=$(cat /sys/module/sipc_wwan/parameters/card 2>/dev/null) ;;
+                0|1) ;;
+                *) printf '{"ok":0,"error":"Invalid SIM slot"}\n'; exit 0 ;;
+            esac
+            case "$selected" in 0|1) ;; *) printf '{"ok":0,"error":"SIM slot unavailable"}\n'; exit 0 ;; esac
+            export MU300_SIM_SLOT=$selected
+            DIR=$DIR/sim$selected
+            export MU300_DASH_DIR=$DIR
+            CELL=$DIR/cell.json; SIGF=$DIR/sig.json
+            COLLECT_LCK=$DIR/collect.lck; FAST_LCK=$DIR/fast.lck; HIST=$DIR/at-history
+            mkdir -p "$DIR"
+            ;;
+    esac
+fi
+esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\r'; }
+now() { date +%s; }
+collecting() {
+    _p=$(cat "$COLLECT_LCK/pid" 2>/dev/null)
+    [ -n "$_p" ] && [ -d "/proc/$_p" ] &&
+        tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null | grep -q '/unisoc-modem/cell'
+}
+fast_busy() {
+    _p=$(cat "$FAST_LCK/pid" 2>/dev/null)
+    [ -n "$_p" ] && [ -d "/proc/$_p" ] &&
+        tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null | grep -q '/unisoc-modem/cell'
+}
+age_of() { [ -s "$1" ] && echo $(( $(now) - $(date -r "$1" +%s 2>/dev/null || echo 0) )) || echo -1; }
+
+m_status() {
+    local info=null cage sage busy=0 fbusy=0
+    if [ "${1:-}" != cells ]; then
+        info=$("$DASH/dashboard-info" 2>/dev/null)
+        [ -n "$info" ] || info='{"error":"dashboard-info failed"}'
+    fi
+    cage=$(age_of "$CELL"); sage=$(age_of "$SIGF")
+    # two refresh tiers, both detached: the fast one keeps the serving-cell data
+    # fresh on the next status poll, the full one refreshes neighbours/QoS/operator.
+    # a full round in flight also writes the fast cache, so it counts for both.
+    # During a lock apply (SFUN restart) do not kick anything: the modem answers
+    # garbage mid-restart and the collectors would only burn the AT channel.
+    if [ -d /run/unisoc-modem-lock-apply ]; then busy=1; fbusy=1; fi
+    if collecting; then busy=1; fbusy=1; fi
+    fast_busy && fbusy=1
+    # A full round also refreshes sig.json. Prefer it when both tiers are stale;
+    # starting full and fast together doubles the AT burst for no benefit.
+    if { [ "$cage" -lt 0 ] || [ "$cage" -ge "$TTL" ]; } && [ "$busy" = 0 ]; then
+        setsid "$DASH/cell" >/dev/null 2>&1 &
+        busy=1; fbusy=1
+    elif [ "${1:-}" != cells ] && { [ "$sage" -lt 0 ] || [ "$sage" -ge "$TTL_FAST" ]; } && [ "$fbusy" = 0 ]; then
+        setsid "$DASH/cell" fast >/dev/null 2>&1 &
+        fbusy=1
+    fi
+    printf '{"info":%s,"cell":%s,"sig":%s,"cell_age":%d,"sig_age":%d,"refreshing":%d}\n' \
+        "$info" \
+        "$([ -s "$CELL" ] && cat "$CELL" || echo null)" \
+        "$([ -s "$SIGF" ] && cat "$SIGF" || echo null)" \
+        "$cage" "$sage" "$busy"
+}
+
+# Fast, uncached per-card counters. No AT, Wi-Fi enumeration or full sysinfo.
+# Fractional uptime avoids integer-second jitter in subsecond rate deltas.
+m_rates() {
+    local dev=sipa_eth0 stamp rest rx=0 tx=0 idx base=0 offset=0 path r t
+    [ "$MU300_SIM_SLOT" = 0 ] || dev=sipa_eth8
+    [ "$MU300_SIM_SLOT" = 0 ] || base=8
+    IFS=' ' read -r stamp rest < /proc/uptime
+    case "$stamp" in ''|*[!0-9.]*) printf '{"error":"Clock unavailable"}\n'; return ;; esac
+    if ! IFS= read -r idx < "/sys/class/net/$dev/ifindex"; then
+        printf '{"card":%s,"ts":%s,"device":"%s","net":null}\n' "$MU300_SIM_SLOT" "$stamp" "$dev"
+        return
+    fi
+    while [ "$offset" -lt 8 ]; do
+        path=/sys/class/net/sipa_eth$((base + offset))
+        offset=$((offset + 1))
+        [ -d "$path" ] || continue
+        if ! { IFS= read -r r < "$path/statistics/rx_bytes" && IFS= read -r t < "$path/statistics/tx_bytes"; }; then
+            printf '{"card":%s,"ts":%s,"device":"%s","net":null}\n' "$MU300_SIM_SLOT" "$stamp" "$dev"
+            return
+        fi
+        case "$r:$t" in *[!0-9:]*|:*|*:) printf '{"error":"Counters unavailable"}\n'; return ;; esac
+        rx=$((rx + r)); tx=$((tx + t))
+    done
+    case "$idx" in *[!0-9]*) printf '{"error":"Counters unavailable"}\n'; return ;; esac
+    [ -n "$rx" ] && [ -n "$tx" ] && [ -n "$idx" ] || { printf '{"error":"Counters unavailable"}\n'; return; }
+    printf '{"card":%s,"ts":%s,"device":"%s","ifindex":%s,"net":{"rx":%s,"tx":%s}}\n' \
+        "$MU300_SIM_SLOT" "$stamp" "$dev" "$idx" "$rx" "$tx"
+}
+
+# Live serving-cell snapshot for views where stale radio readings are actively
+# misleading (notably the lock page hero). This intentionally uses an isolated
+# temporary directory and returns the just-completed AT round, never cell.json
+# or sig.json from an earlier request. The bounded nr6/nr7 pool keeps it off
+# nr1 while limiting the number of concurrent modem collectors.
+m_signal() {
+    # During a lock apply the protocol stack is restarting: live AT reads in
+    # that window return garbage or wedge, and rpcd died with a userspace
+    # segfault (sessions wiped -> LuCI login loop) on at least one live
+    # read's output. Serve the last snapshot until the apply finishes.
+    if [ -d /run/unisoc-modem-lock-apply ]; then
+        if [ -s "$SIGF" ]; then
+            cat "$SIGF"
+        else
+            printf '{"error":"正在应用网络锁定，暂无实时信号"}\n'
+        fi
+        return
+    fi
+    local live="$DIR/live.$$"
+    mkdir -p "$live" 2>/dev/null
+    # The output is deliberately uncached, but the modem channel is not
+    # unbounded parallel work. The collector claims one of the verified
+    # slot-0 nr6/nr7 channels and drops excess overlap immediately.
+    MU300_DASH_DIR="$live" MU300_DASH_LOCK_DIR="$DIR" \
+        "$DASH/cell" fast >/dev/null 2>&1
+    if [ -s "$live/sig.json" ]; then
+        cat "$live/sig.json"
+    else
+        printf '{"error":"live signal read failed"}\n'
+    fi
+    rm -rf "$live"
+}
+
+m_act() {
+    local op arg
+    op=$(inp '@.op')
+    arg=$(inp '@.arg')
+    if [ "$op" = modem-reset ] &&
+       ! "$DASH/radio-allowed" "${MU300_SIM_SLOT:-$(cat /sys/module/sipc_wwan/parameters/card)}"; then
+        printf '{"ok":0,"error":"This SIM radio is disabled by the user"}\n'; return
+    fi
+    case "$op" in
+        radio)      # Submission is fast; return the actual shared RF job.
+            case "$arg" in on|off) "$DASH/action" radio "$arg" ;; *) printf '{"ok":0,"error":"Invalid radio request"}\n';; esac
+            ;;
+        modem-reset|reboot|vpn)
+            setsid "$DASH/action" "$op" "$arg" >/dev/null 2>&1 &
+            printf '{"ok":1,"started":1,"op":"%s"}\n' "$op$arg"
+            ;;
+        # os runs inline: arming takes milliseconds and a failure (misc write
+        # rejected, tool missing) must reach the page instead of a silent no-op
+        data|wifi|os)
+            "$DASH/action" "$op" "$arg" 2>/dev/null || true
+            ;;
+        *)
+            printf '{"ok":0,"error":"unknown op"}\n'
+            ;;
+    esac
+}
+
+m_at() {
+    local cmd reply rc normalized
+    cmd=$(inp '@.cmd')
+    normalized=$(printf '%s' "$cmd" | tr '[:lower:]' '[:upper:]' | tr -d ' ')
+    case "$normalized" in
+        AT+SPENGMD=0,1,0)
+            printf '{"ok":0,"error":"denied: this command wedges the AT port until a reboot"}\n'
+            return
+            ;;
+        AT*|at*) ;;
+        *)
+            printf '{"ok":0,"error":"must be an AT command"}\n'
+            return
+            ;;
+    esac
+    case "$cmd" in *';'*)
+        printf '{"ok":0,"error":"no \";\" command chaining"}\n'
+        return
+        ;;
+    esac
+    # a lock apply in flight means the modem is restarting (SFUN) - say so instead
+    # of a generic busy, so it does not look like the console died
+    if [ -d /run/unisoc-modem-lock-apply ]; then
+        printf '{"ok":0,"busy":1,"error":"正在应用网络锁定，调制解调器重启中（约半分钟），请稍后再试"}
+'
+        return
+    fi
+    # mu300-at itself gives up waiting for the lock and says so; turn that into a
+    # retryable "busy" instead of letting the page show a dead console
+    reply=$("$AT" -t 8 "$cmd" 2>&1)
+    rc=$?
+    case "$reply" in *"busy"*)
+        printf '{"ok":0,"busy":1,"error":"AT 通道正忙，命令未发出，请重试"}\n'
+        return
+        ;;
+    esac
+    if [ "$rc" -ne 0 ]; then
+        printf '{"ok":0,"error":"%s"}\n' "$(esc "$reply" | tr '\n' ' ')"
+        return
+    fi
+    mkdir -p "$DIR" 2>/dev/null
+    printf '%s %s\n' "$(date '+%m-%d %H:%M:%S')" "$cmd" >> "$HIST"
+    tail -n 40 "$HIST" > "$HIST.t" 2>/dev/null && mv "$HIST.t" "$HIST"
+    printf '{"ok":1,"cmd":"%s","reply":"%s"}\n' "$(esc "$cmd")" \
+        "$(printf '%s' "$reply" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | awk 'NR>1 { printf "\\n" } { printf "%s", $0 }')"
+}
+
+m_at_history() {
+    printf '{"history":"%s"}\n' \
+        "$(sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' "$HIST" 2>/dev/null | awk 'NR>1 { printf "\\n" } { printf "%s", $0 }')"
+}
+
+m_lock_set() {
+    local kind val
+    kind=$(inp '@.kind')
+    val=$(inp '@.val')
+    case "$kind" in
+        mode|gran|endc|lte|nr|cell|volte|vonr|auto_apply|bands_default) ;;
+        *) printf '{"ok":0,"error":"unknown lock kind"}\n'; return ;;
+    esac
+    "$DASH/lock" start "$kind" "$val"
+}
+
+# --------------------------------------------------------------------- SMS
+# Everything below talks to the LOCAL pool via mu300-sms (the sms daemon keeps
+# it in step with the SIM). list/show are file reads; send goes through AT
+# (UCS-2 PDU submit, seconds); sync runs detached because CMGL walks the SIM.
+
+esc_ml() {  # multi-line text -> one JSON string
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\r' |
+        awk 'NR>1 { printf "\\n" } { printf "%s", $0 }'
+}
+
+m_sms_list() { printf '%s' "$INPUT" | "$DASH/t551m-sms" list; }
+m_sms_show() { printf '%s' "$INPUT" | "$DASH/t551m-sms" show; }
+m_sms_send() { printf '%s' "$INPUT" | "$DASH/t551m-sms" send; }
+m_sms_delete() { printf '%s' "$INPUT" | "$DASH/t551m-sms" delete; }
+m_sms_sync() { printf '%s' "$INPUT" | "$DASH/t551m-sms" sync; }
+
+m_sysinfo() {
+    # 纯本地快照：无 AT、无缓存、无 kick —— 首屏先把这个画出来
+    "$DASH/dashboard-info" 2>/dev/null || printf '{"error":"dashboard-info failed"}
+'
+}
+
+do_list() {
+    cat <<EOF
+{
+	"sysinfo": { },
+	"sim_get": { },
+	"sim_set": { "slot": "String", "current": "String", "confirm": false },
+	"sim_radio_set": { "slot": "String", "enabled": false, "confirm": false },
+	"sim_radio_get": { },
+	"sim_radio_status": { "id": "String" },
+	"sim_status": { "id": "String" },
+	"status": { "slot": "String" },
+	"rates": { "slot": "String" },
+	"signal": { "slot": "String" },
+	"cells": { "slot": "String" },
+	"act": { "op": "String", "arg": "String", "slot": "String" },
+	"at": { "cmd": "String", "slot": "String" },
+	"at_history": { "slot": "String" },
+	"lock_get": { "fresh": "String", "slot": "String" },
+	"lock_set": { "kind": "String", "val": "String", "slot": "String" },
+	"lock_status": { "id": "String", "slot": "String" },
+	"sms_list": { "page": "String" },
+	"sms_show": { "id": "String" },
+	"sms_send": { "num": "String", "text": "String", "card": "String" },
+	"sms_delete": { "id": "String", "sim": "String" },
+	"sms_sync": { },
+	"forward_get": { "profile": "String" },
+	"forward_status": { "profile": "String" },
+	"forward_set": { "payload": "String" },
+	"forward_test": { "profile": "String" },
+	"forward_log_clear": { },
+	"traffic_get": { "slot": "String" },
+	"traffic_set": { "payload": "String", "slot": "String" },
+	"traffic_clear": { "slot": "String", "confirm": false },
+	"apn_get": { },
+	"apn_set": { "action": "String", "payload": "String" },
+	"usb_get": { },
+	"usb_set": { "kind": "String", "value": "String", "scope": "String", "auto": "String" },
+	"usb_net_list": { },
+	"usb_net_add": { "iface": "String" }
+}
+EOF
+}
+
+# Forensics for the rpcd crash (2026-09-28): rpcd segfaulted while parsing a
+# script reply during a lock apply, wiping every session (LuCI bounced to the
+# login page). Every method's raw stdout is appended here, so the last entry
+# at the moment of a crash is the input that killed the parser.
+LASTLOG=$DIR/last-outputs.log
+run_m() {
+    local out
+    out=$(eval "$2" 2>/dev/null)
+    printf '=== %s %s len=%s\n%s\n' "$(date '+%m-%d %H:%M:%S')" "$1" "${#out}" "$out" >> "$LASTLOG" 2>/dev/null
+    tail -n 400 "$LASTLOG" > "$LASTLOG.t" 2>/dev/null && mv "$LASTLOG.t" "$LASTLOG"
+    printf '%s\n' "$out"
+}
+
+case "${1:-}" in
+list)
+    do_list
+    ;;
+call)
+    case ${2:-} in
+        sysinfo)    run_m sysinfo    'm_sysinfo' ;;
+        apn_get)    "$DASH/apn" get ;;
+        apn_set)
+            action=$(inp '@.action'); payload=$(inp '@.payload')
+            case "$action" in save|delete|apply|auto) ;; *) printf '{"ok":0,"error":"apn_invalid"}\n'; exit 0 ;; esac
+            # Never log APN payloads or pass secrets through eval/argv.
+            printf '%s' "$payload" | "$DASH/apn" "$action" ;;
+        sim_get)    "$DASH/data-sim" get ;;
+        sim_set)    printf '%s' "$INPUT" | "$DASH/data-sim" set ;;
+        sim_radio_set) printf '%s' "$INPUT" | "$DASH/data-sim" radio ;;
+        sim_radio_get) "$DASH/data-sim" radio-get ;;
+        sim_radio_status) "$DASH/data-sim" status "$(inp '@.id')" ;;
+        sim_status) "$DASH/data-sim" status "$(inp '@.id')" ;;
+        status)     run_m status     'm_status' ;;
+        rates)      m_rates ;;
+        cells)      run_m cells      'm_status cells' ;;
+        signal)     run_m signal     'm_signal' ;;
+        act)        run_m act        'm_act' ;;
+        at)         run_m at         'm_at' ;;
+        at_history) run_m at_history 'm_at_history' ;;
+        lock_get)
+            # default serves the lock cache instantly (a real read is seven AT
+            # round trips, about a second each); fresh=1 does the real read -
+            # the page uses it only behind the manual refresh button
+            if [ "$(inp '@.fresh')" = "1" ]; then
+                run_m lock_get:fresh '"$DASH/lock" get fresh 2>/dev/null || printf "{\"error\":\"lock read failed\"}\n"'
+            else
+                run_m lock_get '"$DASH/lock" get 2>/dev/null || printf "{\"error\":\"lock read failed\"}\n"'
+            fi
+            ;;
+        lock_set)   run_m lock_set   'm_lock_set' ;;
+        lock_status) "$DASH/lock" status "$(inp '@.id')" ;;
+        sms_list)   run_m sms_list   'm_sms_list' ;;
+        sms_show)   run_m sms_show   'm_sms_show' ;;
+        sms_send)   run_m sms_send   'm_sms_send' ;;
+        sms_delete) run_m sms_delete 'm_sms_delete' ;;
+        sms_sync)   run_m sms_sync   'm_sms_sync' ;;
+        forward_get) "$DASH/sms-forward" get "$(inp '@.profile' shared)" ;;
+        forward_log_clear) "$DASH/sms-forward" log-clear ;;
+        forward_status) "$DASH/sms-forward" status "$(inp '@.profile' shared)" ;;
+        forward_set) payload=$(inp '@.payload'); printf '%s' "$payload" | "$DASH/sms-forward" set ;;
+        forward_test) "$DASH/sms-forward" test-start "$(inp '@.profile' shared)" ;;
+        traffic_get)
+            ubus -t 3 call unisoc.traffic get "{\"slot\":\"$selected\"}" 2>/dev/null || printf '{"error":"traffic_unavailable"}\n'
+            ;;
+        traffic_set)
+            # rpcd adds ubus_rpc_session for the public object's ACL check.
+            # The private service must receive only its declared arguments.
+            params=$(printf '%s' "$INPUT" | ucode -e 'import * as fs from "fs"; let i=json(fs.readfile("/dev/stdin")); print(sprintf("%J", {payload:i.payload,slot:getenv("MU300_SIM_SLOT")}));' 2>/dev/null) || { printf '{"ok":0,"error":"invalid_config"}\n'; exit 0; }
+            ubus -t 5 call unisoc.traffic set "$params" 2>/dev/null || printf '{"ok":0,"error":"traffic_unavailable"}\n'
+            ;;
+        traffic_clear)
+            # Preserve the explicit scope and boolean confirmation. The daemon
+            # rejects absent/invalid scopes instead of resolving the active SIM.
+            params=$(printf '%s' "$INPUT" | ucode -e 'import * as fs from "fs"; let i=json(fs.readfile("/dev/stdin")); print(sprintf("%J", {confirm:i.confirm === true,slot:i.slot}));' 2>/dev/null) || { printf '{"ok":0,"error":"invalid_config"}\n'; exit 0; }
+            ubus -t 5 call unisoc.traffic clear "$params" 2>/dev/null || printf '{"ok":0,"error":"traffic_unavailable"}\n'
+            ;;
+        usb_get)    run_m usb_get    '"$DASH/device-usb" get' ;;
+        usb_set)
+            kind=$(inp '@.kind'); value=$(inp '@.value'); scope=$(inp '@.scope'); auto=$(inp '@.auto')
+            case $kind in
+                role) run_m usb_set:role '"$DASH/device-usb" set-role "$value" "$auto"' ;;
+                net)  run_m usb_set:net  '"$DASH/device-usb" set-net "$value" "$scope" "$auto"' ;;
+                lan)  run_m usb_set:lan  '"$DASH/device-usb" set-lan-auto "$value"' ;;
+                *)    printf '{"ok":0,"error":"unknown USB setting"}\n' ;;
+            esac ;;
+        usb_net_list) run_m usb_net_list '"$DASH/device-usb" net-list' ;;
+        usb_net_add)  iface=$(inp '@.iface'); run_m usb_net_add '"$DASH/device-usb" net-add "$iface"' ;;
+        *)          printf '{"ok":0,"error":"no such method"}\n' ;;
+    esac
+    ;;
+*)
+    echo "usage: $0 {list|call <method>}" >&2
+    exit 2
+    ;;
+esac

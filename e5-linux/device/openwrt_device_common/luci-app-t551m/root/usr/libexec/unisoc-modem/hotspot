@@ -1,0 +1,7 @@
+#!/usr/bin/ucode
+import { cursor } from 'uci';
+import * as hotspot from './hotspot.uc';
+let action=ARGV[0];
+let r=index(['on','off'],action)>=0 ? hotspot.set(cursor(),action=='on') : {ok:false,error:'Use on or off'};
+print(sprintf('%J\n',r));
+exit(r.ok ? 0 : 1);

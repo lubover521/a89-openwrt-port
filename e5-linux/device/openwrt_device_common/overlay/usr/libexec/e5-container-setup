@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Configure an installed Docker engine for OpenWrt's existing fw4 router.
+
+Use --root for an offline image. The daemon remains disabled until explicitly
+started/enabled; only new Docker sections are added to the firewall.
+"""
+import argparse
+import json
+from pathlib import Path
+import subprocess
+
+
+def configure(root):
+    if not (root / 'etc/openwrt_release').is_file():
+        raise ValueError('Expected an OpenWrt root')
+    if not (root / 'usr/bin/dockerd').is_file():
+        raise ValueError('Install docker, dockerd, iptables-nft and ip6tables-nft first')
+    prefix = [] if root == Path('/') else ['chroot', str(root)]
+    # The offline package installation uses --no-scripts to avoid starting a
+    # daemon in the build environment. Apply only its file-level setup here.
+    subprocess.run(prefix + ['/bin/sh', '-ec',
+        'mkdir -p /var/lock; . /lib/functions.sh; update_alternatives install iptables-nft; '
+        'update_alternatives install ip6tables-nft; add_group_and_user dockerd'], check=True)
+    wrapper = root / 'usr/libexec/e5-dockerd'
+    if not wrapper.is_file():
+        raise ValueError('Install the e5-dockerd cgroup startup wrapper first')
+    wrapper.chmod(0o755)
+    (root / 'usr/libexec/e5-container-setup').chmod(0o755)
+    init = root / 'etc/init.d/dockerd'
+    source = init.read_text()
+    original = 'procd_set_param command /usr/bin/dockerd'
+    hooked = 'procd_set_param command /usr/libexec/e5-dockerd'
+    if source.count(original) == 2:
+        init.write_text(source.replace(original, hooked))
+    elif source.count(hooked) != 2:
+        raise ValueError('Unsupported dockerd init script; review its command hooks')
+
+    def uci(*args, optional=False):
+        result = subprocess.run(prefix + ['/sbin/uci', '-q', *args], text=True, capture_output=True)
+        if result.returncode and not optional:
+            raise RuntimeError('uci ' + args[0] + ' failed: ' + result.stderr.strip())
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    config_path = '/etc/docker/daemon-openwrt.json'
+    alternate = uci('get', 'dockerd.globals.alt_config_file', optional=True)
+    if alternate and alternate != config_path:
+        raise ValueError('A custom Docker config is already selected; keep it and configure networking manually')
+    path = root / config_path.lstrip('/')
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            'data-root': '/opt/docker',
+            'storage-driver': 'overlay2',
+            'features': {'containerd-snapshotter': False},
+            'hosts': ['unix:///var/run/docker.sock'],
+            'bip': '172.22.0.1/24',
+            'default-address-pools': [{'base': '172.23.0.0/16', 'size': 24}],
+            'ip-forward-no-drop': True,
+            'log-level': 'warn',
+            'log-driver': 'local',
+            'log-opts': {'max-size': '5m', 'max-file': '2'},
+        }, indent=2) + '\n')
+        path.chmod(0o644)
+    uci('set', 'dockerd.globals.alt_config_file=' + config_path)
+    uci('commit', 'dockerd')
+    # Match only Docker's default bridge. Do not catch br-lan with a broad
+    # "br-*" wildcard or alter WAN mode, addressing or the global policy.
+    if uci('get', 'firewall.docker', optional=True) is None:
+        for key, value in {'': 'zone', '.name': 'docker', '.input': 'ACCEPT',
+                           '.output': 'ACCEPT', '.forward': 'ACCEPT'}.items():
+            uci('set', 'firewall.docker' + key + '=' + value)
+    devices = (uci('get', 'firewall.docker.device', optional=True) or '').split()
+    if 'docker0' not in devices:
+        uci('add_list', 'firewall.docker.device=docker0')
+    for name, source, dest in [('docker_wan', 'docker', 'wan'), ('lan_docker', 'lan', 'docker')]:
+        if uci('get', 'firewall.' + name, optional=True) is None:
+            uci('set', 'firewall.' + name + '=forwarding')
+            uci('set', 'firewall.' + name + '.src=' + source)
+            uci('set', 'firewall.' + name + '.dest=' + dest)
+    uci('commit', 'firewall')
+    subprocess.run(prefix + ['/etc/init.d/dockerd', 'disable'], check=True)
+
+
+if __name__ == '__main__':
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--root', type=Path, default=Path('/'))
+    args = ap.parse_args()
+    configure(args.root.resolve())
+    print('Docker configured for overlay2, cgroupfs and fw4; service starts on demand')

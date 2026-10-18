@@ -1,0 +1,12 @@
+#!/usr/bin/python3
+import json
+import sys
+sys.path.insert(0, '/usr/lib/e5')
+from e5_sounds import METHODS, dispatch
+if sys.argv[1:] == ['list']:
+    print(json.dumps(METHODS))
+elif len(sys.argv) == 3 and sys.argv[1] == 'call':
+    try:
+        print(json.dumps(dispatch(sys.argv[2], json.loads(sys.stdin.read(24001) or '{}'))))
+    except Exception as error:
+        print(json.dumps({'ok': False, 'error': str(error)}))

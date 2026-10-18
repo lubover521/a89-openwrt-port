@@ -1,0 +1,463 @@
+#!/usr/bin/python3
+"""BlueZ HFP audio gateway for ModemManager and the DSP's SCO PCM path.
+
+Only explicit headset ATA/CHUP/VTS commands control existing calls. No raw
+modem AT, redial, auto-answer, number dialing, or timer-driven call control.
+SCO is leased by e5-voice-audio; loss of its Unix connection closes audio.
+"""
+import asyncio
+import contextlib
+import json
+import logging
+import os
+from pathlib import Path
+import re
+import select
+import signal
+import socket
+import struct
+import sys
+import time
+
+sys.path.insert(0, '/usr/lib/e5/vendor/dbus_next-0.2.3-py3-none-any.whl')
+sys.path.insert(0, '/usr/lib/e5')
+from e5_call_volume import Volume
+from dbus_next import BusType, DBusError, Message, MessageType, Variant
+from dbus_next.aio import MessageBus
+from dbus_next.service import ServiceInterface, method
+
+RUN = Path('/run/e5-hfp')
+VOICE = Path('/run/e5-voice-audio')
+HF = '0000111e-0000-1000-8000-00805f9b34fb'
+AG = '0000111f-0000-1000-8000-00805f9b34fb'
+PROFILE = '/org/e5/HandsFreeGateway'
+MM = 'org.freedesktop.ModemManager1'
+CALL = MM + '.Call'
+CALL_ROOT = '/' + MM.replace('.', '/') + '/Call/'
+CALL_STATES = { 'active': 0, 'held': 1, 'dialing': 2, 'ringing-out': 3,
+                'ringing-in': 4, 'waiting': 5 }
+
+
+def read_json(path, age=None):
+    try:
+        value = json.loads(path.read_text())
+        if not isinstance(value, dict): return {}
+        return value if age is None or 0 <= time.time() - value.get('updated', 0) < age else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_json(path, value):
+    temp = path.with_name(path.name + '.hfp-tmp')
+    temp.write_text(json.dumps(value) + '\n')
+    os.replace(temp, path)
+
+
+def call_list():
+    return [c for c in read_json(VOICE / 'status.json', 5).get('calls', [])
+            if c.get('state') in CALL_STATES and str(c.get('id', '')).isdigit()]
+
+
+def indicators(calls, service=0, strength=0, roaming=0, battery=5):
+    states = {c['state'] for c in calls}
+    setup = (1 if states & {'ringing-in', 'waiting'} else
+             3 if 'ringing-out' in states else 2 if 'dialing' in states else 0)
+    held = 1 if {'held', 'active'} <= states else 2 if 'held' in states else 0
+    return [service, int(bool(states & {'active', 'held'})), setup, held, strength, roaming, battery]
+
+
+class Headset:
+    def __init__(self, gateway, path, sock, props):
+        self.gateway, self.path, self.sock = gateway, path, sock
+        self.name = props.get('Alias', props.get('Name', 'Bluetooth'))
+        self.connection = time.time()
+        self.address, self.adapter = props['Address'], props['Adapter']
+        self.ready = self.reporting = self.clip = False
+        self.features = 0
+        self.codecs = [1]
+        self.codec = 1
+        self.codec_requested = None
+        self.codec_ready = asyncio.Event()
+        self.enabled = [True] * 7
+        self.previous = None
+        self.ring_at = 0
+        self.ring_id = None
+        self.closed = asyncio.Event()
+        self.send_lock = asyncio.Lock()
+        self.task = None
+        self.volume = None
+
+    @property
+    def remote_volume(self):
+        return bool(self.features & 16) or self.volume is not None
+
+    async def send(self, *lines):
+        async with self.send_lock:
+            await asyncio.wait_for(asyncio.get_running_loop().sock_sendall(
+                self.sock, ''.join('\r\n' + line + '\r\n' for line in lines).encode('ascii')), 3)
+
+    def close(self):
+        if self.closed.is_set(): return
+        self.ready = False
+        self.closed.set()
+        self.sock.close()
+        if self.task and self.task is not asyncio.current_task(): self.task.cancel()
+        if self.gateway.peer is self:
+            self.gateway.close_audio()
+            self.gateway.peer = None
+            self.gateway.publish()
+        logging.info('HFP disconnected')
+
+    async def command(self, line):
+        # Command arguments never become a shell command or raw modem command.
+        if line.startswith(('AT+BRSF=', 'AT+BAC=', 'AT+BCS=', 'AT+CMER=', 'AT+CIND')):
+            logging.info('HFP setup %s', line)
+        calls = call_list()
+        if re.fullmatch(r'AT\+BRSF=\d+', line):
+            self.features = int(line.split('=')[1])
+            await self.send('+BRSF: 608', 'OK')  # reject, CLCC, codec negotiation
+        elif line == 'AT+CIND=?':
+            await self.send('+CIND: ("service",(0,1)),("call",(0,1)),("callsetup",(0-3)),("callheld",(0-2)),("signal",(0-5)),("roam",(0,1)),("battchg",(0-5))', 'OK')
+        elif line == 'AT+CIND?':
+            self.previous = self.gateway.indicators(calls)
+            await self.send('+CIND: ' + ','.join(map(str, self.previous)), 'OK')
+        elif re.fullmatch(r'AT\+CMER=3,0,0,[01](?:,[01])?', line):
+            self.reporting = line.split(',')[3] == '1'
+            self.ready = True
+            await self.send('OK')
+            logging.info('HFP service connection ready; codecs=%s', self.codecs)
+            self.gateway.publish()
+        elif re.fullmatch(r'AT\+BAC=\d+(?:,\d+)*', line):
+            self.codecs = [int(c) for c in line[7:].split(',')]
+            await self.send('OK' if 1 in self.codecs else 'ERROR')
+        elif re.fullmatch(r'AT\+BCS=[12]', line):
+            codec = int(line[-1])
+            if codec == self.codec_requested:
+                self.codec = codec
+                await self.send('OK')
+                self.codec_ready.set()
+            else: await self.send('ERROR')
+        elif line == 'ATA':
+            candidates = [c for c in calls if c['state'] in ('ringing-in', 'waiting')]
+            if not self.ready or len(candidates) != 1:
+                await self.send('ERROR'); return
+            await self.gateway.control(candidates[0], 'Accept')
+            self.gateway.prefer_bluetooth(candidates[0]['id'])
+            await self.send('OK')
+        elif line == 'AT+CHUP':
+            ringing = [c for c in calls if c['state'] in ('ringing-in', 'waiting')]
+            candidates = ringing or [c for c in calls if c['state'] in ('active', 'dialing', 'ringing-out')]
+            if not self.ready or len(candidates) != 1:
+                await self.send('ERROR'); return
+            await self.gateway.control(candidates[0], 'Hangup')
+            await self.send('OK')
+        elif line == 'AT+CLCC':
+            for c in calls:
+                number = re.sub(r'[^+0-9*#]', '', c.get('number') or '')[:32]
+                await self.send(f'+CLCC: {int(c["id"])+1},{int(c.get("direction")=="incoming")},{CALL_STATES[c["state"]]},0,0,"{number}",{145 if number.startswith("+") else 129}')
+            await self.send('OK')
+        elif re.fullmatch(r'AT\+VTS=[0-9*#ABCD]', line):
+            active = [c for c in calls if c['state'] == 'active']
+            if not self.ready or len(active) != 1:
+                await self.send('ERROR'); return
+            await self.gateway.control(active[0], 'SendDtmf', 's', [line[-1]])
+            await self.send('OK')
+        elif re.fullmatch(r'AT\+CLIP=[01]', line):
+            self.clip = line[-1] == '1'
+            await self.send('OK')
+        elif line == 'AT+BCC':
+            active = [c for c in calls if c['state'] in ('active', 'dialing', 'ringing-out')]
+            if not self.ready or len(active) != 1:
+                await self.send('ERROR'); return
+            self.gateway.prefer_bluetooth(active[0]['id'])
+            await self.send('OK')
+        elif line.startswith('AT+BIA='):
+            fields = line[7:].split(',')
+            if len(fields) > 7 or any(x not in ('', '0', '1') for x in fields):
+                await self.send('ERROR'); return
+            for i, v in enumerate(fields):
+                if v and i not in (1, 2, 3): self.enabled[i] = v == '1'
+            await self.send('OK')
+        elif line in ('AT', 'ATE0', 'AT+CMEE=0', 'AT+CMEE=1', 'AT+CCWA=0', 'AT+CCWA=1', 'AT+COPS=3,0'):
+            await self.send('OK')
+        elif line == 'AT+COPS?':
+            await self.send('+COPS: 0,0,""', 'OK')
+        elif line == 'AT+CNUM':
+            await self.send('OK')  # do not invent the subscriber's number
+        elif re.fullmatch(r'AT\+VGS=(\d|1[0-5])', line):
+            self.volume = int(line.split('=')[1])
+            # Initial gain reports describe the headset, not a user adjustment.
+            # Once SLC is ready, a headset button updates the shared call level.
+            if self.ready:
+                await asyncio.to_thread(self.gateway.volume.change, 'set', self.volume)
+            await self.send('OK')
+        elif re.fullmatch(r'AT\+VGM=(\d|1[0-5])', line):
+            await self.send('OK')  # never override the user's microphone mute
+        else:
+            await self.send('ERROR')
+
+    async def run(self):
+        pending = b''
+        try:
+            while True:
+                data = await asyncio.get_running_loop().sock_recv(self.sock, 1024)
+                if not data: break
+                pending += data
+                if len(pending) > 4096: raise ValueError('HFP command too long')
+                while b'\r' in pending:
+                    line, pending = pending.split(b'\r', 1)
+                    line = line.strip().decode('ascii', errors='replace')
+                    if not line: continue
+                    try:
+                        await self.command(line)
+                    except (RuntimeError, asyncio.TimeoutError) as error:
+                        logging.warning('HFP command failed: %s', error)
+                        await self.send('ERROR')
+        except (OSError, ValueError, asyncio.TimeoutError) as error:
+            logging.warning('HFP transport: %s', error)
+        finally:
+            self.close()
+
+    async def notify(self, calls):
+        if not self.ready: return
+        if self.remote_volume:
+            level = await asyncio.to_thread(self.gateway.volume.get)
+            if self.volume != level:
+                await self.send(f'+VGS: {level}')
+                self.volume = level
+        values = self.gateway.indicators(calls)
+        if self.reporting and self.previous is not None:
+            for i, (old, new) in enumerate(zip(self.previous, values)):
+                if old != new and self.enabled[i]: await self.send(f'+CIEV: {i+1},{new}')
+        self.previous = values
+        ring = next((c for c in calls if c['state'] == 'ringing-in'), None)
+        if not ring: self.ring_id = None; return
+        if ring['id'] != self.ring_id or time.monotonic() >= self.ring_at:
+            self.ring_id, self.ring_at = ring['id'], time.monotonic() + 3
+            await self.send('RING')
+            number = re.sub(r'[^+0-9*#]', '', ring.get('number') or '')[:32]
+            if self.clip and number:
+                await self.send(f'+CLIP: "{number}",{145 if number.startswith("+") else 129}')
+
+
+class Profile(ServiceInterface):
+    def __init__(self, gateway):
+        super().__init__('org.bluez.Profile1')
+        self.gateway = gateway
+
+    @method()
+    async def NewConnection(self, device: 'o', fd: 'h', properties: 'a{sv}'):
+        sock = socket.socket(fileno=fd)
+        try:
+            props = await self.gateway.properties(device, 'org.bluez.Device1')
+            if not props.get('Paired') or not props.get('Trusted') or self.gateway.peer:
+                raise DBusError('org.bluez.Error.Rejected', 'A paired, trusted headset is required')
+            sock.setblocking(False)
+            peer = Headset(self.gateway, device, sock, props)
+            self.gateway.peer = peer
+            peer.task = self.gateway.spawn(peer.run())
+        except Exception:
+            sock.close()
+            raise
+
+    @method()
+    def RequestDisconnection(self, device: 'o'):
+        if self.gateway.peer and self.gateway.peer.path == device: self.gateway.peer.close()
+
+    @method()
+    def Release(self):
+        self.gateway.stop.set()
+
+
+class Gateway:
+    def __init__(self, bus):
+        self.bus = bus
+        self.peer = self.sco = self.lease = None
+        self.error = None
+        self.stop, self.discover = asyncio.Event(), asyncio.Event()
+        self.tasks = set()
+        self.battery = 5
+        self.battery_at = 0
+        self.volume = Volume()
+
+    def spawn(self, coroutine):
+        task = asyncio.create_task(coroutine)
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+        return task
+
+    async def dbus(self, dest, path, interface, member, signature='', body=None):
+        reply = await asyncio.wait_for(self.bus.call(Message(destination=dest, path=path,
+            interface=interface, member=member, signature=signature, body=body or [])), 4)
+        if reply.message_type == MessageType.ERROR:
+            raise RuntimeError(reply.error_name + ': ' + str(reply.body[0] if reply.body else ''))
+        return reply.body
+
+    async def properties(self, path, interface):
+        result = await self.dbus('org.bluez', path, 'org.freedesktop.DBus.Properties', 'GetAll', 's', [interface])
+        return {k: v.value for k, v in result[0].items()}
+
+    async def control(self, call, method, signature='', body=None):
+        # Revalidate the exact object and state at the authority before acting.
+        path = CALL_ROOT + call['id']
+        props = (await self.dbus(MM, path, 'org.freedesktop.DBus.Properties', 'GetAll', 's', [CALL]))[0]
+        state = props.get('State', Variant('i', 0)).value
+        allowed = (3, 6) if method == 'Accept' else (4,) if method == 'SendDtmf' else (1, 2, 3, 4, 5, 6)
+        if state not in allowed: raise RuntimeError('Call state changed')
+        await self.dbus(MM, path, CALL, method, signature, body)
+        logging.info('headset %s accepted for call %s', method, call['id'])
+
+    def prefer_bluetooth(self, call_id):
+        # A separate one-shot intent avoids racing the screen's settings writer.
+        write_json(RUN / 'intent.json', {'call': call_id, 'updated': time.time()})
+
+    def indicators(self, calls):
+        if time.monotonic() > self.battery_at:
+            try: self.battery = max(0, min(5, (int(Path('/sys/class/power_supply/battery/capacity').read_text()) + 19)//20))
+            except (OSError, ValueError): pass
+            self.battery_at = time.monotonic() + 30
+        # Active call proves service. Idle registration may be unknown; never
+        # open another AT channel merely to populate accessory indicators.
+        return indicators(calls, int(bool(calls)), battery=self.battery)
+
+    def publish(self):
+        peer = self.peer
+        write_json(RUN / 'status.json', {'connected': bool(peer and peer.ready),
+            'device': peer.name if peer else None, 'path': peer.path if peer else None,
+            'connection': peer.connection if peer else None,
+            'audio': self.sco is not None, 'rate': 16000 if peer and peer.codec == 2 else 8000,
+            'remote_volume': bool(peer and peer.remote_volume),
+            'volume': peer.volume if peer else None,
+            'error': self.error, 'updated': time.time()})
+
+    def close_audio(self):
+        if self.sco:
+            self.sco.close()
+            self.sco = None
+        if self.lease:
+            self.lease.close()
+            self.lease = None
+
+    async def acquire(self, reader, writer):
+        owned = False
+        try:
+            request = json.loads(await asyncio.wait_for(reader.readline(), 2))
+            if request != {'acquire': True} or self.lease: raise RuntimeError('Invalid or busy SCO lease')
+            peer = self.peer
+            if not peer or not peer.ready: raise RuntimeError('No HFP headset connected')
+            self.lease, owned = writer, True
+            if peer.features & 128:
+                peer.codec_requested = 2 if 2 in peer.codecs else 1
+                peer.codec_ready.clear()
+                await peer.send(f'+BCS: {peer.codec_requested}')
+                await asyncio.wait_for(peer.codec_ready.wait(), 3)
+            else: peer.codec = 1
+            if self.lease is not writer or self.peer is not peer:
+                raise RuntimeError('Headset disconnected during negotiation')
+            props = await self.properties(peer.adapter, 'org.bluez.Adapter1')
+            if self.lease is not writer or self.peer is not peer:
+                raise RuntimeError('Headset disconnected during negotiation')
+            sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_SCO)
+            self.sco = sock
+            sock.setsockopt(274, 11, struct.pack('H', 0x0063 if peer.codec == 2 else 0x0060))
+            sock.bind(props['Address'])
+            sock.setblocking(False)
+            await asyncio.wait_for(asyncio.get_running_loop().sock_connect(sock, peer.address), 4)
+            if self.peer is not peer or peer.closed.is_set(): raise RuntimeError('Headset disconnected')
+            self.error = None
+            self.publish()
+            writer.write((json.dumps({'ok': True, 'rate': 16000 if peer.codec == 2 else 8000}) + '\n').encode())
+            await writer.drain()
+            logging.info('SCO connected; codec=%s, hardware PCM', peer.codec)
+            # No PCM capture/copy loop: this controller carries SCO over IIS3.
+            await reader.read(1)
+        except (OSError, ValueError, RuntimeError, asyncio.TimeoutError) as error:
+            self.error = str(error) or 'SCO connection timed out'
+            logging.warning('SCO: %s', self.error)
+            if not writer.is_closing():
+                writer.write((json.dumps({'ok': False, 'error': self.error}) + '\n').encode())
+                with contextlib.suppress(OSError): await writer.drain()
+        finally:
+            if owned and self.lease is writer: self.close_audio()
+            writer.close()
+            self.publish()
+
+    async def connect_headset(self):
+        while not self.stop.is_set():
+            self.discover.clear()
+            if self.peer is None:
+                try:
+                    objects = (await self.dbus('org.bluez', '/', 'org.freedesktop.DBus.ObjectManager', 'GetManagedObjects'))[0]
+                    for path, interfaces in objects.items():
+                        props = {k: v.value for k, v in interfaces.get('org.bluez.Device1', {}).items()}
+                        if props.get('Connected') and props.get('Trusted') and props.get('Paired') and HF in props.get('UUIDs', []):
+                            await self.dbus('org.bluez', path, 'org.bluez.Device1', 'ConnectProfile', 's', [HF])
+                            break
+                except (RuntimeError, asyncio.TimeoutError) as error:
+                    logging.debug('HFP connect: %s', error)
+            try: await asyncio.wait_for(self.discover.wait(), 20)
+            except asyncio.TimeoutError: pass
+
+    def signal(self, message):
+        if message.message_type != MessageType.SIGNAL: return
+        if message.member == 'NameOwnerChanged' and message.body[0] == 'org.bluez':
+            self.stop.set()  # procd reconnects and re-registers after bluetoothd restart
+        elif message.interface == 'org.freedesktop.DBus.Properties' and message.body[0] == 'org.bluez.Device1':
+            self.discover.set()
+
+    async def monitor(self):
+        while not self.stop.is_set():
+            peer = self.peer
+            if peer:
+                try: await peer.notify(call_list())
+                except (OSError, asyncio.TimeoutError): peer.close()
+            if self.sco and select.select([self.sco], [], [], 0)[0]:
+                try:
+                    if not self.sco.recv(512): self.close_audio()
+                except OSError: self.close_audio()
+            # Dead audio owner is reclaimed by Unix EOF, even if the modem or
+            # audio observer is restarting. Never infer or initiate a hangup.
+            self.publish()
+            await asyncio.sleep(.5)
+
+
+async def main():
+    RUN.mkdir(mode=0o700, parents=True, exist_ok=True)
+    bus = await MessageBus(bus_type=BusType.SYSTEM, negotiate_unix_fd=True).connect()
+    gateway = Gateway(bus)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        asyncio.get_running_loop().add_signal_handler(sig, gateway.stop.set)
+    bus.export(PROFILE, Profile(gateway))
+    bus.add_message_handler(gateway.signal)
+    for rule in ["type='signal',sender='org.bluez',interface='org.freedesktop.DBus.Properties'",
+                 "type='signal',interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='org.bluez'"]:
+        await gateway.dbus('org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus', 'AddMatch', 's', [rule])
+    await gateway.dbus('org.bluez', '/org/bluez', 'org.bluez.ProfileManager1', 'RegisterProfile', 'osa{sv}', [PROFILE, AG, {
+        'Name': Variant('s', 'Phone calls'), 'Version': Variant('q', 0x0107),
+        'Features': Variant('q', 0x20), 'RequireAuthentication': Variant('b', True),
+        'RequireAuthorization': Variant('b', True), 'AutoConnect': Variant('b', True)}])
+    sockpath = RUN / 'audio.sock'
+    sockpath.unlink(missing_ok=True)
+    server = await asyncio.start_unix_server(gateway.acquire, path=str(sockpath), limit=256)
+    os.chmod(sockpath, 0o600)
+    gateway.spawn(gateway.connect_headset())
+    gateway.spawn(gateway.monitor())
+    gateway.spawn(bus.wait_for_disconnect()).add_done_callback(lambda _: gateway.stop.set())
+    logging.info('HFP gateway registered')
+    try:
+        await gateway.stop.wait()
+    finally:
+        server.close()
+        await server.wait_closed()
+        if gateway.peer: gateway.peer.close()
+        gateway.close_audio()
+        for task in tuple(gateway.tasks): task.cancel()
+        await asyncio.gather(*gateway.tasks, return_exceptions=True)
+        bus.disconnect()
+        sockpath.unlink(missing_ok=True)
+        gateway.publish()
+
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, format='e5-hfp: %(message)s')
+    asyncio.run(main())
