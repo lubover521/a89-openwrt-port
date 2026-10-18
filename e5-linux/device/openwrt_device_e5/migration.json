@@ -1,0 +1,14 @@
+{
+  "source_repository": "sprd-linux-devs/e5-linux",
+  "source_commit": "b7282af",
+  "files": {
+    "devices/e5/stage.py": {
+      "path": "stage.py",
+      "source_sha256": "fe28b323335129be5a4dd4f0a7cfacb1eeeebefb156d56d47d0d7ae9b15c6dfd"
+    },
+    "devices/e5/test_stage.py": {
+      "path": "test_stage.py",
+      "source_sha256": "076ee3f1f67f3f9f669c273c66686f6349f99c9f635a219e8f4729230afa4982"
+    }
+  }
+}

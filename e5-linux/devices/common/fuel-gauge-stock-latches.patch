@@ -1,0 +1,89 @@
+--- a/drivers/power/supply/sprd_ump96xx_fuel_gauge.c
++++ b/drivers/power/supply/sprd_ump96xx_fuel_gauge.c
+@@ -723,12 +723,12 @@
+ 	return false;
+ }
+ 
+-/* Retained SET/CLEAR latches require writes even when their readback is unchanged. */
++/* Match the stock FGU masked-write sequence, including unchanged-value handling. */
+ static int ump96xx_fgu_save_boot_mode(struct sprd_fgu_info *info, int boot_mode)
+ {
+ 	int ret;
+ 
+-	ret = regmap_write_bits(info->regmap,
++	ret = regmap_update_bits(info->regmap,
+ 				 info->base + UMP96XX_FGU_USER_AREA_CLEAR0,
+ 				 UMP96XX_FGU_MODE_AREA_MASK,
+ 				 UMP96XX_FGU_MODE_AREA_MASK);
+@@ -745,7 +745,7 @@
+ 	 */
+ 	usleep_range(200, 210);
+ 
+-	ret = regmap_write_bits(info->regmap,
++	ret = regmap_update_bits(info->regmap,
+ 				 info->base + UMP96XX_FGU_USER_AREA_SET0,
+ 				 UMP96XX_FGU_MODE_AREA_MASK,
+ 				 boot_mode << UMP96XX_FGU_MODE_AREA_SHIFT);
+@@ -767,7 +767,7 @@
+ 	 * make the user area data available, otherwise we can not save the user
+ 	 * area data.
+ 	 */
+-	ret = regmap_write_bits(info->regmap,
++	ret = regmap_update_bits(info->regmap,
+ 				 info->base + UMP96XX_FGU_USER_AREA_CLEAR0,
+ 				 UMP96XX_FGU_MODE_AREA_MASK, 0);
+ 	if (ret) {
+@@ -845,7 +845,7 @@
+ 	if (cap < 0 || cap > UMP96XX_FGU_FCC_PERCENT)
+ 		return -ERANGE;
+ 
+-	ret = regmap_write_bits(info->regmap,
++	ret = regmap_update_bits(info->regmap,
+ 				 info->base + UMP96XX_FGU_USER_AREA_CLEAR0,
+ 				 UMP96XX_FGU_CAP_AREA_MASK,
+ 				 UMP96XX_FGU_CAP_AREA_MASK);
+@@ -865,7 +865,7 @@
+ 	value = (cap / 10) & UMP96XX_FGU_CAP_INTEGER_MASK;
+ 	value |= ((cap % 10) & UMP96XX_FGU_CAP_DECIMAL_MASK) << UMP96XX_FGU_CAP_DECIMAL_SHIFT;
+ 
+-	ret = regmap_write_bits(info->regmap,
++	ret = regmap_update_bits(info->regmap,
+ 				 info->base + UMP96XX_FGU_USER_AREA_SET0,
+ 				 UMP96XX_FGU_CAP_AREA_MASK, value);
+ 	if (ret) {
+@@ -886,7 +886,7 @@
+ 	 * make the user area data available, otherwise we can not save the user
+ 	 * area data.
+ 	 */
+-	ret = regmap_write_bits(info->regmap,
++	ret = regmap_update_bits(info->regmap,
+ 				 info->base + UMP96XX_FGU_USER_AREA_CLEAR0,
+ 				 UMP96XX_FGU_CAP_AREA_MASK, 0);
+ 	if (ret) {
+@@ -923,7 +923,7 @@
+ 	if (cap < 0 || cap > UMP96XX_FGU_FCC_PERCENT)
+ 		return -ERANGE;
+ 
+-	ret = regmap_write_bits(info->regmap,
++	ret = regmap_update_bits(info->regmap,
+ 				 info->base + UMP96XX_FGU_USER_AREA_CLEAR1,
+ 				 UMP96XX_FGU_CAP_AREA_MASK,
+ 				 UMP96XX_FGU_CAP_AREA_MASK);
+@@ -942,7 +942,7 @@
+ 	value = (cap / 10) & UMP96XX_FGU_CAP_INTEGER_MASK;
+ 	value |= ((cap % 10) & UMP96XX_FGU_CAP_DECIMAL_MASK) << UMP96XX_FGU_CAP_DECIMAL_SHIFT;
+ 
+-	ret = regmap_write_bits(info->regmap,
++	ret = regmap_update_bits(info->regmap,
+ 				 info->base + UMP96XX_FGU_USER_AREA_SET1,
+ 				 UMP96XX_FGU_CAP_AREA_MASK, value);
+ 	if (ret) {
+@@ -958,7 +958,7 @@
+ 	 */
+ 	usleep_range(200, 210);
+ 
+-	ret = regmap_write_bits(info->regmap,
++	ret = regmap_update_bits(info->regmap,
+ 				 info->base + UMP96XX_FGU_USER_AREA_CLEAR1,
+ 				 UMP96XX_FGU_CAP_AREA_MASK, 0);
+ 	if (ret) {

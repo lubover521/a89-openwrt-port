@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>电话</title>
+<link rel="stylesheet" href="phone.css">
+</head>
+<body>
+<header class="heading"><strong data-text="phone">电话</strong><span id="connection" class="connection" aria-live="polite"></span></header>
+<div id="feedback" class="feedback" role="status" hidden></div>
+<div id="call-choices" class="call-choices" hidden></div>
+<section id="call-card" class="call-card" hidden>
+ <span id="call-state" class="call-state"></span>
+ <div class="avatar call-avatar"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h4l2 5-3 2c1 3 3 5 6 6l2-3 5 2v4c0 1-1 2-2 2C10 21 3 14 3 5c0-1 1-2 3-2z"/></svg></div>
+ <strong id="call-name"></strong><span id="call-number"></span><span id="call-duration"></span>
+ <div id="audio-actions" class="audio-actions"><button id="speaker" aria-haspopup="dialog" aria-expanded="false" aria-pressed="false">手机</button><button id="mute" data-text="mute" aria-pressed="false">静音</button></div>
+ <button id="dtmf-toggle" class="dtmf-toggle" aria-expanded="false" data-text="keypad">键盘</button>
+ <div id="dtmf-panel" hidden>
+  <output id="dtmf-digits" aria-live="polite"></output>
+  <div class="dtmf-keypad" aria-label="DTMF">
+   <button data-tone="1">1</button><button data-tone="2">2</button><button data-tone="3">3</button>
+   <button data-tone="4">4</button><button data-tone="5">5</button><button data-tone="6">6</button>
+   <button data-tone="7">7</button><button data-tone="8">8</button><button data-tone="9">9</button>
+   <button data-tone="*">*</button><button data-tone="0">0</button><button data-tone="#">#</button>
+  </div>
+ </div>
+ <div id="call-sim" class="call-sim"></div>
+ <div class="call-actions"><button id="accept" class="dial" data-text="answer">接听</button><button id="hangup" class="end" data-text="hangup">挂断</button></div>
+</section>
+<section id="dialer" class="dialer" aria-label="拨号盘">
+ <div class="sim-selector" role="group" aria-label="发送呼叫 SIM">
+  <button id="sim-1" data-sim="0" aria-pressed="true">SIM1</button>
+  <button id="sim-2" data-sim="1" aria-pressed="false">SIM2</button>
+ </div>
+ <div class="number-area"><span id="number-label" data-text="enterNumber">输入电话号码</span><output id="number"></output></div>
+ <div id="keypad" class="keypad">
+  <button data-key="1"><b>1</b><small>&nbsp;</small></button><button data-key="2"><b>2</b><small>ABC</small></button><button data-key="3"><b>3</b><small>DEF</small></button>
+  <button data-key="4"><b>4</b><small>GHI</small></button><button data-key="5"><b>5</b><small>JKL</small></button><button data-key="6"><b>6</b><small>MNO</small></button>
+  <button data-key="7"><b>7</b><small>PQRS</small></button><button data-key="8"><b>8</b><small>TUV</small></button><button data-key="9"><b>9</b><small>WXYZ</small></button>
+  <button data-key="*"><b>*</b><small>&nbsp;</small></button><button data-key="0"><b>0</b><small>+</small></button><button data-key="#"><b>#</b><small>&nbsp;</small></button>
+ </div>
+ <div class="dial-actions">
+  <button id="save-number" class="icon-button" aria-label="保存联系人"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button>
+  <button id="dial" class="dial"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h4l2 5-3 2c1 3 3 5 6 6l2-3 5 2v4c0 1-1 2-2 2C10 21 3 14 3 5c0-1 1-2 3-2z"/></svg><span data-text="dial">拨号</span></button>
+  <button id="backspace" class="icon-button" aria-label="退格"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5h12v14H9L2 12zM12 9l6 6m0-6-6 6"/></svg></button>
+ </div>
+</section>
+<section id="contacts-panel" class="contacts-panel">
+ <div class="section-heading"><strong data-text="contacts">通讯录</strong><span id="contact-count"></span></div>
+ <div id="contacts" class="contacts"></div>
+</section>
+<div id="editor" class="scrim" hidden><form class="sheet" id="contact-form">
+ <div class="section-heading"><strong id="editor-title" data-text="newContact">新建联系人</strong><button type="button" id="editor-close" data-text="cancel">取消</button></div>
+ <label><span data-text="contactName">姓名（可选）</span><input id="contact-name" maxlength="40" autocomplete="off"></label>
+ <label><span data-text="contactNumber">电话号码</span><input id="contact-number" maxlength="32" inputmode="tel" autocomplete="off" required></label>
+ <button type="submit" class="dial" id="editor-save" data-text="save">保存</button>
+</form></div>
+<div id="delete-sheet" class="scrim" hidden><div class="sheet">
+ <strong data-text="deleteContact">删除联系人？</strong><p id="delete-name"></p>
+ <div class="call-actions"><button id="delete-cancel" data-text="cancel">取消</button><button id="delete-confirm" class="end" data-text="delete">删除</button></div>
+</div></div>
+<div id="audio-sheet" class="scrim" hidden><section class="sheet audio-sheet" role="dialog" aria-modal="true" aria-labelledby="audio-title">
+ <div class="section-heading"><strong id="audio-title" data-text="audioOutput">通话音频</strong><button id="audio-close" data-text="done">完成</button></div>
+ <div class="audio-routes" role="group" aria-labelledby="audio-title">
+  <button data-route="receiver" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="2.5" width="12" height="19" rx="3"/><path d="M10 5h4m-3 13h2"/></svg><span data-text="receiver">手机</span><i></i></button>
+  <button data-route="speaker" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 4 6 8H3v8h3l5 4V4zm4 4a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14"/></svg><span data-text="speaker">扬声器</span><i></i></button>
+  <button data-route="bluetooth" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10-5 5V2l5 5L7 17"/></svg><span><b data-text="bluetooth">蓝牙耳机</b><small id="bluetooth-name"></small></span><i></i></button>
+ </div>
+</section></div>
+<script src="/sdk/e5.js"></script>
+<link rel="stylesheet" href="/mobile-phone.css">
+<script src="phone.js"></script>
+</body>
+</html>

@@ -1,0 +1,65 @@
+/* Phone 1.5 in the T551M shell's 356px app viewport. Preserve readable
+   keys instead of compressing them below their two lines of text. */
+html { overflow-y:auto; overflow-x:hidden; scrollbar-width:none; }
+body { height:auto; min-height:100%; overflow:visible; padding:8px 14px; gap:6px; }
+.heading { height:23px; }
+.sim-selector button { height:26px; }
+.number-area { height:42px; min-height:42px; padding:3px 0; gap:0; }
+#number { flex-shrink:0; min-height:32px; line-height:32px; }
+.keypad { gap:5px 12px; grid-auto-rows:minmax(44px,auto); }
+.keypad button { height:auto; min-height:44px; padding:4px 6px; gap:1px; }
+.keypad b { flex-shrink:0; font-size:24px; line-height:25px; }
+.keypad small { flex-shrink:0; font-size:8px; line-height:10px; }
+.dial-actions { margin-top:8px; }
+.dial-actions>button { min-height:42px; }
+.contacts-panel { flex:0 0 auto; min-height:64px; margin-top:8px; padding-top:8px; }
+.contacts { flex:none; overflow:visible; }
+.call-card { flex:1 0 auto; min-height:280px; }
+.dtmf-toggle { min-height:32px; padding:5px 18px; border-radius:18px; }
+#dtmf-panel { width:100%; }
+#dtmf-digits { display:block; height:24px; line-height:24px; text-align:center; overflow:hidden; white-space:nowrap; font-size:18px; letter-spacing:3px; }
+.dtmf-keypad { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:5px 12px; }
+.dtmf-keypad button { min-height:42px; padding:4px; border-radius:16px; font-size:23px; line-height:30px; touch-action:manipulation; }
+.call-card.dtmf-open { gap:5px; min-height:0; padding:4px 0; }
+.call-card.dtmf-open { position:relative; }
+.dtmf-open .call-avatar,.dtmf-open #call-number,.dtmf-open #call-sim,.dtmf-open #audio-actions,.dtmf-open #call-state { display:none; }
+.dtmf-open #call-name { font-size:19px; line-height:24px; }
+.dtmf-open #call-duration { position:absolute; top:8px; right:0; font-size:13px; }
+.dtmf-open .dtmf-toggle { min-height:26px; padding:3px 14px; }
+.dtmf-open .dtmf-keypad button { min-height:40px; height:40px; }
+.dtmf-open .call-actions button { min-height:38px; height:38px; }
+.dtmf-open .call-actions { position:sticky; bottom:0; width:100%; }
+.call-only #dialer,.call-only #contacts-panel,.call-only #editor,.call-only #delete-sheet { display:none!important; }
+.call-only { min-height:100vh; padding:16px 20px; }
+.call-only .call-card { min-height:calc(100vh - 70px); justify-content:center; }
+.call-only .dtmf-open { justify-content:space-between; }
+.call-only .dtmf-keypad button { min-height:44px; height:44px; }
+
+/* Match the shell wallpaper through scrolling without exposing the app list
+   beneath the iframe. Only background colors gain alpha; content stays opaque. */
+html.desktop-wallpaper {
+    background-color:var(--bg);
+    background-image:var(--wallpaper-wash),var(--desktop-wallpaper);
+    background-size:100vw var(--wallpaper-height);
+    background-position:center var(--wallpaper-offset);
+    background-attachment:fixed;
+    background-repeat:no-repeat;
+}
+.desktop-wallpaper body { background:transparent; }
+html { --surface-alpha:1; --green:var(--accent,#42d391); }
+html.desktop-wallpaper { --surface-alpha:var(--ui-opacity,.7); }
+html button { background:rgba(var(--button-rgb),var(--surface-alpha)); }
+html .keypad button,html .sheet { background:rgba(var(--surface-rgb),var(--surface-alpha)); }
+html .icon-button,html .contact-pick,html .contact-remove,html .sim-selector button { background:transparent; }
+html .dial { background:rgba(66,211,145,var(--surface-alpha)); color:#05291b; }
+html .end { background:rgba(242,106,109,var(--surface-alpha)); color:#3c0910; }
+html .feedback { background:rgba(var(--danger-rgb),var(--surface-alpha)); }
+html .feedback.info,html .sheet input { background:rgba(var(--button-rgb),var(--surface-alpha)); }
+html .avatar,html .call-avatar,html .audio-actions button[aria-pressed="true"],
+html .sim-selector button[aria-pressed="true"] { background:rgba(var(--active-rgb),var(--surface-alpha)); color:var(--accent); }
+html[data-theme=light] { color-scheme:light; }
+[data-theme=light] .keypad small,[data-theme=light] .icon-button,[data-theme=light] .contact-remove,
+[data-theme=light] .audio-actions button,[data-theme=light] .sheet label,[data-theme=light] .sheet p { color:var(--dim); }
+[data-theme=light] .feedback { color:var(--poor); }
+[data-theme=light] .feedback.info { color:var(--text); }
+[data-theme=light] .contact,[data-theme=light] .audio-actions button,[data-theme=light] .sheet input { border-color:var(--line); }

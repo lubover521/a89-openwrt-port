@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "system": "openwrt",
+  "model": "e5",
+  "repository": "https://github.com/sprd-linux-devs/openwrt_device_e5.git"
+}

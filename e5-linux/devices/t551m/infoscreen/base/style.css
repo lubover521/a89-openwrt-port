@@ -1,0 +1,330 @@
+/* 320x480 portrait panel, dark: most of the time this is read at a glance */
+:root {
+	--bg: #0b0e13;
+	--card: #161b23;
+	--line: #232a35;
+	--text: #e8ecf2;
+	--dim: #8b95a5;
+	--accent: #4aa3ff;
+	--good: #3ccf7a;
+	--fair: #f2c14b;
+	--poor: #f0625a;
+	--focus: #ffffff;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+	margin: 0;
+	width: 100%;
+	height: 100%;
+	overflow: hidden;
+	background: var(--bg);
+	color: var(--text);
+	font-family: "Noto Sans CJK SC", "DejaVu Sans", sans-serif;
+	font-size: 15px;
+	-webkit-user-select: none;
+	user-select: none;
+	cursor: none;
+}
+
+/* status bar */
+#bar {
+	position: absolute; top: 0; left: 0; right: 0;
+	height: 30px;
+	padding: 0 8px;
+	display: flex; align-items: center; justify-content: space-between;
+	font-size: 13px;
+	background: #07090d;
+	border-bottom: 1px solid var(--line);
+}
+#bar .left, #bar .right { display: flex; align-items: center; gap: 6px; }
+#bar-op { max-width: 120px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.badge {
+	font-size: 11px; font-weight: bold;
+	padding: 1px 5px; border-radius: 4px;
+	background: var(--accent); color: #000;
+}
+.badge.off { background: var(--line); color: var(--dim); }
+/* the SIM card in use: a card with its corner cut, the slot number on it */
+.sim {
+	display: inline-flex; align-items: center; justify-content: center;
+	width: 11px; height: 14px; padding-top: 1px; box-sizing: border-box;
+	font-size: 10px; font-weight: bold; line-height: 1;
+	background: var(--text); color: #000; border-radius: 1.5px;
+	-webkit-clip-path: polygon(0 0, 62% 0, 100% 28%, 100% 100%, 0 100%);
+	clip-path: polygon(0 0, 62% 0, 100% 28%, 100% 100%, 0 100%);
+}
+.sim:empty { display: none; }
+
+.bars { display: inline-flex; align-items: flex-end; gap: 2px; height: 14px; }
+.bars i { display: block; width: 4px; background: var(--line); border-radius: 1px; }
+.bars i:nth-child(1) { height: 25%; }
+.bars i:nth-child(2) { height: 50%; }
+.bars i:nth-child(3) { height: 75%; }
+.bars i:nth-child(4) { height: 100%; }
+.bars i.on { background: var(--text); }
+
+.bat {
+	position: relative; display: inline-block;
+	width: 22px; height: 11px;
+	border: 1.5px solid var(--text); border-radius: 2px;
+}
+.bat::after {
+	content: ""; position: absolute; right: -4px; top: 2.5px;
+	width: 2px; height: 4px; background: var(--text); border-radius: 0 1px 1px 0;
+}
+.bat b { position: absolute; left: 1px; top: 1px; bottom: 1px; width: 0; background: var(--good); }
+.bat.low b { background: var(--poor); }
+.bat.charging b { background: var(--accent); }
+
+/* pages side by side, one on screen */
+#pages {
+	position: absolute; top: 30px; bottom: 26px; left: 0; right: 0;
+	display: flex;
+	transition: transform 0.25s ease;
+}
+.page {
+	flex: 0 0 100%;
+	height: 100%;
+	padding: 8px;
+	overflow-y: auto;
+	display: flex; flex-direction: column; gap: 7px;
+}
+.page::-webkit-scrollbar { display: none; }
+
+.card {
+	background: var(--card);
+	border-radius: 10px;
+	padding: 9px 11px;
+}
+.row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.label { color: var(--dim); }
+.label { flex-shrink: 0; }
+/* long values (addresses, versions, firmware) wrap instead of ending in "..." */
+.value { text-align: right; min-width: 0; overflow-wrap: anywhere; }
+.value.one { white-space: nowrap; }   /* short lines that must not break (the battery) */
+#ov-bat { font-size: 13px; }
+.value.strong { font-weight: bold; text-align: left; font-size: 17px; }
+.value.small, .small { font-size: 12px; }
+.sub { color: var(--dim); font-size: 12px; }
+.ok { color: var(--good); }
+.warn { color: var(--fair); }
+.bad { color: var(--poor); }
+
+/* overview */
+/* download and upload side by side, the traffic since boot under both */
+.rates { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 8px; }
+.rates .sub { grid-column: 1 / -1; }
+.rate { display: flex; align-items: baseline; gap: 3px; min-width: 0; white-space: nowrap; }
+.rate .big { font-size: 27px; }
+.rate .arrow { color: var(--good); font-size: 19px; width: 14px; }
+.rate .arrow.up { color: var(--accent); }
+.big { font-size: 34px; font-weight: bold; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.unit { color: var(--dim); font-size: 14px; }
+
+/* signal */
+.cellhead { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; }
+.cellhead .sub { flex-basis: 100%; }
+.band { color: var(--accent); }
+.meter .mh { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 5px; }
+.meter .mh span:first-child { color: var(--dim); }
+.track { height: 7px; background: var(--line); border-radius: 4px; overflow: hidden; }
+.track div { height: 100%; width: 0; border-radius: 4px; background: var(--dim); transition: width 0.4s; }
+.usage .track { height: 5px; }
+.usage .track + .mh { margin-top: 7px; }
+.temperatures { display: grid; grid-template-columns: 1fr 1fr; gap: 5px 14px; }
+.temperature { display: flex; justify-content: space-between; gap: 6px; font-size: 13px; }
+.temperature .label { font-size: inherit; }
+.temperature .value { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.grid.thermal-zones { font-size: 12px; grid-template-columns: minmax(0, 1fr) auto; }
+.thermal-zones .label { font-size: inherit; overflow-wrap: anywhere; }
+#ad-moretemps { margin-top: 10px; }
+#ad-extra-temps { margin-top: 10px; }
+#ad-extra-temps[hidden] { display: none; }
+.grid { display: grid; grid-template-columns: auto 1fr; gap: 5px 10px; }
+
+/* traffic */
+.tr { display: flex; align-items: baseline; gap: 6px; }
+.tr .arrow { font-size: 16px; width: 14px; }
+.mid { font-size: 20px; font-weight: bold; flex: 1; font-variant-numeric: tabular-nums; }
+.days { display: flex; flex-direction: column; gap: 4px; }
+.day { display: grid; grid-template-columns: 42px 1fr 64px; gap: 6px; align-items: center; font-size: 12px; }
+.day .bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; display: flex; }
+.day .bar i { display: block; height: 100%; }
+.day .bar i.rx { background: var(--good); }
+.day .bar i.tx { background: var(--accent); }
+.day .sum { text-align: right; color: var(--dim); }
+
+/* SMS */
+.smsmark { font-size: 12px; font-weight: bold; color: #000; background: var(--fair); border-radius: 4px; padding: 0 4px; }
+.smsmark:empty { display: none; }
+#bar-sms { display:flex; align-items:center; justify-content:center; align-self:center; flex:none; width:18px; height:18px; line-height:0; color:var(--text); }
+#bar-sms[hidden] { display:none; }
+/* Optical alignment with the adjacent signal and battery on the physical panel. */
+#bar-sms svg { display:block; flex:none; width:18px; height:18px; transform:translateY(1px); fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+.smsitem {
+	display: block; width: 100%; text-align: left;
+	font: inherit; color: var(--text);
+	background: var(--card); border: 0; border-radius: 10px;
+	padding: 8px 11px; margin-bottom: 7px; outline: none;
+}
+.smsitem:focus { box-shadow: 0 0 0 2px var(--focus); }
+.smsitem .top { display: flex; justify-content: space-between; gap: 6px; font-size: 13px; }
+.smsitem .from { font-weight: bold; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.smsitem.unread .from::before { content: "● "; color: var(--fair); }
+.smsitem .when { color: var(--dim); font-size: 11px; white-space: nowrap; }
+.smsitem .preview { color: var(--dim); font-size: 13px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.smshead { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; margin-bottom: 6px; }
+.smstext { white-space: pre-wrap; word-break: break-word; line-height: 1.45; }
+.strong { font-weight: bold; }
+.btn.danger { background: #5a2420; }
+.btn.danger.armed { background: var(--poor); color: #000; }
+
+/* advanced */
+.label.sect { color: var(--accent); font-weight: bold; }
+.fw { grid-column: 1 / -1; font-size: 11px; color: var(--dim); line-height: 1.5; word-break: break-all; }
+#ad-ids { margin-bottom: 8px; }
+
+/* settings */
+.stpath { color: var(--dim); font-size: 12px; margin: 0 2px 2px; }
+.strow {
+	display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 8px;
+	font: inherit; color: var(--text); text-align: left;
+	background: var(--card); border: 0; border-radius: 10px;
+	padding: 10px 11px; margin-bottom: 6px; outline: none;
+}
+.strow:focus { box-shadow: 0 0 0 2px var(--focus); }
+.strow.info { display: flex; }
+.strow .sv { color: var(--dim); font-size: 13px; text-align: right; min-width: 0; overflow-wrap: anywhere; flex: 1; }
+/* the label at its own width, the value in all the rest of the row: it
+   wraps only when it does not fit, and then evenly (no one character left
+   on a line) */
+.strow > span:first-child { flex-shrink: 0; max-width: 48%; }
+.strow .sv { text-wrap: balance; }
+.stnote { text-wrap: pretty; }
+.strow .sv.on { color: var(--good); }
+.strow .chev::after { content: "›"; color: var(--dim); margin-left: 4px; }
+.strow.armed { background: #5a2420; }
+.strow.armed .sv { color: var(--text); }
+.stnote { color: var(--dim); font-size: 11px; margin: -3px 4px 7px; }
+.stnum { font-size: 40px; font-weight: bold; text-align: center; padding: 14px 0; }
+.stbtns { display: flex; gap: 8px; }
+.stbtns .btn { flex: 1; }
+.opt.on::before { content: "● "; color: var(--good); }
+.opt.check::before { content: "☐ "; }
+.opt.check.on::before { content: "☑ "; color: var(--good); }
+.devst.bad { color: var(--poor); }
+
+/* apps */
+#app-frame { position: absolute; top: 30px; bottom: 26px; left: 0; right: 0; width: 100%; height: calc(100% - 56px); border: 0; background: var(--bg); z-index: 4; }
+#ime-frame { position: absolute; top: 30px; bottom: 26px; left: 0; right: 0; width: 100%; height: calc(100% - 56px); border: 0; background: var(--bg); z-index: 6; }
+
+/* hotspot */
+.qr { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+#hs-qr { position: relative; width: 168px; height: 168px; background: #fff; border-radius: 6px; padding: 4px; }
+#hs-qr svg { width: 100%; height: 100%; display: block; }
+/* the hotspot is not up: the code faded, and why, over it */
+#hs-qr.off svg { opacity: 0.12; }
+#hs-qr.off::after {
+	content: attr(data-off); position: absolute; inset: 0;
+	display: flex; align-items: center; justify-content: center; text-align: center;
+	color: #1a1f27; font-weight: bold; font-size: 15px; padding: 10px;
+}
+.list .lh { color: var(--dim); margin-bottom: 4px; }
+#st-view .lh { color: var(--dim); font-size: 12px; margin: 10px 4px 5px; }
+.client { display: flex; justify-content: space-between; gap: 6px; padding: 4px 0; border-top: 1px solid var(--line); font-size: 13px; }
+.client .via { color: var(--dim); font-size: 11px; }
+
+/* buttons: touch and the keypad (focus ring) */
+.btn {
+	font: inherit; color: var(--text);
+	background: var(--line);
+	border: 0; border-radius: 8px;
+	padding: 7px 14px;
+	min-width: 64px;
+	outline: none;
+}
+.btn.on { background: var(--good); color: #000; }
+.btn.small { padding: 4px 12px; min-width: 40px; }
+.btn.wide { width: 100%; }
+.btn:active { filter: brightness(1.3); }
+.btn:focus { box-shadow: 0 0 0 2px var(--focus); }
+.btns { display: flex; align-items: center; gap: 10px; }
+
+/* footer */
+#foot {
+	position: absolute; bottom: 0; left: 0; right: 0;
+	height: 26px; padding: 0 10px;
+	display: flex; align-items: center; justify-content: space-between;
+	font-size: 12px; color: var(--dim);
+	border-top: 1px solid var(--line);
+}
+#dots i { display: inline-block; width: 6px; height: 6px; margin-left: 5px; border-radius: 3px; background: var(--line); }
+#dots i.on { background: var(--text); }
+
+/* backlight off: nothing to draw, and the first touch only wakes */
+/* Update notice: compact by default; release notes scroll inside the card. */
+#update-card {
+	position: fixed; left: 8px; right: 8px; bottom: 34px; z-index: 6;
+	padding: 12px; border: 1px solid var(--accent); border-radius: 12px;
+	background: var(--card); box-shadow: 0 6px 24px #000a;
+	max-height: calc(100% - 76px); overflow-y: auto;
+}
+#update-card[hidden], #update-notes[hidden], #update-error[hidden] { display: none; }
+.update-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; font-size: 14px; }
+#update-version { color: var(--accent); font-variant-numeric: tabular-nums; }
+#update-scope { margin-top: 5px; font-size: 12px; }
+.update-details { padding: 7px 0; border: 0; background: transparent; color: var(--accent); font-size: 13px; text-align: left; }
+#update-notes { max-height: 145px; overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; font-size: 13px; margin-bottom: 8px; }
+#update-error { color: var(--poor); font-size: 12px; overflow-wrap: anywhere; margin-bottom: 8px; }
+.update-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.update-actions .btn { width: 100%; }
+.update-actions .btn:disabled { opacity: .5; }
+.update-later-hint { margin-top: 6px; color: var(--dim); font-size: 11px; text-align: right; }
+
+/* a picture over everything (picOpen), below the dark screen */
+#pic {
+	position: fixed; inset: 0; z-index: 8; background: var(--bg);
+	display: flex; flex-direction: column; align-items: center; justify-content: center;
+	gap: 10px; padding: 16px; text-align: center;
+}
+#pic[hidden] { display: none; }
+#pic img { width: 260px; max-width: 100%; border-radius: 10px; background: #fff; }
+#pic-caption { font-size: 15px; text-wrap: balance; }
+#pic-note { font-size: 12px; color: var(--dim); text-wrap: balance; }
+#pic-note[hidden] { display: none; }
+#pic-close { font-size: 12px; color: var(--dim); }
+
+#blank { position: fixed; inset: 0; background: #000; display: none; z-index: 10; }
+body.blank #blank { display: block; }
+
+#toast {
+	position: fixed; left: 50%; bottom: 36px; transform: translateX(-50%);
+	background: #000c; color: var(--text); padding: 6px 12px; border-radius: 8px;
+	font-size: 13px; opacity: 0; transition: opacity 0.2s; z-index: 5; pointer-events: none;
+}
+#toast.show { opacity: 1; }
+
+/* the volume keys' level, over the page for a moment */
+#vol-osd {
+	position: fixed; left: 50%; top: 64px; transform: translateX(-50%); width: 240px;
+	display: flex; align-items: center; gap: 8px;
+	background: #000d; color: var(--text); padding: 10px 12px; border-radius: 10px;
+	font-size: 14px; opacity: 0; transition: opacity 0.2s; z-index: 6; pointer-events: none;
+}
+#vol-osd.show { opacity: 1; }
+#vol-osd .track { flex: 1; height: 6px; }
+#vol-osd .track div { background: var(--accent); transition: width 0.15s; }
+#vol-n { min-width: 30px; text-align: right; font-variant-numeric: tabular-nums; }
+
+/* touch off (高级 -> 屏幕 -> 触摸): nothing takes a touch, a plugin's frame neither */
+body.notouch, body.notouch * { pointer-events: none !important; }
+
+.tr .lbl2 { color: var(--dim); font-size: 12px; width: 30px; }
+.tr .mid { font-size: 17px; }
+
+/* All installed applications share this presentation; no application-specific action is automatic. */
+#notification-card { position:fixed; top:40px; left:8px; right:8px; z-index:7; padding:12px; border:1px solid var(--accent); border-radius:12px; background:var(--card); box-shadow:0 6px 24px #000a; }
+#notification-card[hidden] { display:none; }
+#notification-body { margin:8px 0; overflow-wrap:anywhere; font-size:14px; }

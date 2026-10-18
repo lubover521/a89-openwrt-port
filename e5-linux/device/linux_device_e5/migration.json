@@ -1,0 +1,46 @@
+{
+  "source_repository": "sprd-linux-devs/e5-linux",
+  "source_commit": "b7282af",
+  "files": {
+    "devices/e5/README.md": {
+      "path": "README.md",
+      "source_sha256": "3c9bd7114ba43fe30ca93b57e96a4a0b440aae9d2cb33ca9241d22fbf7b629ab"
+    },
+    "devices/e5/build-kernel.sh": {
+      "path": "build-kernel.sh",
+      "source_sha256": "d889aa400661073df869cd32422316f6da2761f385a3a1321772c8a57d235b94"
+    },
+    "devices/e5/charge-profile.h": {
+      "path": "charge-profile.h",
+      "source_sha256": "4eccafe4af45289e2d3ac4e99066767c92c3946bc53b110e44b43fff43db1708"
+    },
+    "devices/e5/charger-current.h": {
+      "path": "charger-current.h",
+      "source_sha256": "aeea43a197eeb6af7c1a37f977f9123b4870ddf0bd4fee740bc7ec41d74eb1ed"
+    },
+    "devices/e5/charger.py": {
+      "path": "charger.py",
+      "source_sha256": "baa43de80b59762990e0d7eed5d3b98731d6f0bdd6ca9689efa3b6f2e13a9df4"
+    },
+    "devices/e5/prepare-kernel.py": {
+      "path": "prepare-kernel.py",
+      "source_sha256": "06b733f2c99de39f3fdd3349515af66887337a7716e3d799a8378055d4c2cb1a"
+    },
+    "devices/e5/test_charge_profile.py": {
+      "path": "test_charge_profile.py",
+      "source_sha256": "c5871a3b1e6bb61d950aeb0f5586578573fde1baafc5f550c299b36d69d810c3"
+    },
+    "devices/e5/test_charger.py": {
+      "path": "test_charger.py",
+      "source_sha256": "e2ccba6916d526ebc666c4fabceb8a4ec9b2b96fa80c17b78732985c74d92238"
+    },
+    "rootfs/overlay/usr/share/alsa/ucm2/conf.d/sprdphone-sc273/sprdphone-sc2730.conf": {
+      "path": "overlay/usr/share/alsa/ucm2/conf.d/sprdphone-sc273/sprdphone-sc2730.conf",
+      "source_sha256": "d8b524e62d4656c7574b2da5a2016348295d3e2fe4028c7d548ec9fa170ac3a9"
+    },
+    "rootfs/overlay/usr/share/alsa/ucm2/sprdphone-sc273/HiFi.conf": {
+      "path": "overlay/usr/share/alsa/ucm2/sprdphone-sc273/HiFi.conf",
+      "source_sha256": "5b2f3af71651d0d876fa81a869c9da213a200bdf1260ab68484442603ad25596"
+    }
+  }
+}

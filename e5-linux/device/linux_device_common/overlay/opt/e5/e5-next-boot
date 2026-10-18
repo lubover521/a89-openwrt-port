@@ -1,0 +1,115 @@
+#!/bin/bash
+# Choose what the E5 boots next and keep Linux as default safely.
+#   e5-next-boot linux    Linux stays the default (re-armed on every successful boot)
+#   e5-next-boot android  the next reboot, and every one after it, goes to Android
+#   e5-next-boot --rearm  used by e5-boot-ok after a successful boot
+#   e5-next-boot status
+#   e5-next-boot next     what the next reboot boots, "linux" or "android", from misc as it is
+#
+# Slot b is armed with tries=2 and successful=0 (misc-bc-slot-b-trial.bin).  LK decrements
+# tries on every boot, so if Linux never reaches e5-boot-ok the next boot sees tries=1 and
+# rolls back to slot a (Android) on its own.  boot/init works from the other side: it writes
+# the recorded slot-a block back unless /etc/e5linux/default-boot says linux, so a Linux boot
+# that dies before userspace cannot loop either.
+#
+# That is also why --rearm does nothing unless the default is linux: an image that was asked
+# for one trial boot must not keep re-arming itself.  Turning Linux into the persistent
+# default is therefore explicit -- "e5-next-boot linux" -- and it is the same command that
+# arms slot b, so the two can never disagree.
+#
+# `e5-next-boot android` is the way back to the stock system from a running Linux: it writes
+# the slot-a block and records the choice; reboot afterwards.
+#
+# (port of mu300-linux/device/debian_device_common/overlay/opt/mu300/bin/mu300-next-boot.  The E5 image has no
+#  .e5linux/boot-tries counter: the initramfs restore above is what plays that role.)
+set -eu
+CONF=/etc/e5linux/default-boot
+BC_A=/run/e5linux/misc-bc-slot-a.bin
+BC_B=/run/e5linux/misc-bc-slot-b-trial.bin
+# the initramfs leaves them in /run; a system that keeps copies of its own
+# (the OpenWrt tree, openwrt/install.sh) finds them in /etc/e5linux
+[ -f "$BC_A" ] || BC_A=/etc/e5linux/misc-bc-slot-a.bin
+[ -f "$BC_B" ] || BC_B=/etc/e5linux/misc-bc-slot-b-trial.bin
+MISC=$(cat /run/e5linux/misc-dev 2>/dev/null || readlink -f /dev/block/by-name/misc)
+
+write_bc() {
+    [ "$(wc -c < "$1")" = 32 ] || { echo "invalid boot control block size" >&2; return 1; }
+    dd if="$1" of="$MISC" bs=1 seek=2048 conv=notrunc 2>/dev/null || return 1
+    sync || return 1
+    [ "$(dd if="$MISC" bs=1 skip=2048 count=32 2>/dev/null | od -An -tx1 -v | tr -d ' \n')" = "$(od -An -tx1 -v "$1" | tr -d ' \n')" ] \
+        || { echo "misc verify failed" >&2; return 1; }
+}
+
+slot_state() {
+    b=$(dd if="$MISC" bs=1 skip=2048 count=32 2>/dev/null | od -An -tx1 -v | tr -d ' \n')
+    echo "misc bootloader_control: $b"
+    # This LK keeps one status byte per slot at 12 (a) and 14 (b) -- checked against
+    # dumps/misc-head.bin (a: 9f = prio 15/tries 9/successful 1) and the trial block
+    # (a: 9e, b: 2f = prio 15/tries 2/successful 0), which is what arming slot b does.
+    echo "  slot a info: ${b:24:2}  slot b info: ${b:28:2}  (prio<<0|tries<<4|successful<<7)"
+}
+
+# What LK boots next, read from the block as it stands: the bootable slot of the higher
+# priority, where this LK takes a slot that is not successful and has one try left as failed
+# (it rolls back at once), and one with two or more as worth a try.  LK takes a try off slot
+# b as it boots it, so during a trial boot the block already says android -- until e5-boot-ok
+# re-arms it, which it does only when Linux is the default.
+next_target() {
+    b=$(dd if="$MISC" bs=1 skip=2048 count=32 2>/dev/null | od -An -tx1 -v | tr -d ' \n')
+    [ ${#b} -eq 64 ] || { echo unknown; return; }
+    a=$((16#${b:24:2})) s=$((16#${b:28:2}))
+    bootable() { [ $(($1 & 15)) -gt 0 ] && { [ $(($1 >> 7 & 1)) = 1 ] || [ $(($1 >> 4 & 7)) -ge 2 ]; }; }
+    if bootable $s && { ! bootable $a || [ $((s & 15)) -gt $((a & 15)) ]; }; then
+        echo linux
+    else
+        echo android
+    fi
+}
+
+# a trial image (e5.openwrt= on the command line: the mainline kernel's, upstream/) is never the
+# default boot -- boot/init writes android into its default-boot on every boot, and this refuses
+trial() { case " $(cat /proc/cmdline) " in *" e5.openwrt="*) true ;; *) false ;; esac; }
+
+# Serialize the complete misc+intent transaction; never advertise a successful
+# default change before misc readback. Preserve old misc if persistence fails.
+set_default() (
+    target=$1
+    mkdir -p "${CONF%/*}" /run || exit 1
+    candidate=$(mktemp "${CONF}.XXXXXX") || exit 1
+    previous=$(mktemp /run/openwrt-boot-bc.XXXXXX) || { rm -f "$candidate"; exit 1; }
+    old_conf=$(mktemp "${CONF}.backup.XXXXXX") || { rm -f "$candidate" "$previous"; exit 1; }
+    had_conf=false
+    if [ -e "$CONF" ]; then cp -p "$CONF" "$old_conf" || exit 1; had_conf=true; fi
+    trap 'rm -f "$candidate" "$previous" "$old_conf"' EXIT
+    printf '%s\n' "$target" > "$candidate" || exit 1
+    dd if="$MISC" of="$previous" bs=1 skip=2048 count=32 2>/dev/null || exit 1
+    [ "$(wc -c < "$previous")" = 32 ] || exit 1
+    if ( if [ "$target" = linux ]; then write_bc "$BC_B"; else write_bc "$BC_A"; fi ); then
+        if mv -f "$candidate" "$CONF" && sync && [ "$(cat "$CONF")" = "$target" ]; then
+            exit 0
+        fi
+    fi
+    if "$had_conf"; then mv -f "$old_conf" "$CONF"; else rm -f "$CONF"; fi
+    ( write_bc "$previous" ) || echo "boot control rollback failed" >&2
+    exit 1
+)
+
+# Include the successful-boot rearm in the same lock: an Android selection
+# must not be overwritten by a concurrently finishing startup service.
+case "${1:-status}" in
+    linux|android|--rearm|attempts)
+        exec 9>/run/openwrt-default-boot.lock
+        flock -n 9 || { echo "boot control busy" >&2; exit 1; } ;;
+esac
+
+case "${1:-status}" in
+    linux)   trial && { echo "a trial image (e5.openwrt=) is never the default boot" >&2; exit 1; }
+             set_default linux; echo "default boot: linux (slot b armed)" ;;
+    android) set_default android; echo "next boot: android (slot a)" ;;
+    --rearm) [ "$(cat "$CONF" 2>/dev/null)" = linux ] && write_bc "$BC_B" && echo "slot b re-armed" || echo "default boot is not linux, nothing to do" ;;
+    status)  echo "default boot: $(cat "$CONF" 2>/dev/null || echo android)"
+             echo "next boot: $(next_target)"
+             slot_state ;;
+    next)    next_target ;;
+    *) echo "usage: $0 linux|android|status|next" >&2; exit 2 ;;
+esac

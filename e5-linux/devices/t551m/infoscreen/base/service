@@ -1,0 +1,69 @@
+#!/bin/sh /etc/rc.common
+# The info screen on the E5's panel: a local status page in a full-screen
+# browser.  Three procd instances:
+#   seatd  hands the DRM and input devices to the compositor
+#   api    uhttpd on 127.0.0.1:8088 only -- the page and its data (api.uc);
+#          nothing outside the device reaches it, so it asks no password
+#   ui     cage (a single-application Wayland compositor) running cog
+START=95
+STOP=10
+USE_PROCD=1
+
+SHARE=/usr/share/e5-infoscreen
+# Noto Sans CJK: in the image when OpenWrt has one of its own (e5-linux's
+# standalone form puts it in /usr/share/fonts/e5-noto), else from the Debian
+# root image this OpenWrt runs from.  Bound under /usr/share/fonts, not named
+# where it is: WebKit's web process runs in a bubblewrap sandbox that sees
+# /usr but not /mnt, and a font it cannot open is drawn as garbage.
+CJK_SRC=/mnt/e5-disk/usr/share/fonts/opentype/noto
+CJK_DST=/usr/share/fonts/e5-noto
+
+start_service() {
+	config_load e5-infoscreen
+	local enabled
+	config_get_bool enabled main enabled 1
+	[ "$enabled" = 1 ] || { /usr/libexec/t551m-screen-power set 0; return; }
+
+	# the installed apps (/etc/e5-infoscreen/plugins) into the web root: an
+	# image update brings a web root without their links
+	/usr/libexec/e5-infoscreen/plugin link
+
+	# the saved backlight level (the page changes it, and turns it off when idle)
+	local level bl
+	config_get level main brightness 120
+	/usr/libexec/t551m-screen-power set "$level"
+
+	if [ -d "$CJK_SRC" ] && ! ls "$CJK_DST"/*.tt? >/dev/null 2>&1 &&
+	   ! grep -q " $CJK_DST " /proc/mounts; then
+		mkdir -p "$CJK_DST" && mount --bind "$CJK_SRC" "$CJK_DST"
+	fi
+
+	procd_open_instance seatd
+	procd_set_param command /usr/bin/seatd -g root
+	procd_set_param respawn 3600 5 0
+	procd_set_param stderr 1
+	procd_close_instance
+
+	procd_open_instance api
+	procd_set_param command /usr/sbin/uhttpd -f -p 127.0.0.1:8088 \
+		-h $SHARE/www -D -n 4 -t 30 -o /api -O $SHARE/api.uc
+	procd_set_param respawn 3600 5 0
+	procd_set_param stderr 1
+	procd_close_instance
+
+	procd_open_instance ui
+	procd_set_param command /usr/libexec/e5-infoscreen/session
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+stop_service() {
+	/usr/libexec/t551m-screen-power set 0
+	return 0
+}
+
+service_triggers() {
+	procd_add_reload_trigger e5-infoscreen
+}

@@ -1,0 +1,79 @@
+{
+	"id": "phone",
+	"device_integration": "e5-phone-audio-v1",
+	"api_version": 2,
+	"version": "1.5",
+	"name": {
+		"zh": "电话",
+		"en": "Phone"
+	},
+	"description": {
+		"zh": "双卡拨号、通讯录和来电",
+		"en": "Dual-SIM dialer, contacts and calls"
+	},
+	"entry": "index.html",
+	"order": 5,
+	"notifications": true,
+	"settings": [
+		{
+			"id": "ring_sound",
+			"type": "toggle",
+			"uci": "e5-plugin-phone.settings.ring_sound",
+			"default": "1",
+			"label": {
+				"zh": "来电铃声",
+				"en": "Incoming-call sound"
+			}
+		},
+		{
+			"id": "ring_vibrate",
+			"type": "toggle",
+			"uci": "e5-plugin-phone.settings.ring_vibrate",
+			"default": "1",
+			"label": {
+				"zh": "来电震动",
+				"en": "Incoming-call vibration"
+			}
+		},
+		{
+			"id": "ring_screen",
+			"type": "toggle",
+			"uci": "e5-plugin-phone.settings.ring_screen",
+			"default": "1",
+			"label": {
+				"zh": "来电亮屏",
+				"en": "Wake on incoming call"
+			}
+		},
+		{
+			"id": "ring_tone",
+			"type": "choice",
+			"uci": "e5-plugin-phone.settings.ring_tone",
+			"default": "call",
+			"label": {
+				"zh": "铃声",
+				"en": "Ringtone"
+			},
+			"options": [
+				{
+					"value": "call",
+					"label": {
+						"zh": "电话铃",
+						"en": "Phone ring"
+					}
+				},
+				{
+					"value": "beep",
+					"label": {
+						"zh": "提示音",
+						"en": "Beep"
+					}
+				},
+				{
+					"value": "custom",
+					"label": {"zh": "网页上传的铃声", "en": "Uploaded ringtone", "tr": "Yüklenen zil sesi"}
+				}
+			]
+		}
+	]
+}

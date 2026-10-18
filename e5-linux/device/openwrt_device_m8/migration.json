@@ -1,0 +1,30 @@
+{
+  "source_repository": "sprd-linux-devs/e5-linux",
+  "source_commit": "b7282af",
+  "files": {
+    "devices/m8/bluetooth-address.py": {
+      "path": "bluetooth-address.py",
+      "source_sha256": "6ae17270a19d5e094933366b2bd2fd9c930e6fcf6f459817b69173c3f5317b77"
+    },
+    "devices/m8/install-trial-data.py": {
+      "path": "install-trial-data.py",
+      "source_sha256": "a5233cb0ba7cd7b5e64bfd0f113f0db7a19d751452c1d956bfcadcf95e92ee5e"
+    },
+    "devices/m8/prepare-root.py": {
+      "path": "prepare-root.py",
+      "source_sha256": "64622935b4e58d4f2c4aec08fa4b1263dfb65bd3985cf036e8e2626a6e27a46a"
+    },
+    "devices/m8/prepare-trial-root.py": {
+      "path": "prepare-trial-root.py",
+      "source_sha256": "cf20b55a6fb899817d0e289e2e13834cefd2b7c0f3fb7cdda3d59d4637df26be"
+    },
+    "devices/m8/stage.py": {
+      "path": "stage.py",
+      "source_sha256": "d5421ad9d16e8eea0b5d85229d55e919f20eeeac8efe24ba12b3ed9ee3bd776f"
+    },
+    "devices/m8/test_bluetooth_address.py": {
+      "path": "test_bluetooth_address.py",
+      "source_sha256": "3ba8a542d7c14fcf63fa3c5e754fddbb74e2ba1c91daf9a05c439cbd7685963a"
+    }
+  }
+}

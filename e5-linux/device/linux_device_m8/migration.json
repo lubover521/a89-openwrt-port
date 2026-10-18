@@ -1,0 +1,166 @@
+{
+  "source_repository": "sprd-linux-devs/e5-linux",
+  "source_commit": "b7282af",
+  "files": {
+    "devices/m8/README.md": {
+      "path": "README.md",
+      "source_sha256": "a44aa3817a9dc2c9de2de3852a7d1f29f85a9ae3b74bc8143762816bb2e11678"
+    },
+    "devices/m8/audio.py": {
+      "path": "audio.py",
+      "source_sha256": "418c74cc8efdb6fdc9f93e3929d655dd8301f3c5dab1025beafca771250413fd"
+    },
+    "devices/m8/build-probe.sh": {
+      "path": "build-probe.sh",
+      "source_sha256": "4ac68f2667ae51d057a1593d140bf06cdf3d4415beb13fb211752eab0aed1749"
+    },
+    "devices/m8/charger.py": {
+      "path": "charger.py",
+      "source_sha256": "963d79f27246ee634c89cbcb966bd74322d39b5bdad1251262fcaed98472a027"
+    },
+    "devices/m8/collect-files.py": {
+      "path": "collect-files.py",
+      "source_sha256": "b409b7f53ecf488dfb857af984812ca111f124f7905d6257003f850d56b731de"
+    },
+    "devices/m8/collect-logs.py": {
+      "path": "collect-logs.py",
+      "source_sha256": "375d8ae5fcc1b5db4db77de9e48b67bc5873e66c01a9b97ebfacec272c9bf4f4"
+    },
+    "devices/m8/collect.py": {
+      "path": "collect.py",
+      "source_sha256": "aad0f72dad66cb67d371667740dc8cdc12b294ecea138d80a59d29c7da6a52f7"
+    },
+    "devices/m8/cpu-controls.md": {
+      "path": "cpu-controls.md",
+      "source_sha256": "06a846c0caddbe55c06fc1b29ba9d53b3fef3cdfb0f5aa2c7379f173f92e74e9"
+    },
+    "devices/m8/display-test.c": {
+      "path": "display-test.c",
+      "source_sha256": "0737498369bc9e858e28b38f6d4bfb59eef6f0706b873818618f6b4f292e5170"
+    },
+    "devices/m8/display.py": {
+      "path": "display.py",
+      "source_sha256": "e37d6875b0ce621ba9e62b9aa3e76fad67691d3dc2888b3fb6d3e5b5df9cd43f"
+    },
+    "devices/m8/dwc3-role.h": {
+      "path": "dwc3-role.h",
+      "source_sha256": "e44251cd7dd0199e73233cd1e1dd9827ff468cdcafa388bbcc468270fa6663fe"
+    },
+    "devices/m8/flash-probe.py": {
+      "path": "flash-probe.py",
+      "source_sha256": "5cc9d1bcc71ce4516a264cfbc1fead6f555566037b738147d689a0256fdd2c01"
+    },
+    "devices/m8/gpu.py": {
+      "path": "gpu.py",
+      "source_sha256": "61b20537ba4d5e9a8d6b15c419214152e73a6e12d36380ab01b11ded37e81f4e"
+    },
+    "devices/m8/make-probe.py": {
+      "path": "make-probe.py",
+      "source_sha256": "0ae908528d455468b65e821e576be9b4a99389661c12c0ade31f50cdbbce7417"
+    },
+    "devices/m8/make-trial.py": {
+      "path": "make-trial.py",
+      "source_sha256": "7c6f7d707945589653ca203a61894755e4e6143dcf4340955b153e79e00bc1e8"
+    },
+    "devices/m8/package-kernel.py": {
+      "path": "package-kernel.py",
+      "source_sha256": "ca8ffe5dd59d6a5fdff3a874d70e66ef00dc8781cb60f93713ad74285d2bd0d8"
+    },
+    "devices/m8/port/audio-legacy-dt.c": {
+      "path": "port/audio-legacy-dt.c",
+      "source_sha256": "c37616c9613d410ccb8ea906597fe11bbf6551b217bc8155738d054f731371c0"
+    },
+    "devices/m8/port/charger-sources.json": {
+      "path": "port/charger-sources.json",
+      "source_sha256": "485e556f30c03aba9ff8e9fd5b6bc2529717cc47a935baa5b7cfa63a964ba028"
+    },
+    "devices/m8/port/drivers/clk/sprd/ums9620-clk.c": {
+      "path": "port/drivers/clk/sprd/ums9620-clk.c",
+      "source_sha256": "6e3cc04b0d68920b9e84343aa7ca79f6c7f62869572ee1f81bf303acf983ecdc"
+    },
+    "devices/m8/port/drivers/cpufreq/sprd-cpufreq-v2-driver.c": {
+      "path": "port/drivers/cpufreq/sprd-cpufreq-v2-driver.c",
+      "source_sha256": "0d30b23b979889342a7439a50e842b624e2dd3a8a367aa01b3bbd4c906708cc3"
+    },
+    "devices/m8/port/drivers/cpufreq/sprd-cpufreq-v2.h": {
+      "path": "port/drivers/cpufreq/sprd-cpufreq-v2.h",
+      "source_sha256": "2752df107d605e66c87f63dbe531bea4268692b5222cf053c66b9f1a0e85e370"
+    },
+    "devices/m8/port/drivers/pinctrl/sprd/pinctrl-sprd-qogirn6pro.c": {
+      "path": "port/drivers/pinctrl/sprd/pinctrl-sprd-qogirn6pro.c",
+      "source_sha256": "0b45a6c2ac3dede193f524957b669757719e2a44beba87540c46eee4fdd37db4"
+    },
+    "devices/m8/port/drivers/pmdomain/sprd/Makefile": {
+      "path": "port/drivers/pmdomain/sprd/Makefile",
+      "source_sha256": "2e59a3b5cb2cd498ab5e3c9dc646c37bc9ab72756a54cf1de1940cee686ffff9"
+    },
+    "devices/m8/port/drivers/pmdomain/sprd/ums9620-ipa-sys.c": {
+      "path": "port/drivers/pmdomain/sprd/ums9620-ipa-sys.c",
+      "source_sha256": "ee71fdf1513a472119eb96592d5ccf5995347dc1091b771b1c7014200dbedeb9"
+    },
+    "devices/m8/port/drivers/power/supply/bq2560x-charger.c": {
+      "path": "port/drivers/power/supply/bq2560x-charger.c",
+      "source_sha256": "e7a99ea539a66a5dfcf2b25f8a275c8eb0567a675ed029fdb0b087133822dd51"
+    },
+    "devices/m8/port/drivers/thermal/sprd_thermal_r5p0.c": {
+      "path": "port/drivers/thermal/sprd_thermal_r5p0.c",
+      "source_sha256": "6d6fdfb28e67c71da9540a3b4bf5fb5db7f4de35483f0cad9d59f3154613f2cb"
+    },
+    "devices/m8/port/drivers/usb/phy/phy-sprd-ums9620-ssphy.c": {
+      "path": "port/drivers/usb/phy/phy-sprd-ums9620-ssphy.c",
+      "source_sha256": "0d25e915d7e4be8e0ef605f5b6c6dd2ed142f9a7f9d23eaa04916d06f0f898a4"
+    },
+    "devices/m8/port/include/dt-bindings/clock/sprd,ums9620-clk.h": {
+      "path": "port/include/dt-bindings/clock/sprd,ums9620-clk.h",
+      "source_sha256": "754e2398f8d9bf7604ea0ad5d2cf3526e5ca7661e51d4a257251f04311bf67b0"
+    },
+    "devices/m8/port/include/dt-bindings/reset/sprd,ums9620-reset.h": {
+      "path": "port/include/dt-bindings/reset/sprd,ums9620-reset.h",
+      "source_sha256": "4ac68c3919a86c7e935f34bd2e36d485323fef62de4b224c34075d4a9ca9178c"
+    },
+    "devices/m8/port/include/dt-bindings/soc/sprd,qogirn6pro-mask.h": {
+      "path": "port/include/dt-bindings/soc/sprd,qogirn6pro-mask.h",
+      "source_sha256": "0709197623ca1d0980b4b627eb10c4ee860cf498833039af146b74d024be3783"
+    },
+    "devices/m8/port/include/dt-bindings/soc/sprd,qogirn6pro-regs.h": {
+      "path": "port/include/dt-bindings/soc/sprd,qogirn6pro-regs.h",
+      "source_sha256": "048c5a1af9d0020c9f107f45a0d80790cb8289f9b8c02ec7b301a26bf5e0ede2"
+    },
+    "devices/m8/port/realme-sources.json": {
+      "path": "port/realme-sources.json",
+      "source_sha256": "149f03bd8f257be9715eb7fa273f6c21cae27435d97acf89022a8dde672a3b17"
+    },
+    "devices/m8/port/sources.json": {
+      "path": "port/sources.json",
+      "source_sha256": "5a85ed36a1873007819d11249824ca4bbc84c847519b6906122b8c59a8876c23"
+    },
+    "devices/m8/prepare-kernel.py": {
+      "path": "prepare-kernel.py",
+      "source_sha256": "a4a7ba10c30b4aee3bb21424beffd6acee3e847ac32bb7a5636ee64231f5016e"
+    },
+    "devices/m8/probe-module-order.txt": {
+      "path": "probe-module-order.txt",
+      "source_sha256": "73d7d1ed34e2975c11f4dcf0a58e3d5437da7b18dde85370abeeb78db44d604e"
+    },
+    "devices/m8/sprd_virtual_thermal.c": {
+      "path": "sprd_virtual_thermal.c",
+      "source_sha256": "97813f4c4f3d7da4794918cb974e19fc27466035c4b031a2d241fbe6f2056639"
+    },
+    "devices/m8/test_flash_probe.py": {
+      "path": "test_flash_probe.py",
+      "source_sha256": "ea36b1ed83786f20a13d75be67ad88d9cd731e5e234807836468afafcd64d309"
+    },
+    "devices/m8/usb-role.py": {
+      "path": "usb-role.py",
+      "source_sha256": "faf98fe54d9d746fb7bcd099e1237cacfbbc42a781267bc52febe02811dd3947"
+    },
+    "devices/m8/usb.py": {
+      "path": "usb.py",
+      "source_sha256": "13be5fd2206b6e5b11c507a00286abbb5d959570abb1475665f9021e09562d5a"
+    },
+    "devices/m8/wifi.py": {
+      "path": "wifi.py",
+      "source_sha256": "095c1fcd3fa108f464ef52d09b1d79c70e5fbe4b23dc6f8209fcb3eb43b95944"
+    }
+  }
+}

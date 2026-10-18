@@ -1,0 +1,406 @@
+Subject: [PATCH] sprd: complete stock camera sequencing and unwind failed GPU starts
+
+Follow-up to CharlesGool/e5-sleep-kernel e5-sleep2 patches 0004/0005.
+Camera sequence verified against E5 stock qogirn6l operations (Android 13):
+sprd_cam_pw_on.58 0x25b4, sprd_cam_pw_off.59 0x2d80. Keep DT register/mask
+selection, propagate bus failures, check three stable PMU reads and gate the
+clock only after confirmed shutdown. Built-in provider owns its lifetime.
+Do not change suspend policy, radio operation, polling or eMMC sleep.
+
+--- a/drivers/soc/sprd/domain/sprd_camsys_pd.c
++++ b/drivers/soc/sprd/domain/sprd_camsys_pd.c
+@@ -1,22 +1,11 @@
+-// SPDX-License-Identifier: GPL-2.0
++// SPDX-License-Identifier: GPL-2.0-only
+ /*
+- * Camera subsystem power domain for UMS9621 ("qogirn6lite").
+- *
+- * The camera block (PD_CAMERA in the PMU) has no auto shutdown and comes out
+- * of the bootloader powered, with its AON MM_EB gate open.  The stock kernel's
+- * camera driver forces it off whenever no camera is open; without that the
+- * AP subsystem never enters PMU deep sleep during system suspend
+- * (AP_DEEP_SLEEP_CNT stays at 0).  This driver turns the vendor node
+- * ("sprd,qogirl6l-camsys-domain", <&mm_domain>) into a generic PM domain
+- * that starts off, so the domain is powered only while a consumer (ISP, DCAM,
+- * JPEG, a sensor) is runtime active -- which on these boards is never.
+- *
+- * The register layout comes from the vendor DT as <&syscon reg mask>
+- * triples, the same way the vendor driver reads it.
+- *
+- * Copyright (C) 2026 The e5-linux project
++ * UMS9621 camera power domain. Based on CharlesGool/e5-sleep-kernel
++ * e5-sleep2 (52ad641), with the DCAM/ISP/top sequence verified against
++ * E5's stock sprd_camsys_pw_domain.ko, qogirn6l operations.
++ * Registers and masks come from the original device tree.
+  */
+-
++#include <linux/bitops.h>
+ #include <linux/clk.h>
+ #include <linux/delay.h>
+ #include <linux/mfd/syscon.h>
+@@ -26,22 +15,18 @@
+ #include <linux/pm_domain.h>
+ #include <linux/regmap.h>
+ 
+-#define CAMSYS_STATE_ON		0
+-#define CAMSYS_POLL_US		50
+-#define CAMSYS_POLL_MAX		200
+-
+-struct camsys_reg {
+-	struct regmap *map;
+-	u32 reg;
+-	u32 mask;
+-};
+-
++#define CAMSYS_POLL_MAX 30
++enum camsys_bank_id { CAMSYS_TOP, CAMSYS_DCAM, CAMSYS_ISP, CAMSYS_BANKS };
++struct camsys_reg { struct regmap *map; u32 reg, mask; };
++struct camsys_bank {
++	struct camsys_reg force, automatic, state;
++};
+ struct camsys_pd {
+ 	struct generic_pm_domain gpd;
+ 	struct device *dev;
+-	struct camsys_reg force_shutdown;
+-	struct camsys_reg power_state;
++	struct camsys_bank banks[CAMSYS_BANKS];
+ 	struct clk *mm_eb;
++	bool clock_on;
+ };
+ 
+ static int camsys_reg_get(struct device *dev, const char *prop,
+@@ -49,136 +34,188 @@
+ {
+ 	u32 args[2];
+ 
+-	out->map = syscon_regmap_lookup_by_phandle_args(dev->of_node, prop,
+-							2, args);
++	out->map = syscon_regmap_lookup_by_phandle_args(dev->of_node, prop, 2, args);
+ 	if (IS_ERR(out->map))
+-		return dev_err_probe(dev, PTR_ERR(out->map),
+-				     "no %s property/syscon\n", prop);
+-
++		return dev_err_probe(dev, PTR_ERR(out->map), "no %s syscon\n", prop);
+ 	out->reg = args[0];
+ 	out->mask = args[1];
+-
++	return out->mask ? 0 : -EINVAL;
++}
++
++static int camsys_switch(struct camsys_bank *bank, bool on)
++{
++	unsigned int value[3], expected;
++	int ret, i, j;
++
++	expected = on ? 0 : 7U << __ffs(bank->state.mask);
++	if (expected & ~bank->state.mask)
++		return -EINVAL;
++	ret = regmap_update_bits(bank->automatic.map, bank->automatic.reg,
++				 bank->automatic.mask, 0);
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(bank->force.map, bank->force.reg,
++				 bank->force.mask, on ? 0 : bank->force.mask);
++	if (ret)
++		return ret;
++	/* Stock qogirn6l: 300-350 us and three equal state reads, up to 30 tries. */
++	for (i = 0; i < CAMSYS_POLL_MAX; i++) {
++		usleep_range(300, 350);
++		for (j = 0; j < 3; j++) {
++			ret = regmap_read(bank->state.map, bank->state.reg, &value[j]);
++			if (ret)
++				return ret;
++			value[j] &= bank->state.mask;
++		}
++		if (value[0] == expected && value[1] == expected && value[2] == expected)
++			return 0;
++	}
++	return -ETIMEDOUT;
++}
++
++static int camsys_all_off(struct camsys_pd *pd)
++{
++	static const int order[] = { CAMSYS_DCAM, CAMSYS_ISP, CAMSYS_TOP };
++	int ret;
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(order); i++) {
++		ret = camsys_switch(&pd->banks[order[i]], false);
++		if (ret)
++			return ret;
++	}
+ 	return 0;
+ }
+ 
++static int camsys_all_on(struct camsys_pd *pd)
++{
++	static const int order[] = { CAMSYS_TOP, CAMSYS_DCAM, CAMSYS_ISP };
++	int ret;
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(order); i++) {
++		ret = camsys_switch(&pd->banks[order[i]], true);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
++static void camsys_clock_off(void *data)
++{
++	struct camsys_pd *pd = data;
++
++	if (pd->clock_on) {
++		clk_disable_unprepare(pd->mm_eb);
++		pd->clock_on = false;
++	}
++}
++
+ static int camsys_pd_power_on(struct generic_pm_domain *gpd)
+ {
+ 	struct camsys_pd *pd = container_of(gpd, struct camsys_pd, gpd);
+-	unsigned int val;
+-	int ret, i;
+-
+-	ret = clk_prepare_enable(pd->mm_eb);
+-	if (ret)
+-		return ret;
+-
+-	regmap_update_bits(pd->force_shutdown.map, pd->force_shutdown.reg,
+-			   pd->force_shutdown.mask, 0);
+-
+-	for (i = 0; i < CAMSYS_POLL_MAX; i++) {
+-		regmap_read(pd->power_state.map, pd->power_state.reg, &val);
+-		if ((val & pd->power_state.mask) == CAMSYS_STATE_ON)
+-			return 0;
+-		udelay(CAMSYS_POLL_US);
+-	}
+-
+-	dev_err(pd->dev, "camera domain did not power up (state 0x%x)\n",
+-		val & pd->power_state.mask);
+-	regmap_update_bits(pd->force_shutdown.map, pd->force_shutdown.reg,
+-			   pd->force_shutdown.mask, pd->force_shutdown.mask);
+-	clk_disable_unprepare(pd->mm_eb);
+-
+-	return -ETIMEDOUT;
++	int ret, cleanup;
++
++	if (!pd->clock_on) {
++		ret = clk_prepare_enable(pd->mm_eb);
++		if (ret)
++			return ret;
++		pd->clock_on = true;
++	}
++	ret = camsys_all_on(pd);
++	if (!ret)
++		return 0;
++	cleanup = camsys_all_off(pd);
++	if (!cleanup)
++		camsys_clock_off(pd);
++	else
++		dev_err(pd->dev, "camera power-on rollback failed: %d\n", cleanup);
++	return ret;
+ }
+ 
+ static int camsys_pd_power_off(struct generic_pm_domain *gpd)
+ {
+ 	struct camsys_pd *pd = container_of(gpd, struct camsys_pd, gpd);
+-
+-	regmap_update_bits(pd->force_shutdown.map, pd->force_shutdown.reg,
+-			   pd->force_shutdown.mask, pd->force_shutdown.mask);
+-	clk_disable_unprepare(pd->mm_eb);
+-
+-	return 0;
++	int ret, cleanup;
++
++	ret = camsys_all_off(pd);
++	if (!ret) {
++		camsys_clock_off(pd);
++		return 0;
++	}
++	/* genpd keeps the domain logically on when power_off fails. */
++	cleanup = camsys_all_on(pd);
++	if (cleanup)
++		dev_err(pd->dev, "camera power-off rollback failed: %d\n", cleanup);
++	return ret;
+ }
+ 
+ static int camsys_pd_probe(struct platform_device *pdev)
+ {
++	static const char * const props[CAMSYS_BANKS][3] = {
++		{ "force_shutdown", "shutdown_en", "camera_power_state" },
++		{ "dcam_force_shutdown", "dcam_shutdown_en", "dcam_power_state" },
++		{ "isp_force_shutdown", "isp_shutdown_en", "isp_power_state" },
++	};
+ 	struct device *dev = &pdev->dev;
+ 	struct camsys_pd *pd;
+-	int ret;
++	int ret, i;
+ 
+ 	pd = devm_kzalloc(dev, sizeof(*pd), GFP_KERNEL);
+ 	if (!pd)
+ 		return -ENOMEM;
+-
+ 	pd->dev = dev;
+-
+-	ret = camsys_reg_get(dev, "force_shutdown", &pd->force_shutdown);
+-	if (ret)
+-		return ret;
+-	ret = camsys_reg_get(dev, "camera_power_state", &pd->power_state);
+-	if (ret)
+-		return ret;
+-
++	for (i = 0; i < CAMSYS_BANKS; i++) {
++		ret = camsys_reg_get(dev, props[i][0], &pd->banks[i].force);
++		if (ret)
++			return ret;
++		ret = camsys_reg_get(dev, props[i][1], &pd->banks[i].automatic);
++		if (ret)
++			return ret;
++		ret = camsys_reg_get(dev, props[i][2], &pd->banks[i].state);
++		if (ret)
++			return ret;
++	}
+ 	pd->mm_eb = devm_clk_get(dev, "clk_mm_eb");
+ 	if (IS_ERR(pd->mm_eb))
+-		return dev_err_probe(dev, PTR_ERR(pd->mm_eb),
+-				     "no clk_mm_eb\n");
+-
+-	/*
+-	 * The bootloader leaves the domain on and the gate open, but the clock
+-	 * framework counts MM_EB as unused (and clk_ignore_unused keeps it
+-	 * that way).  Take a reference so power_off() can drop it and the
+-	 * gate really closes.
+-	 */
++		return dev_err_probe(dev, PTR_ERR(pd->mm_eb), "no clk_mm_eb\n");
++	ret = devm_add_action_or_reset(dev, camsys_clock_off, pd);
++	if (ret)
++		return ret;
++	/* Own the bootloader's AON gate reference before closing it. */
+ 	ret = clk_prepare_enable(pd->mm_eb);
+ 	if (ret)
+ 		return ret;
+-	camsys_pd_power_off(&pd->gpd);
+-
++	pd->clock_on = true;
++	ret = camsys_all_off(pd);
++	if (ret)
++		return dev_err_probe(dev, ret, "camera domain did not shut down\n");
++	camsys_clock_off(pd);
+ 	pd->gpd.name = dev_name(dev);
+ 	pd->gpd.power_on = camsys_pd_power_on;
+ 	pd->gpd.power_off = camsys_pd_power_off;
+-
+ 	ret = pm_genpd_init(&pd->gpd, NULL, true);
+ 	if (ret)
+ 		return ret;
+-
+ 	ret = of_genpd_add_provider_simple(dev->of_node, &pd->gpd);
+ 	if (ret) {
+ 		pm_genpd_remove(&pd->gpd);
+ 		return ret;
+ 	}
+-
+-	platform_set_drvdata(pdev, pd);
+-	dev_info(dev, "camera power domain forced off\n");
+-
++	dev_info(dev, "camera/DCAM/ISP domains off; power managed by genpd\n");
+ 	return 0;
+-}
+-
+-static void camsys_pd_remove(struct platform_device *pdev)
+-{
+-	struct camsys_pd *pd = platform_get_drvdata(pdev);
+-
+-	of_genpd_del_provider(pdev->dev.of_node);
+-	pm_genpd_remove(&pd->gpd);
+ }
+ 
+ static const struct of_device_id camsys_pd_of_match[] = {
+ 	{ .compatible = "sprd,qogirl6l-camsys-domain" },
+ 	{ }
+ };
+-MODULE_DEVICE_TABLE(of, camsys_pd_of_match);
+-
+ static struct platform_driver camsys_pd_driver = {
+ 	.probe = camsys_pd_probe,
+-	.remove = camsys_pd_remove,
+ 	.driver = {
+ 		.name = "sprd-camsys-pd",
+ 		.of_match_table = camsys_pd_of_match,
++		.suppress_bind_attrs = true,
+ 	},
+ };
+-module_platform_driver(camsys_pd_driver);
+-
+-MODULE_DESCRIPTION("UMS9621 camera subsystem power domain");
+-MODULE_LICENSE("GPL");
++builtin_platform_driver(camsys_pd_driver);
+--- a/drivers/gpu/drm/panfrost/panfrost_sprd.c
++++ b/drivers/gpu/drm/panfrost/panfrost_sprd.c
+@@ -200,6 +200,8 @@
+  * Power the GPU up and give it a clock: everything kbase's mali_power_on()
+  * and mali_clock_on() do, minus its DVFS governor.
+  */
++static void sprd_gpu_stop(struct panfrost_sprd *sprd);
++
+ static int sprd_gpu_start(struct panfrost_device *pfdev,
+ 			  struct panfrost_sprd *sprd)
+ {
+@@ -212,28 +214,38 @@
+ 	sprd_gpu_power_on(sprd, pfdev->rstc);
+ 
+ 	/* Core clock gate inside the GPU APB block */
+-	regmap_update_bits(sprd->clk_core_gpu_eb.map,
++	ret = regmap_update_bits(sprd->clk_core_gpu_eb.map,
+ 			   sprd->clk_core_gpu_eb.reg,
+ 			   sprd->clk_core_gpu_eb.mask,
+ 			   sprd->clk_core_gpu_eb.mask);
++	if (ret)
++		goto err_power;
+ 	udelay(400);
+ 
+ 	ret = sprd_gpu_top_state_wait(sprd);
+ 	if (ret) {
+ 		dev_err(pfdev->dev, "GPU did not report itself powered up (%d)\n",
+ 			ret);
+-		return ret;
+-	}
+-
+-	regmap_update_bits(sprd->gpu_dvfs_apb,
++		goto err_power;
++	}
++
++	ret = regmap_update_bits(sprd->gpu_dvfs_apb,
+ 			   SPRD_DVFS_APB_FREQ_UPD_CFG0,
+ 			   SPRD_DVFS_APB_FREQ_UPD_MASK, 1);
+-	regmap_update_bits(sprd->gpu_dvfs_apb,
++	if (ret)
++		goto err_power;
++	ret = regmap_update_bits(sprd->gpu_dvfs_apb,
+ 			   SPRD_DVFS_APB_DVFS_INDEX_CFG,
+ 			   SPRD_DVFS_APB_DVFS_INDEX_MASK,
+ 			   SPRD_DVFS_INDEX_DEFAULT);
+ 
++	if (ret)
++		goto err_power;
+ 	return 0;
++
++err_power:
++	sprd_gpu_stop(sprd);
++	return ret;
+ }
+ 
+ /* kbase's mali_clock_off() and mali_power_off(), in that order */
+--- a/drivers/soc/sprd/domain/Kconfig
++++ b/drivers/soc/sprd/domain/Kconfig
+@@ -22,8 +22,7 @@
+ 	  vendor_dlkm; here it is built in-tree from the vendor source.
+ 
+ config SPRD_CAMSYS_PD
+-	tristate "UMS9621 camera subsystem power domain"
+-	default m
++	bool "UMS9621 camera subsystem power domain"
+ 	depends on ARCH_SPRD || COMPILE_TEST
+ 	depends on MFD_SYSCON
+ 	select PM_GENERIC_DOMAINS if PM

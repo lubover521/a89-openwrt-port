@@ -1,0 +1,17 @@
+{
+  "repository": "https://github.com/kanoqwq/mu300-linux",
+  "commit": "23361cea515950e19abd02f1816142c324d3e03d",
+  "files": {
+    "drivers/clk/sprd/ums9620-clk.c": "6e3cc04b0d68920b9e84343aa7ca79f6c7f62869572ee1f81bf303acf983ecdc",
+    "include/dt-bindings/clock/sprd,ums9620-clk.h": "754e2398f8d9bf7604ea0ad5d2cf3526e5ca7661e51d4a257251f04311bf67b0",
+    "include/dt-bindings/reset/sprd,ums9620-reset.h": "4ac68c3919a86c7e935f34bd2e36d485323fef62de4b224c34075d4a9ca9178c",
+    "drivers/pmdomain/sprd/ums9620-ipa-sys.c": "ee71fdf1513a472119eb96592d5ccf5995347dc1091b771b1c7014200dbedeb9",
+    "drivers/pmdomain/sprd/Makefile": "2e59a3b5cb2cd498ab5e3c9dc646c37bc9ab72756a54cf1de1940cee686ffff9",
+    "drivers/usb/phy/phy-sprd-ums9620-ssphy.c": "0d25e915d7e4be8e0ef605f5b6c6dd2ed142f9a7f9d23eaa04916d06f0f898a4",
+    "include/dt-bindings/soc/sprd,qogirn6pro-mask.h": "0709197623ca1d0980b4b627eb10c4ee860cf498833039af146b74d024be3783",
+    "include/dt-bindings/soc/sprd,qogirn6pro-regs.h": "048c5a1af9d0020c9f107f45a0d80790cb8289f9b8c02ec7b301a26bf5e0ede2",
+    "drivers/thermal/sprd_thermal_r5p0.c": "6d6fdfb28e67c71da9540a3b4bf5fb5db7f4de35483f0cad9d59f3154613f2cb",
+    "drivers/cpufreq/sprd-cpufreq-v2-driver.c": "0d30b23b979889342a7439a50e842b624e2dd3a8a367aa01b3bbd4c906708cc3",
+    "drivers/cpufreq/sprd-cpufreq-v2.h": "2752df107d605e66c87f63dbe531bea4268692b5222cf053c66b9f1a0e85e370"
+  }
+}

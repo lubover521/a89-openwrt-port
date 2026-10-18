@@ -1,0 +1,299 @@
+#!/bin/bash
+# Mobile data on the E5's baseband, without Android RIL: AT commands on /dev/stty_nr1, data over sipa_eth<cid-1>.
+# (port of mu300-linux/device/debian_device_common/overlay/opt/mu300/bin/mobile-data)
+# usage: mobile-data up [APN] | down | status | signal | at "CMD" | sim-reset | watch
+# The modem itself is booted by e5-vendor.service (Android's modem_control in a chroot) -- this drives the radio
+# and the bearer.  There is no netifd branch here: the E5 image is systemd-only.
+export PATH="$PATH:/opt/e5/bin:/usr/sbin:/sbin"
+set -euo pipefail
+DEV=${E5_AT_DEV:-/dev/stty_nr1}
+CID=1
+IFACE=sipa_eth$((CID - 1))
+DIR=${E5_AT_DIR:-/run/e5-at}
+ATCLIENT=${E5_AT_CLIENT:-/opt/e5/e5-at}   # named so the AT layer can be exercised off the device
+
+# The operator hands out the default bearer only once its APN exists, so the APN is read from
+# /etc/e5/mobile-data.conf unless one is given on the command line.
+# (mu300-linux relies on the network activating CID 1 on its own.)
+APN=
+if [ -r /etc/e5/mobile-data.conf ]; then
+    # shellcheck disable=SC1091
+    . /etc/e5/mobile-data.conf
+fi
+
+at() {  # at CMD [timeout] -> response lines up to the final result code
+    local cmd=$1 t=${2:-5} line
+    # e5-atd owns the AT channel when it runs: closing the SIPC tty wedges it until the modem restarts, so
+    # ask the daemon instead of opening the device here
+    if [ -p "$DIR/cmd" ]; then
+        "$ATCLIENT" -t "$t" "$cmd"
+        return
+    fi
+    [ -c "$DEV" ] || return 1   # never let the redirection create a regular file in /dev
+    exec 3<>"$DEV"
+    # drop late responses/URCs left over from earlier commands
+    while IFS= read -r -t 0.2 line <&3; do :; done
+    printf '%s\r' "$cmd" >&3
+    local end=$((SECONDS + t))
+    while [ $SECONDS -lt $end ]; do
+        IFS= read -r -t 1 line <&3 || continue
+        line=${line%$'\r'}
+        [ -z "$line" ] && continue
+        case "$line" in
+            +CSQ:*|+CESQ:*|+SPPCI:*|+ECIND:*|+SIND:*|+CREG:*|+CGREG:*|+SPNRINDICATE:*|+CTZV:*|^CONN:*|+SPERRLOG:*)
+                [ "${cmd#AT+CSQ}" != "$cmd" ] && [ "${line#+CSQ:}" != "$line" ] && echo "$line"
+                continue ;;
+        esac
+        echo "$line"
+        case "$line" in OK|ERROR|+CME\ ERROR*|+CMS\ ERROR*|CONNECT*|NO\ CARRIER) break ;; esac
+    done
+    exec 3>&-
+}
+
+# dotted netmask -> prefix length, in shell: a wrong prefix leaves the interface with /32 and no on-link subnet
+mask2prefix() {
+    local m=$1 o bits=0
+    case "$m" in
+        [0-9]*.[0-9]*.[0-9]*.[0-9]*) ;;
+        *) echo 32; return ;;
+    esac
+    local IFS=.
+    for o in $m; do
+        case $o in
+            255) bits=$((bits + 8)) ;;
+            254) bits=$((bits + 7)) ;;
+            252) bits=$((bits + 6)) ;;
+            248) bits=$((bits + 5)) ;;
+            240) bits=$((bits + 4)) ;;
+            224) bits=$((bits + 3)) ;;
+            192) bits=$((bits + 2)) ;;
+            128) bits=$((bits + 1)) ;;
+            0) ;;
+            *) echo 32; return ;;
+        esac
+    done
+    echo "$bits"
+}
+
+# Make sure the radio is on (CFUN=1). SFUN=4 alone is enough from any state; the off/on cycle is the last resort,
+# because an interrupted cycle used to leave the radio switched off with nothing to turn it back on.
+radio_on() {
+    at 'AT+CFUN?' 4 | grep -q '+CFUN: 1' && return 0
+    at 'AT+SFUN=4' 15 >/dev/null || true
+    at 'AT+CFUN?' 4 | grep -q '+CFUN: 1' && return 0
+    at 'AT+SFUN=2' 5 >/dev/null || true
+    at 'AT+SFUN=4' 20 >/dev/null || true
+    at 'AT+CFUN?' 4 | grep -q '+CFUN: 1'
+}
+
+# The modem needs the vendor modem loader/SIPC drivers; a kernel without them has no modem.
+modem_stack() { [ -e /dev/modem ] || [ -e /dev/pmsys ] || [ -c "$DEV" ]; }
+
+# "stty -F" opens and closes the tty, which desynchronises the SIPC channel (docs/FINDINGS.md 13b). When
+# e5-atd owns the device it has already set the flags on its own descriptor, so leave the tty alone.
+tty_setup() {
+    if [ ! -p "$DIR/cmd" ]; then
+        stty -F "$DEV" raw -echo 2>/dev/null || true
+    fi
+    return 0
+}
+
+# Only one bring-up at a time: the watchdog and the service can both decide to reconnect, and two of them race for
+# every AT command (each losing the channel lock in turn, so neither finishes).
+UPLOCK=/run/e5-mobile-data-up.lock
+up() {
+    if ! mkdir "$UPLOCK" 2>/dev/null; then
+        local p=$(cat "$UPLOCK/pid" 2>/dev/null || true)
+        if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+            echo "another bring-up is already running (pid $p)" >&2
+            return 0
+        fi
+        rm -rf "$UPLOCK"; mkdir "$UPLOCK" 2>/dev/null || true
+    fi
+    echo $$ > "$UPLOCK/pid"
+    up_locked "$@"
+    local rc=$?
+    rm -rf "$UPLOCK"
+    return $rc
+}
+
+up_locked() {
+    modem_stack || { echo "no modem stack in this kernel ($(uname -r))" >&2; exit 3; }
+    rm -f /run/e5-mobile-data-down
+    tty_setup
+    radio_on
+    # Background preferences never gate registration/PDP or restart the radio.
+    /opt/e5/e5-data-priority queue 0 >/dev/null 2>&1 || true
+    for n in $(seq 1 60); do
+        at 'AT+CEREG?' | grep -qE '\+CEREG: [0-9],(1|5)' && break
+        # the radio can be switched off again meanwhile (modem reset), so re-check it every 10 s
+        [ $((n % 5)) -eq 0 ] && radio_on
+        sleep 2
+    done
+    at 'AT+CEREG?' | grep -qE '\+CEREG: [0-9],(1|5)' || { echo "not registered on the network" >&2; exit 1; }
+    local apn=${1:-$APN}
+    if [ -n "$apn" ]; then
+        at "AT+CGDCONT=$CID,\"IPV4V6\",\"$apn\"" >/dev/null
+    fi
+    at "AT+CGACT?" | grep -q "+CGACT:$CID,1" || at "AT+CGACT=1,$CID" 20 >/dev/null
+    local rdp addrmask ip4 mask dns1 dns2 prefix
+    rdp=$(at "AT+CGCONTRDP=$CID" 4 | grep '^+CGCONTRDP:' | head -1)
+    # +CGCONTRDP: cid,bearer,apn,"a.b.c.d.m.m.m.m",gw,dns1,dns2,...
+    addrmask=$(echo "$rdp" | cut -d, -f4 | tr -d '"')
+    ip4=$(echo "$addrmask" | cut -d. -f1-4)
+    mask=$(echo "$addrmask" | cut -d. -f5-8)
+    dns1=$(echo "$rdp" | cut -d, -f6 | tr -d '"')
+    dns2=$(echo "$rdp" | cut -d, -f7 | tr -d '"')
+    [ -n "$ip4" ] || { echo "no IPv4 address from AT+CGCONTRDP" >&2; exit 1; }
+    at "AT+CGDATA=\"M-ETHER\",$CID" 8 | grep -q CONNECT || true
+    prefix=$(mask2prefix "$mask")
+    ip link set "$IFACE" up
+    # the sipa driver hands up wrong hardware checksums ("hw csum failure" warnings): verify them in software
+    ethtool -K "$IFACE" rx off 2>/dev/null || true
+    ip addr flush dev "$IFACE"
+    ip addr add "$ip4/$prefix" dev "$IFACE"
+    ip route replace default dev "$IFACE" metric 100
+    if command -v resolvectl >/dev/null; then
+        resolvectl dns "$IFACE" $dns1 $dns2 || true
+        resolvectl domain "$IFACE" '~.' || true
+    else
+        # this image has no resolvectl, and the carrier's resolvers only exist behind this bearer -- when the
+        # context drops they become unreachable and *every* lookup fails, so public resolvers go first
+        {
+            printf 'nameserver 223.5.5.5\n'
+            printf 'nameserver 119.29.29.29\n'
+            [ -n "$dns1" ] && printf 'nameserver %s\n' "$dns1"
+            [ -n "$dns2" ] && printf 'nameserver %s\n' "$dns2"
+        } > /etc/resolv.conf
+    fi
+    # share the connection with USB/Wi-Fi clients
+    sysctl -qw net.ipv4.ip_forward=1
+    nft -f - <<NFT
+table ip e5_nat
+delete table ip e5_nat
+table ip e5_nat {
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname "$IFACE" masquerade
+    }
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+        tcp flags syn tcp option maxseg size set rt mtu
+    }
+}
+NFT
+    # the board has no sc27xx:blue LED; the guard keeps this a no-op, as in mu300-linux
+    [ -w /sys/class/leds/sc27xx:blue/brightness ] && echo 255 > /sys/class/leds/sc27xx:blue/brightness
+    echo "mobile data up on $IFACE ($(at 'AT+COPS?' | sed -n 's/^+COPS: [0-9],[0-9],"\([^"]*\)".*/\1/p'))"
+}
+
+down() {
+    touch /run/e5-mobile-data-down   # tells watch not to reconnect
+    [ -w /sys/class/leds/sc27xx:blue/brightness ] && echo 0 > /sys/class/leds/sc27xx:blue/brightness
+    nft delete table ip e5_nat 2>/dev/null || true
+    ip route del default dev "$IFACE" 2>/dev/null || true
+    ip addr flush dev "$IFACE" 2>/dev/null || true
+    ip link set "$IFACE" down 2>/dev/null || true
+    # Deactivating the context is a courtesy to the network, not a requirement: the modem is restarted on the
+    # next boot anyway. During a shutdown e5-atd is going away at the same time, so asking it anything only
+    # delays the reboot - skip it there, and keep the wait short everywhere else.
+    if [ "$(systemctl is-system-running 2>/dev/null)" = stopping ]; then
+        return 0
+    fi
+    tty_setup
+    export E5_AT_LOCK_WAIT=5
+    at "AT+CGACT=0,$CID" 5 >/dev/null || true
+}
+
+sim_reset() {
+    tty_setup
+    at 'AT+SFUN=5' 20; at 'AT+SFUN=3' 10; sleep 2; at 'AT+SFUN=2' 10; at 'AT+SFUN=4' 30
+    for _ in $(seq 1 30); do at 'AT+CPIN?' | grep -q READY && break; sleep 2; done
+    at 'AT+CPIN?'
+}
+
+# The modem firmware occasionally resets itself (modem_control reloads it); it comes back with the radio off and
+# no PDP context, which Android's RIL repairs silently. Check the context every 30 s and reconnect when it is gone.
+watch() {
+    local fails=0
+    modem_stack || { echo "no modem stack in this kernel ($(uname -r)), not watching" >&2; exit 0; }
+    while :; do
+        sleep "${E5_WATCH_INTERVAL:-30}"
+        [ -e /run/e5-mobile-data-down ] && continue
+        [ -c "$DEV" ] || continue
+        tty_setup
+        if at "AT+CGACT?" | grep -q "+CGACT:$CID,1" && ip -4 addr show "$IFACE" 2>/dev/null | grep -q inet; then
+            fails=0
+            continue
+        fi
+        # a switched-off radio never comes back on its own
+        at 'AT+CFUN?' 4 | grep -q '+CFUN: 1' || { echo "radio was off, switching it on" >&2; radio_on || true; }
+        fails=$((fails + 1))
+        [ "$fails" -lt 2 ] && continue
+        echo "mobile data lost (modem reset or detached), reconnecting" >&2
+        [ -w /sys/class/leds/sc27xx:blue/brightness ] && echo 0 > /sys/class/leds/sc27xx:blue/brightness
+        ( up ) || echo "reconnect failed, retrying" >&2
+        fails=0
+    done
+}
+
+# Radio quality in human terms. The AT channel belongs to whoever asks first, so the watchdog is paused by the
+# caller (mu300-toolkit does this); reading these values never disturbs an established data connection.
+signal() {
+    tty_setup
+    local cops cereg cesq csq rsrp rsrq act mcc oper tac cell rat q
+    cops=$(at 'AT+COPS?' 4 | grep '^+COPS:' || true)
+    cereg=$(at 'AT+CEREG?' 4 | grep '^+CEREG:' || true)
+    cesq=$(at 'AT+CESQ' 4 | grep '^+CESQ:' || true)
+    csq=$(at 'AT+CSQ' 4 | grep '^+CSQ:' || true)
+    oper=$(echo "$cops" | sed -n 's/.*"\([^"]*\)".*/\1/p')
+    act=$(echo "$cops" | awk -F, '{gsub(/ /, "", $4); print $4}')
+    tac=$(echo "$cereg" | awk -F'"' '{print $2}')
+    cell=$(echo "$cereg" | awk -F'"' '{print $4}')
+    # +CESQ: rxlev,ber,rscp,ecno,rsrq,rsrp[,ssrsrq,ssrsrp,sssinr]
+    rsrq=$(echo "$cesq" | awk -F'[,:]' '{gsub(/ /, "", $6); print $6}')
+    rsrp=$(echo "$cesq" | awk -F'[,:]' '{gsub(/ /, "", $7); print $7}')
+    case $act in
+        7) rat="LTE" ;;
+        13) rat="5G NSA (LTE + NR)" ;;
+        11|12) rat="5G" ;;
+        2|4|5|6) rat="3G" ;;
+        0|1|3) rat="2G" ;;
+        *) rat="unknown (AcT $act)" ;;
+    esac
+    printf 'operator     %s (%s)\n' "${oper:-unknown}" "$rat"
+    if [ -n "$rsrp" ] && [ "$rsrp" != 255 ] 2>/dev/null; then
+        # 3GPP mapping: RSRP index 0..97 = -140..-44 dBm, RSRQ index 0..34 = -19.5..-3 dB
+        local rsrp_dbm rsrq_db
+        rsrp_dbm=$((rsrp - 140))
+        rsrq_db=$(awk -v i="$rsrq" 'BEGIN { printf "%.1f", -19.5 + i * 0.5 }')
+        if [ "$rsrp_dbm" -ge -85 ]; then q="excellent"
+        elif [ "$rsrp_dbm" -ge -95 ]; then q="good"
+        elif [ "$rsrp_dbm" -ge -105 ]; then q="fair"
+        elif [ "$rsrp_dbm" -ge -115 ]; then q="weak"
+        else q="very weak"; fi
+        printf 'signal       RSRP %s dBm (%s), RSRQ %s dB\n' "$rsrp_dbm" "$q" "$rsrq_db"
+    else
+        printf 'signal       %s\n' "${csq:-no reading}"
+    fi
+    [ -n "$cell" ] && printf 'cell         %s  (tracking area %s)\n' "$cell" "$tac"
+    ip -4 -br addr show "$IFACE" 2>/dev/null | awk '{printf "interface    %s %s\n", $1, $3}'
+}
+
+status() {
+    tty_setup
+    at 'AT+COPS?'; at 'AT+CSQ'; at 'AT+CEREG?'; at 'AT+CGACT?'
+    ip -br addr show "$IFACE"
+}
+
+case "${1:-status}" in
+    up) up "${2:-}" ;;
+    signal) signal ;;
+    at) [ -n "${2:-}" ] || { echo "usage: $0 at \"AT+COMMAND\"" >&2; exit 2; }
+        tty_setup; at "$2" "${3:-6}" ;;
+    down) down ;;
+    status) status ;;
+    sim-reset) sim_reset ;;
+    watch) watch ;;
+    *) echo "usage: $0 up [APN] | down | status | signal | at \"CMD\" | sim-reset | watch" >&2; exit 2 ;;
+esac

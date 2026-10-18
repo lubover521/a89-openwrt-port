@@ -1,0 +1,78 @@
+{
+  "source_repository": "sprd-linux-devs/e5-linux",
+  "source_commit": "b7282af",
+  "files": {
+    "devices/t551m/README.md": {
+      "path": "README.md",
+      "source_sha256": "efac2553eab3525d6c2c43a1023bb429f179d082efc66b38692131d409ffac4f"
+    },
+    "devices/t551m/build-kernel.sh": {
+      "path": "build-kernel.sh",
+      "source_sha256": "4c63a0ae5bd3dd1a1fc0a346bb996c91862c0b2c53a588bd5404afca21ae11d7"
+    },
+    "devices/t551m/charge-profile.h": {
+      "path": "charge-profile.h",
+      "source_sha256": "e55eae02eaa9823aca04b43c61d9c415701eb0af24cd8a69d259709a1d23f86d"
+    },
+    "devices/t551m/collect-files.py": {
+      "path": "collect-files.py",
+      "source_sha256": "0f85e7fec2a012861ac2190caa33c8dd70ef363c3afca67b1bd24847564c3b84"
+    },
+    "devices/t551m/make-boot.py": {
+      "path": "make-boot.py",
+      "source_sha256": "17348850ce5e58a6dfc586d6ab6c48fc6f58b26b770febf58eb05d5c8e8d5b8c"
+    },
+    "devices/t551m/prepare-kernel.py": {
+      "path": "prepare-kernel.py",
+      "source_sha256": "3558aea3eb421958eba45323d6795a9f74232d84f38168217e0b91e587a7b367"
+    },
+    "devices/t551m/t551m-backlight.h": {
+      "path": "t551m-backlight.h",
+      "source_sha256": "039fae56d70a53dba234fb36f6fca4a20256b738f3a511ecdf0d315de9646e5d"
+    },
+    "devices/t551m/test_backlight.py": {
+      "path": "test_backlight.py",
+      "source_sha256": "097c77644cf7446f9b31817f110e241f22e30ae299c9a0a363e3f134aa30b0f0"
+    },
+    "devices/t551m/test_charge_profile.py": {
+      "path": "test_charge_profile.py",
+      "source_sha256": "0f0a3f4287b035595c0bea81f95227e591c8fd37096f06f9c5cf91315269f7c3"
+    },
+    "devices/t551m/test_charger.py": {
+      "path": "test_charger.py",
+      "source_sha256": "e6c8aea89ba0a5105bcb0101b3f3dca571181edcba99a178d573ad04fa7791ae"
+    },
+    "devices/t551m/test_host_dma.py": {
+      "path": "test_host_dma.py",
+      "source_sha256": "7f05cb1d9e1e14b788c483be63714546f16b16b67c692b64cd58aed1c5e2c0a5"
+    },
+    "devices/t551m/test_usb_charge_redetect.py": {
+      "path": "test_usb_charge_redetect.py",
+      "source_sha256": "5ac8db85980da36b8a078d0cdef3e20d35f617a38345bfb3bea37728c9613f38"
+    },
+    "devices/t551m/test_usb_charge_restart.py": {
+      "path": "test_usb_charge_restart.py",
+      "source_sha256": "e9b366b212952606594ab0119378256f49dc17e9fc696f8500c2c8a79eb427c9"
+    },
+    "devices/t551m/test_usb_charge_transition.py": {
+      "path": "test_usb_charge_transition.py",
+      "source_sha256": "78cb7ba8d7626c93d8ac844bd09d1b662fc275af21d2ac3be387d6ea7dbb847b"
+    },
+    "devices/t551m/test_usb_charger.py": {
+      "path": "test_usb_charger.py",
+      "source_sha256": "23474181671357d5d4a4340f235559e37fc5da22bb21892802b3dbbc4f9ffdb1"
+    },
+    "devices/t551m/test_usb_host_lifecycle.py": {
+      "path": "test_usb_host_lifecycle.py",
+      "source_sha256": "4a49f8649f814088e51a263cf06a8efa86794cf5bcde0d0f56610b15059499ae"
+    },
+    "devices/t551m/test_usb_host_start.py": {
+      "path": "test_usb_host_start.py",
+      "source_sha256": "ff00bf6b1104027e653fb7f7e45405571e104451c636f7fc333db72f8b6bb54d"
+    },
+    "devices/t551m/test_wifi_tx.py": {
+      "path": "test_wifi_tx.py",
+      "source_sha256": "c68a27a39d41d7e6df7b9b8e6ac587066eda27e2cfee50733f3b191084af67ae"
+    }
+  }
+}

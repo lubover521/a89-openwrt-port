@@ -1,0 +1,18 @@
+{
+  "source_repository": "sprd-linux-devs/e5-linux",
+  "source_commit": "b7282af",
+  "files": {
+    "devices/t551m/configure-rootfs.py": {
+      "path": "configure-rootfs.py",
+      "source_sha256": "f9bbfaeade88f2a7f37c8779587579a7287c4ea13eb637d8c9f0947885c96916"
+    },
+    "devices/t551m/trial-service": {
+      "path": "trial-service",
+      "source_sha256": "6730f3bbbd7ba9db6e6c57da341085db38713d79b3b658cb62d9252743b5837e"
+    },
+    "devices/t551m/trial.py": {
+      "path": "trial.py",
+      "source_sha256": "fa34bf9f0ec34238803a129b2d901553a6ff360e0909c186bde2ed611f08ea8c"
+    }
+  }
+}

@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>E5</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header id="bar">
+	<div class="left">
+		<span id="bar-sim" class="sim"></span>
+		<span id="bar-op">--</span>
+		<span id="bar-tech" class="badge">--</span>
+	</div>
+	<div class="right">
+		<span id="bar-notifications" class="smsmark"></span>
+		<span id="bar-sms" role="img" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="m4 7 8 6 8-6"/></svg></span>
+		<span id="bar-bars" class="bars"><i></i><i></i><i></i><i></i></span>
+		<span id="bar-bat" class="bat"><b></b></span>
+		<span id="bar-batpct">--</span>
+		<span id="bar-clock">--:--</span>
+	</div>
+</header>
+
+<main id="pages">
+	<!-- overview -->
+	<section class="page" data-title="overview">
+		<div class="card rates">
+			<div class="rate"><span class="arrow">↓</span><span id="ov-rx" class="big">--</span><span id="ov-rx-u" class="unit"></span></div>
+			<div class="rate"><span class="arrow up">↑</span><span id="ov-tx" class="big">--</span><span id="ov-tx-u" class="unit"></span></div>
+			<div class="sub"><span data-t="since_boot"></span> <span id="ov-total">--</span></div>
+		</div>
+		<div class="card row">
+			<span class="label" data-t="network"></span>
+			<span id="ov-wan" class="value"></span>
+		</div>
+		<div class="card row">
+			<span class="label" data-t="hotspot"></span>
+			<span id="ov-wifi" class="value"></span>
+		</div>
+		<div class="card row">
+			<span class="label" data-t="clients"></span>
+			<span id="ov-clients" class="value"></span>
+		</div>
+		<div class="card row">
+			<span class="label" data-t="battery"></span>
+			<span id="ov-bat" class="value one"></span>
+		</div>
+		<div class="card row">
+			<span class="label" data-t="current_voltage"></span>
+			<span id="ov-power" class="value"></span>
+		</div>
+		<div class="card meter usage">
+			<div class="mh"><span data-t="memory"></span><span id="ov-mem">--</span></div>
+			<div class="track"><div id="ov-mem-bar"></div></div>
+			<div class="mh"><span data-t="storage"></span><span id="ov-disk">--</span></div>
+			<div class="track"><div id="ov-disk-bar"></div></div>
+		</div>
+		<div id="ov-temps" class="card temperatures"></div>
+	</section>
+
+	<!-- signal -->
+	<section class="page" data-title="signal">
+		<div class="card cellhead">
+			<span id="sg-tech" class="big">--</span>
+			<span id="sg-band" class="big band">--</span>
+			<div id="sg-op" class="sub">--</div>
+		</div>
+		<div class="card meter"><div class="mh"><span>RSRP</span><span id="sg-rsrp">--</span></div><div class="track"><div id="sg-rsrp-bar"></div></div></div>
+		<div class="card meter"><div class="mh"><span>SINR</span><span id="sg-sinr">--</span></div><div class="track"><div id="sg-sinr-bar"></div></div></div>
+		<div class="card meter"><div class="mh"><span>RSRQ</span><span id="sg-rsrq">--</span></div><div class="track"><div id="sg-rsrq-bar"></div></div></div>
+		<div class="card grid">
+			<span class="label">PCI</span><span id="sg-pci" class="value">--</span>
+			<span class="label">ARFCN</span><span id="sg-arfcn" class="value">--</span>
+			<span class="label" data-t="bandwidth"></span><span id="sg-bw" class="value">--</span>
+			<span class="label" data-t="neighbours"></span><span id="sg-nb" class="value">--</span>
+			<span class="label" data-t="subscribed"></span><span id="sg-qos" class="value">--</span>
+		</div>
+	</section>
+
+	<!-- Shared per-SIM usage history; choosing a view does not switch data SIM. -->
+	<section class="page" data-title="traffic">
+		<div class="card traffic-scope">
+			<label for="tf-slot" data-t="traffic_view"></label>
+			<div class="traffic-select"><select id="tf-slot"><option value="" data-t="traffic_data_sim"></option><option value="0">SIM 1</option><option value="1">SIM 2</option></select></div>
+			<div id="tf-state" class="sub" role="status"></div>
+		</div>
+		<div class="card">
+			<div class="lh"><span data-t="today"></span></div>
+			<div class="tr"><span class="lbl2" data-t="wan"></span><span class="arrow">↓</span><span id="tf-day-rx" class="mid">--</span><span class="arrow up">↑</span><span id="tf-day-tx" class="mid">--</span></div>
+			<div class="tr"><span class="lbl2" data-t="lan"></span><span class="arrow">↓</span><span id="tf-day-lan-rx" class="mid">--</span><span class="arrow up">↑</span><span id="tf-day-lan-tx" class="mid">--</span></div>
+			<div id="tf-day-since" class="sub"></div>
+		</div>
+		<div class="card">
+			<div class="lh"><span data-t="this_month"></span></div>
+			<div class="tr"><span class="lbl2" data-t="wan"></span><span class="arrow">↓</span><span id="tf-mon-rx" class="mid">--</span><span class="arrow up">↑</span><span id="tf-mon-tx" class="mid">--</span></div>
+			<div class="tr"><span class="lbl2" data-t="lan"></span><span class="arrow">↓</span><span id="tf-mon-lan-rx" class="mid">--</span><span class="arrow up">↑</span><span id="tf-mon-lan-tx" class="mid">--</span></div>
+			<div id="tf-mon-since" class="sub"></div>
+		</div>
+		<div class="card">
+			<div class="lh"><span data-t="since_boot"></span> · <span data-t="wan"></span></div>
+			<div class="tr"><span class="arrow">↓</span><span id="tf-boot-rx" class="mid">--</span><span class="arrow up">↑</span><span id="tf-boot-tx" class="mid">--</span></div>
+			<div class="sub" data-t="traffic_session_note"></div>
+		</div>
+		<div class="card">
+			<div class="lh"><span data-t="last_days"></span> · <span data-t="wan"></span></div>
+			<div id="tf-days" class="days"></div>
+		</div>
+	</section>
+
+	<!-- SMS: the list, or one message -->
+	<section class="page" data-title="sms">
+		<div id="sms-list"></div>
+		<div id="sms-view" hidden>
+			<div class="card">
+				<div class="smshead"><span id="sv-from" class="strong"></span><span id="sv-time" class="sub"></span></div>
+				<div id="sv-text" class="smstext"></div>
+			</div>
+			<div class="card row">
+				<button id="sv-back" class="btn" data-t="back"></button>
+				<button id="sv-delete" class="btn danger" data-t="delete"></button>
+			</div>
+			<div class="sub" data-t="sms_delete_note"></div>
+		</div>
+	</section>
+
+	<!-- hotspot -->
+	<section class="page" data-title="hotspot">
+		<div class="card row">
+			<span id="hs-ssid" class="value strong">--</span>
+			<button id="hs-toggle" class="btn"></button>
+		</div>
+		<div class="card qr">
+			<div id="hs-qr"></div>
+			<div id="hs-key" class="sub"></div>
+			<button id="hs-showkey" class="btn small" data-t="show_key"></button>
+		</div>
+		<div class="card list">
+			<div class="lh"><span data-t="clients"></span> <span id="hs-count"></span></div>
+			<div id="hs-list"></div>
+		</div>
+	</section>
+
+	<!-- device -->
+	<section class="page" data-title="device">
+		<div class="card grid">
+			<span class="label" data-t="battery"></span><span id="dv-bat" class="value one">--</span>
+			<span class="label" data-t="uptime"></span><span id="dv-up" class="value">--</span>
+			<span class="label" data-t="wan_uptime"></span><span id="dv-wanup" class="value">--</span>
+			<span class="label" data-t="load"></span><span id="dv-load" class="value">--</span>
+			<span class="label" data-t="memory"></span><span id="dv-mem" class="value">--</span>
+		</div>
+		<div class="card grid">
+			<span class="label">USB</span><span id="dv-usb" class="value">--</span>
+			<span class="label">LAN</span><span id="dv-lan" class="value">--</span>
+			<span class="label">IPv4</span><span id="dv-v4" class="value">--</span>
+			<span class="label">IPv6</span><span id="dv-v6" class="value small">--</span>
+		</div>
+		<div class="card row">
+			<span class="label" data-t="brightness"></span>
+			<span class="btns">
+				<button id="dv-dim" class="btn small">−</button>
+				<span id="dv-bl" class="value">--</span>
+				<button id="dv-bright" class="btn small">+</button>
+			</span>
+		</div>
+		<div class="card row">
+			<button id="dv-reconnect" class="btn wide" data-t="reconnect"></button>
+		</div>
+	</section>
+	<!-- advanced information: details, read-only -->
+	<section class="page" data-title="adv_info">
+		<div class="card grid">
+			<span class="label sect" data-t="device"></span><span></span>
+			<span class="label" data-t="model"></span><span id="ad-model" class="value">--</span>
+			<span class="label" data-t="system"></span><span id="ad-os" class="value small">--</span>
+			<span class="label" data-t="image"></span><span id="ad-image" class="value small">--</span>
+			<span class="label" data-t="kernel"></span><span id="ad-kernel" class="value small">--</span>
+			<span class="label" data-t="storage"></span><span id="ad-disk" class="value">--</span>
+			<span class="label" data-t="temperature"></span><span id="ad-temp" class="value">--</span>
+			<span class="label" data-t="battery"></span><span id="ad-bat" class="value">--</span>
+		</div>
+		<div class="card">
+			<div class="lh"><span data-t="temperatures"></span></div>
+			<div id="ad-temps" class="temperatures"></div>
+			<button id="ad-moretemps" class="btn" data-t="show_more"></button>
+			<div id="ad-extra-temps" class="grid thermal-zones" hidden></div>
+		</div>
+		<div class="card grid">
+			<span class="label sect" data-t="baseband"></span><span></span>
+			<span class="label" data-t="model"></span><span id="ad-bb" class="value small">--</span>
+			<span class="label">5G SA</span><span id="ad-sa" class="value">--</span>
+			<span class="label" data-t="modes"></span><span id="ad-modes" class="value small">--</span>
+			<div id="ad-fw" class="fw"></div>
+		</div>
+		<div class="card grid">
+			<span class="label sect" data-t="locks"></span><span></span>
+			<span class="label" data-t="lte_bands"></span><span id="ad-lte" class="value">--</span>
+			<span class="label" data-t="nr_bands"></span><span id="ad-nr" class="value">--</span>
+			<span class="label" data-t="cell_lock"></span><span id="ad-cell" class="value small">--</span>
+		</div>
+		<div class="card grid">
+			<span class="label sect">SIM</span><span></span>
+			<span class="label" data-t="slot"></span><span id="ad-slot" class="value">--</span>
+			<span class="label" data-t="operator"></span><span id="ad-op" class="value">--</span>
+			<span class="label" data-t="registration"></span><span id="ad-reg" class="value">--</span>
+		</div>
+		<div class="card">
+			<div id="ad-ids" class="grid" hidden>
+				<span class="label">IMEI</span><span id="id-imei" class="value small">--</span>
+				<span class="label">ICCID</span><span id="id-iccid" class="value small">--</span>
+				<span class="label">IMSI</span><span id="id-imsi" class="value small">--</span>
+				<span class="label" data-t="number"></span><span id="id-num" class="value small">--</span>
+			</div>
+			<button id="ad-showids" class="btn wide" data-t="show_ids"></button>
+		</div>
+	</section>
+	<!-- advanced: settings by function -->
+	<section class="page" data-title="settings">
+		<div id="st-path" class="stpath"></div>
+		<div id="st-view"></div>
+	</section>
+
+	<!-- apps: the installed plugins -->
+	<section class="page" data-title="apps">
+		<div id="ap-list"></div>
+	</section>
+</main>
+
+<!-- an open plugin, over the pages -->
+<iframe id="app-frame" hidden></iframe>
+<iframe id="ime-frame" hidden></iframe>
+
+<footer id="foot">
+	<span id="foot-title"></span>
+	<span id="dots"></span>
+</footer>
+
+<!-- A non-modal update notice, shown only on the overview. -->
+<aside id="update-card" hidden aria-label="信息屏更新" aria-live="polite">
+	<div class="update-heading"><strong data-t="update_found"></strong><span id="update-version"></span></div>
+	<div id="update-scope" class="sub" data-t="update_scope"></div>
+	<button id="update-details" class="update-details" aria-expanded="false" aria-controls="update-notes" data-t="update_logs"></button>
+	<div id="update-notes" hidden tabindex="0"></div>
+	<div id="update-error" hidden></div>
+	<div class="update-actions">
+		<button id="update-now" class="btn on" data-t="update_now"></button>
+		<button id="update-later" class="btn" data-t="update_later"></button>
+	</div>
+	<div class="update-later-hint" data-t="update_later_hint"></div>
+</aside>
+
+<aside id="notification-card" hidden role="status" aria-live="polite">
+ <strong id="notification-title"></strong><div id="notification-body"></div>
+ <div class="update-actions"><button id="notification-open" class="btn on"></button><button id="notification-later" class="btn"></button></div>
+</aside>
+
+<!-- a picture over everything (the 赞赏码): a key or a tap closes it -->
+<div id="pic" hidden><img id="pic-img" alt=""><div id="pic-caption"></div><div id="pic-note"></div><div id="pic-close"></div></div>
+
+<div id="blank"></div>
+<div id="toast"></div>
+<div id="vol-osd"><span id="vol-label" data-t="volume"></span><div class="track"><div id="vol-bar"></div></div><span id="vol-n"></span></div>
+<script src="app.js"></script>
+</body>
+</html>

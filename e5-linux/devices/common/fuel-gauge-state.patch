@@ -1,0 +1,413 @@
+--- a/drivers/power/supply/sprd_ump96xx_fuel_gauge.c
++++ b/drivers/power/supply/sprd_ump96xx_fuel_gauge.c
+@@ -723,11 +723,12 @@
+ 	return false;
+ }
+ 
++/* Retained SET/CLEAR latches require writes even when their readback is unchanged. */
+ static int ump96xx_fgu_save_boot_mode(struct sprd_fgu_info *info, int boot_mode)
+ {
+ 	int ret;
+ 
+-	ret = regmap_update_bits(info->regmap,
++	ret = regmap_write_bits(info->regmap,
+ 				 info->base + UMP96XX_FGU_USER_AREA_CLEAR0,
+ 				 UMP96XX_FGU_MODE_AREA_MASK,
+ 				 UMP96XX_FGU_MODE_AREA_MASK);
+@@ -744,7 +745,7 @@
+ 	 */
+ 	usleep_range(200, 210);
+ 
+-	ret = regmap_update_bits(info->regmap,
++	ret = regmap_write_bits(info->regmap,
+ 				 info->base + UMP96XX_FGU_USER_AREA_SET0,
+ 				 UMP96XX_FGU_MODE_AREA_MASK,
+ 				 boot_mode << UMP96XX_FGU_MODE_AREA_SHIFT);
+@@ -766,7 +767,7 @@
+ 	 * make the user area data available, otherwise we can not save the user
+ 	 * area data.
+ 	 */
+-	ret = regmap_update_bits(info->regmap,
++	ret = regmap_write_bits(info->regmap,
+ 				 info->base + UMP96XX_FGU_USER_AREA_CLEAR0,
+ 				 UMP96XX_FGU_MODE_AREA_MASK, 0);
+ 	if (ret) {
+@@ -796,6 +797,15 @@
+ 	if (ret)
+ 		return ret;
+ 
++	/* Retained SOC is percent in bits 7:0 and tenths in bits 11:8.
++	 * Reject invalid metadata; never let a decoded value become false 100%.
++	 */
++	if ((value & UMP96XX_FGU_CAP_INTEGER_MASK) > 100 ||
++	    ((value >> UMP96XX_FGU_CAP_DECIMAL_SHIFT) & UMP96XX_FGU_CAP_DECIMAL_MASK) > 9 ||
++	    ((value & UMP96XX_FGU_CAP_INTEGER_MASK) == 100 &&
++	     ((value >> UMP96XX_FGU_CAP_DECIMAL_SHIFT) & UMP96XX_FGU_CAP_DECIMAL_MASK)))
++		return -ERANGE;
++
+ 	*cap = (value & UMP96XX_FGU_CAP_INTEGER_MASK) * 10;
+ 	*cap += (value >> UMP96XX_FGU_CAP_DECIMAL_SHIFT) & UMP96XX_FGU_CAP_DECIMAL_MASK;
+ 
+@@ -812,6 +822,15 @@
+ 	if (ret)
+ 		return ret;
+ 
++	/* Retained SOC is percent in bits 7:0 and tenths in bits 11:8.
++	 * Reject invalid metadata; never let a decoded value become false 100%.
++	 */
++	if ((value & UMP96XX_FGU_CAP_INTEGER_MASK) > 100 ||
++	    ((value >> UMP96XX_FGU_CAP_DECIMAL_SHIFT) & UMP96XX_FGU_CAP_DECIMAL_MASK) > 9 ||
++	    ((value & UMP96XX_FGU_CAP_INTEGER_MASK) == 100 &&
++	     ((value >> UMP96XX_FGU_CAP_DECIMAL_SHIFT) & UMP96XX_FGU_CAP_DECIMAL_MASK)))
++		return -ERANGE;
++
+ 	*cap = (value & UMP96XX_FGU_CAP_INTEGER_MASK) * 10;
+ 	*cap += (value >> UMP96XX_FGU_CAP_DECIMAL_SHIFT) & UMP96XX_FGU_CAP_DECIMAL_MASK;
+ 
+@@ -823,7 +842,10 @@
+ 	int ret;
+ 	u32 value;
+ 
+-	ret = regmap_update_bits(info->regmap,
++	if (cap < 0 || cap > UMP96XX_FGU_FCC_PERCENT)
++		return -ERANGE;
++
++	ret = regmap_write_bits(info->regmap,
+ 				 info->base + UMP96XX_FGU_USER_AREA_CLEAR0,
+ 				 UMP96XX_FGU_CAP_AREA_MASK,
+ 				 UMP96XX_FGU_CAP_AREA_MASK);
+@@ -843,7 +865,7 @@
+ 	value = (cap / 10) & UMP96XX_FGU_CAP_INTEGER_MASK;
+ 	value |= ((cap % 10) & UMP96XX_FGU_CAP_DECIMAL_MASK) << UMP96XX_FGU_CAP_DECIMAL_SHIFT;
+ 
+-	ret = regmap_update_bits(info->regmap,
++	ret = regmap_write_bits(info->regmap,
+ 				 info->base + UMP96XX_FGU_USER_AREA_SET0,
+ 				 UMP96XX_FGU_CAP_AREA_MASK, value);
+ 	if (ret) {
+@@ -864,7 +886,7 @@
+ 	 * make the user area data available, otherwise we can not save the user
+ 	 * area data.
+ 	 */
+-	ret = regmap_update_bits(info->regmap,
++	ret = regmap_write_bits(info->regmap,
+ 				 info->base + UMP96XX_FGU_USER_AREA_CLEAR0,
+ 				 UMP96XX_FGU_CAP_AREA_MASK, 0);
+ 	if (ret) {
+@@ -898,7 +920,10 @@
+ 		return ret;
+ 	}
+ 
+-	ret = regmap_update_bits(info->regmap,
++	if (cap < 0 || cap > UMP96XX_FGU_FCC_PERCENT)
++		return -ERANGE;
++
++	ret = regmap_write_bits(info->regmap,
+ 				 info->base + UMP96XX_FGU_USER_AREA_CLEAR1,
+ 				 UMP96XX_FGU_CAP_AREA_MASK,
+ 				 UMP96XX_FGU_CAP_AREA_MASK);
+@@ -917,7 +942,7 @@
+ 	value = (cap / 10) & UMP96XX_FGU_CAP_INTEGER_MASK;
+ 	value |= ((cap % 10) & UMP96XX_FGU_CAP_DECIMAL_MASK) << UMP96XX_FGU_CAP_DECIMAL_SHIFT;
+ 
+-	ret = regmap_update_bits(info->regmap,
++	ret = regmap_write_bits(info->regmap,
+ 				 info->base + UMP96XX_FGU_USER_AREA_SET1,
+ 				 UMP96XX_FGU_CAP_AREA_MASK, value);
+ 	if (ret) {
+@@ -933,7 +958,7 @@
+ 	 */
+ 	usleep_range(200, 210);
+ 
+-	ret = regmap_update_bits(info->regmap,
++	ret = regmap_write_bits(info->regmap,
+ 				 info->base + UMP96XX_FGU_USER_AREA_CLEAR1,
+ 				 UMP96XX_FGU_CAP_AREA_MASK, 0);
+ 	if (ret) {
+--- a/drivers/power/supply/sprd_fuel_gauge_core.c
++++ b/drivers/power/supply/sprd_fuel_gauge_core.c
+@@ -1162,87 +1162,61 @@
+  */
+ static int sprd_fgu_get_boot_capacity(struct sprd_fgu_data *data, int *cap)
+ {
+-	int pocv_uv, ret, pocv_cap;
++	int pocv_uv, ret, pocv_cap, saved_ui = -1, normal_cap = -1, ui_cap;
+ 	struct sprd_fgu_info *fgu_info = data->fgu_info;
+-	bool is_first_poweron = fgu_info->ops->is_first_poweron(fgu_info);
++	bool first = fgu_info->ops->is_first_poweron(fgu_info);
++	bool recovered;
+ 
+ 	ret = sprd_fgu_get_boot_voltage(data, &pocv_uv);
+-	if (ret) {
+-		dev_err(data->dev, "Failed to get boot voltage, ret = %d\n", ret);
++	if (ret)
+ 		return ret;
+-	}
+ 	data->boot_volt_uv = pocv_uv;
+-
+-	/*
+-	 * Parse the capacity table to look up the correct capacity percent
+-	 * according to current battery's corresponding OCV values.
+-	 */
+ 	pocv_cap = sprd_fgu_ocv2cap(data->cap_table, data->table_len, pocv_uv);
+ 
+-	/*
+-	 * If system is not the first power on, we should use the last saved
+-	 * battery capacity as the initial battery capacity. Otherwise we should
+-	 * re-calculate the initial battery capacity.
+-	 */
+-	if (!is_first_poweron) {
+-		ret = fgu_info->ops->read_last_cap(fgu_info, cap);
+-		if (ret) {
+-			dev_err(data->dev, "Failed to read last cap, ret = %d\n", ret);
++	if (!first) {
++		ret = fgu_info->ops->read_last_cap(fgu_info, &saved_ui);
++		if (ret && ret != -ERANGE)
++			return ret; /* An I/O failure is not permission to invent a SOC. */
++		if (ret || saved_ui < 0 || saved_ui > SPRD_FGU_FCC_PERCENT)
++			saved_ui = -1;
++		ret = fgu_info->ops->read_normal_temperature_cap(fgu_info, &normal_cap);
++		if (ret && ret != -ERANGE)
+ 			return ret;
+-		}
+-
+-		data->boot_cap = *cap;
+-		ret = fgu_info->ops->read_normal_temperature_cap(fgu_info, cap);
+-		if (ret) {
+-			dev_err(data->dev, "Failed to read normal temperature cap, ret = %d\n",
+-				ret);
+-			sprd_fgu_boot_cap_calibration(data, pocv_cap, pocv_uv, cap);
++		if (ret || normal_cap < 0 || normal_cap > SPRD_FGU_FCC_PERCENT)
++			normal_cap = -1;
++	}
++
++	recovered = !first && (saved_ui < 0 || normal_cap < 0);
++	if (normal_cap >= 0) {
++		*cap = normal_cap;
++		sprd_fgu_boot_cap_calibration(data, pocv_cap, pocv_uv, cap);
++	} else if (saved_ui >= 0) {
++		/* Preserve the vendor fallback when the second retained area resets. */
++		*cap = saved_ui;
++		sprd_fgu_boot_cap_calibration(data, pocv_cap, pocv_uv, cap);
++	} else {
++		/* Only first power-on or invalid retained metadata uses voltage. */
++		*cap = pocv_cap;
++	}
++	data->normal_temp_cap = *cap;
++	ui_cap = *cap;
++	if (saved_ui < 0) {
++		sprd_fgu_capacity_loss_by_temperature(data, &ui_cap);
++		saved_ui = sprd_fgu_capacity_remap(data, ui_cap);
++		ret = fgu_info->ops->save_last_cap(fgu_info, saved_ui);
++		if (ret)
+ 			return ret;
+-		}
+-
+-		if (*cap == SPRD_FGU_DEFAULT_CAP || *cap == SPRD_FGU_RTC2_RESET_VALUE) {
+-			*cap = data->boot_cap;
+-			sprd_fgu_boot_cap_calibration(data, pocv_cap, pocv_uv, cap);
+-			ret = fgu_info->ops->save_normal_temperature_cap(fgu_info, *cap);
+-			if (ret < 0)
+-				dev_err(data->dev, "Failed to initialize fgu user area status1 register\n");
+-		} else {
+-			sprd_fgu_boot_cap_calibration(data, pocv_cap, pocv_uv, cap);
+-		}
+-
+-		data->normal_temp_cap = *cap;
+-		ret = fgu_info->ops->save_normal_temperature_cap(fgu_info, data->normal_temp_cap);
+-		if (ret) {
+-			dev_err(data->dev, "Failed to save normal temperature capacity, ret = %d\n",
+-				ret);
+-			return ret;
+-		}
+-
+-		dev_info(data->dev, "init: boot_cap = %d, normal_cap = %d\n", data->boot_cap, *cap);
+-
+-		return fgu_info->ops->save_boot_mode(fgu_info, SPRD_FGU_NORMAL_POWERON);
+-	}
+-
+-	*cap = pocv_cap;
+-	sprd_fgu_capacity_loss_by_temperature(data, cap);
+-	data->boot_cap = sprd_fgu_capacity_remap(data, *cap);
+-	ret = fgu_info->ops->save_last_cap(fgu_info, data->boot_cap);
+-	if (ret) {
+-		dev_err(data->dev, "Failed to save last cap, ret = %d\n", ret);
++	}
++	data->boot_cap = saved_ui;
++	ret = fgu_info->ops->save_normal_temperature_cap(fgu_info, data->normal_temp_cap);
++	if (ret)
+ 		return ret;
+-	}
+-
+-	data->normal_temp_cap = pocv_cap;
+-	ret = fgu_info->ops->save_normal_temperature_cap(fgu_info, data->normal_temp_cap);
+-	if (ret) {
+-		dev_err(data->dev, "Failed to save normal temperature capacity, ret = %d\n", ret);
+-		return ret;
+-	}
+-
+-	data->is_first_poweron = true;
+-	dev_info(data->dev, "First_poweron: pocv_uv = %d, pocv_cap = %d, boot_cap = %d\n",
+-		 pocv_uv, pocv_cap, data->boot_cap);
+-	*cap = pocv_cap;
++	if (first) {
++		data->is_first_poweron = true;
++	}
++	dev_info(data->dev, "SOC restore: ui=%d normal=%d first=%d recovered=%d\n",
++		 data->boot_cap, data->normal_temp_cap, first,
++		 recovered);
+ 	return fgu_info->ops->save_boot_mode(fgu_info, SPRD_FGU_NORMAL_POWERON);
+ }
+ 
+@@ -2032,12 +2006,50 @@
+ 	return ret;
+ }
+ 
++
++static int sprd_fgu_save_capacity(struct sprd_fgu_data *data, int ui_cap)
++{
++	struct sprd_fgu_info *info = data->fgu_info;
++	int attempt, ret, actual;
++
++	if (ui_cap < 0 || ui_cap > SPRD_FGU_FCC_PERCENT)
++		return -ERANGE;
++	if (data->normal_temp_cap != SPRD_FGU_MAGIC_NUMBER &&
++	    (data->normal_temp_cap < 0 || data->normal_temp_cap > SPRD_FGU_FCC_PERCENT))
++		return -ERANGE;
++	for (attempt = 0; attempt < 2; attempt++) {
++		ret = info->ops->save_last_cap(info, ui_cap);
++		if (ret)
++			continue;
++		ret = info->ops->read_last_cap(info, &actual);
++		if (!ret && actual == ui_cap)
++			break;
++		if (!ret)
++			ret = -EIO;
++	}
++	if (ret)
++		return ret;
++	if (data->normal_temp_cap == SPRD_FGU_MAGIC_NUMBER)
++		return 0;
++	for (attempt = 0; attempt < 2; attempt++) {
++		ret = info->ops->save_normal_temperature_cap(info, data->normal_temp_cap);
++		if (ret)
++			continue;
++		ret = info->ops->read_normal_temperature_cap(info, &actual);
++		if (!ret && actual == data->normal_temp_cap)
++			return 0;
++		if (!ret)
++			ret = -EIO;
++	}
++	return ret;
++}
++
+ static int sprd_fgu_set_property(struct power_supply *psy,
+ 				 enum power_supply_property psp,
+ 				 const union power_supply_propval *val)
+ {
+ 	struct sprd_fgu_data *data = power_supply_get_drvdata(psy);
+-	int ret = 0, ui_cap, normal_cap;
++	int ret = 0;
+ 	struct sprd_fgu_info *fgu_info;
+ 	struct timespec64 cur_time;
+ 
+@@ -2061,46 +2073,9 @@
+ 
+ 	switch (psp) {
+ 	case POWER_SUPPLY_PROP_CAPACITY:
+-		dev_dbg(data->dev, "%s:line%d ui_cap = %d, normal_cap = %d\n",
+-			__func__, __LINE__, val->intval, data->normal_temp_cap);
+-		ret = fgu_info->ops->save_last_cap(fgu_info, val->intval);
+-		if (ret < 0)
+-			dev_err(data->dev, "failed to save battery capacity\n");
+-
+-		ret = fgu_info->ops->save_normal_temperature_cap(fgu_info, data->normal_temp_cap);
+-		if (ret < 0)
+-			dev_err(data->dev, "failed to save normal temperature capacity\n");
+-
+-		ret = fgu_info->ops->read_last_cap(fgu_info, &ui_cap);
+-		if (ret < 0) {
+-			ui_cap = -1;
+-			dev_err(data->dev, "failed to read ui capacity\n");
+-		}
+-
+-		if (val->intval != ui_cap) {
+-			dev_info(data->dev, "ui cap save failed, save it again! save_cap = %d, read_cap = %d\n",
+-				 val->intval, ui_cap);
+-			ret = fgu_info->ops->save_last_cap(fgu_info, val->intval);
+-			if (ret < 0)
+-				dev_err(data->dev, "%d failed to save battery capacity\n",
+-					__LINE__);
+-		}
+-
+-		ret = fgu_info->ops->read_normal_temperature_cap(fgu_info, &normal_cap);
+-		if (ret < 0) {
+-			normal_cap = -1;
+-			dev_err(data->dev, "failed to read normal capacity\n");
+-		}
+-
+-		if (data->normal_temp_cap != normal_cap) {
+-			dev_info(data->dev, "normal cap save failed, save it again! save_cap = %d, read_cap = %d\n",
+-				 data->normal_temp_cap, normal_cap);
+-			ret = fgu_info->ops->save_normal_temperature_cap(fgu_info,
+-									 data->normal_temp_cap);
+-			if (ret < 0)
+-				dev_err(data->dev, "%d failed to save normal temperature capacity\n",
+-					__LINE__);
+-		}
++		ret = sprd_fgu_save_capacity(data, val->intval);
++		if (ret)
++			dev_err(data->dev, "Failed to persist verified SOC: %d\n", ret);
+ 		break;
+ 
+ 	case POWER_SUPPLY_PROP_STATUS:
+--- a/drivers/power/supply/charger-manager.c
++++ b/drivers/power/supply/charger-manager.c
+@@ -8351,9 +8351,10 @@
+ 	}
+ 
+ schedule_cap_update_work:
+-	queue_delayed_work(system_power_efficient_wq,
+-			   &cm->cap_update_work,
+-			   work_cycle * HZ);
++	if (!READ_ONCE(cm->shutdown_flag))
++		queue_delayed_work(system_power_efficient_wq,
++				   &cm->cap_update_work,
++				   work_cycle * HZ);
+ }
+ 
+ static int cm_check_alt_cp_psy_ready_status(struct charger_manager *cm)
+@@ -8793,20 +8794,23 @@
+ {
+ 	struct charger_manager *cm = platform_get_drvdata(pdev);
+ 
+-	cm->shutdown_flag = true;
+-	if (cm->desc->uvlo_trigger_cnt < CM_UVLO_CALIBRATION_CNT_THRESHOLD)
+-		set_batt_cap(cm, cm->desc->cap);
+-
+-	if (cm->fchg_info->ops && cm->fchg_info->ops->shutdown)
+-		cm->fchg_info->ops->shutdown(cm->fchg_info);
+-
+-	if (cm->vchg_info->ops && cm->vchg_info->ops->shutdown)
+-		cm->vchg_info->ops->shutdown(cm->vchg_info);
+-
++	WRITE_ONCE(cm->shutdown_flag, true);
++	/* Stop SOC writers before the final retained-register transaction. */
+ 	cancel_delayed_work_sync(&cm_monitor_work);
+ 	cancel_delayed_work_sync(&cm->fullbatt_vchk_work);
+ 	cancel_delayed_work_sync(&cm->cap_update_work);
++	/* UVLO may have called kernel_power_off() from this very work item. */
+ 	cancel_delayed_work(&cm->uvlo_work);
++	if (cm->desc->uvlo_trigger_cnt < CM_UVLO_CALIBRATION_CNT_THRESHOLD &&
++	    set_batt_cap(cm, cm->desc->cap))
++		dev_err(cm->dev, "Shutdown SOC save failed\n");
++
++	if (cm->fchg_info->ops && cm->fchg_info->ops->shutdown)
++		cm->fchg_info->ops->shutdown(cm->fchg_info);
++
++	if (cm->vchg_info->ops && cm->vchg_info->ops->shutdown)
++		cm->vchg_info->ops->shutdown(cm->vchg_info);
++
+ }
+ 
+ static const struct platform_device_id charger_manager_id[] = {

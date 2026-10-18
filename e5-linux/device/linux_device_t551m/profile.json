@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "system": "linux",
+  "model": "t551m",
+  "repository": "https://github.com/sprd-linux-devs/linux_device_t551m.git"
+}

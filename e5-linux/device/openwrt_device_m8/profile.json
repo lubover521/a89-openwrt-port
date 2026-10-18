@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "system": "openwrt",
+  "model": "m8",
+  "repository": "https://github.com/sprd-linux-devs/openwrt_device_m8.git"
+}

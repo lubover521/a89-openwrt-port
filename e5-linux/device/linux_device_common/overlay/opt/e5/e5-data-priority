@@ -1,0 +1,65 @@
+#!/bin/sh
+# Shared E5/T551M policy. No tty opens, radio cycles or dial prerequisites.
+# queue [0|1] detaches; run [0|1] is the bounded background worker.
+set -u
+export PATH="$PATH:/opt/e5/bin:/usr/sbin:/sbin"
+slot=${2:-$(cat /sys/module/sipc_wwan/parameters/card 2>/dev/null || echo 0)}
+case "$slot" in 0|1) ;; *) echo 'Invalid SIM slot' >&2; exit 2 ;; esac
+case "${1:-queue}" in
+    queue)
+        setsid "$0" run "$slot" </dev/null >/dev/null 2>&1 &
+        exit 0 ;;
+    run) ;;
+    *) echo 'usage: e5-data-priority queue|run [0|1]' >&2; exit 2 ;;
+esac
+
+umask 077
+state=${E5_DATA_PRIORITY_DIR:-/run/e5-data-priority}
+mkdir -p "$state" || exit 0
+# flock is released even on a crash; never wait for another worker. Keep the
+# lock file inode in place so late contenders cannot acquire a different lock.
+exec 9>"$state/slot$slot.lock"
+flock -n 9 || exit 0
+
+# All adapted boards stage the secondary owner, regardless of device profile.
+# Do not fall back to MM's dial port when that owner is temporarily unavailable.
+if [ -n "${E5_DATA_PRIORITY_CLIENT:-}" ]; then
+    client=$E5_DATA_PRIORITY_CLIENT
+elif [ -x /opt/e5/t551m-at ]; then
+    client=/opt/e5/t551m-at
+else
+    # Stock Debian/OpenWrt and unisoc-cpd: ask the current owner, never the tty.
+    client=/opt/e5/e5-at
+fi
+export T551M_AT_CHANNEL=2
+log() { logger -t e5-data-priority "SIM$slot $*" 2>/dev/null || true; }
+failed=0
+for command in '+CEUS=1' '+CEMODE=2'; do
+    accepted=0
+    # Initial send plus THREE retries, separately for each command.
+    for attempt in 1 2 3 4; do
+        # The outer deadline also bounds IPC/connect/queue time. Closing fd 9
+        # prevents an orphaned client from retaining the worker's singleton.
+        if reply=$(timeout 18 "$client" -t 3 "AT+SPACTCARD=$slot;$command" 9>&- 2>&1) &&
+           printf '%s\n' "$reply" | awk '
+               { sub(/\r$/, "") }
+               /^(ERROR|\+CME ERROR|\+CMS ERROR)(:|$)/ { bad=1 }
+               NF { last=$0 }
+               END { exit (bad || last != "OK") }
+           '; then
+            accepted=1
+            log "$command confirmed OK (attempt $attempt/4)"
+            break
+        fi
+        log "$command unconfirmed (attempt $attempt/4); dialing unaffected"
+        # Only the failed background worker pauses; no fixed startup delay.
+        # Pace quick ERROR/unavailable replies instead of hammering the owner.
+        [ "$attempt" = 4 ] || sleep 1
+    done
+    if [ "$accepted" != 1 ]; then
+        failed=$((failed + 1))
+        log "$command exhausted 3 retries; continuing without blocking dialing"
+    fi
+done
+[ "$failed" != 0 ] || log 'CEUS=1 CEMODE=2 both confirmed OK'
+exit 0

@@ -1,0 +1,67 @@
+#!/bin/sh
+# Repairs that the root filesystem build cannot guarantee.
+#
+# The tree is unpacked from a container image (fetch-debian-rootfs.py +
+# install-packages.sh) and pushed as a raw ext4 file, so xattrs do not always
+# survive: file capabilities in particular come out empty, and then ping fails
+# with "Operation not permitted" on a plain user account.
+#
+# (port of mu300-linux's rootfs-fixups.  Its third job -- replacing an empty
+#  /etc/resolv.conf with the systemd-resolved stub -- is deliberately not done
+#  here: on this image e5-mobile-data writes resolv.conf with the baseband's DNS
+#  servers, public resolvers first, and a symlink would fight with it.)
+# The world-usable device nodes.  The kernel creates them 0666, but on some
+# boots something early in userspace leaves them unusable for a non-root user
+# until udev's coldplug re-applies MODE=0666: dbus-daemon, which drops to
+# messagebus, then failed with "Failed to open /dev/null: Permission denied",
+# and NetworkManager, bound to it, did not start at all (docs/FINDINGS.md 37).
+# This runs before sysinit.target, ahead of dbus; what it finds is logged, so
+# the culprit can still be found.
+for f in /dev/null /dev/zero /dev/full /dev/random /dev/urandom /dev/tty; do
+    [ -c "$f" ] || continue
+    m=$(stat -c %a "$f" 2>/dev/null)
+    [ "$m" = 666 ] && continue
+    echo "rootfs-fixups: $f was mode $m ($(stat -c '%U:%G' "$f")), restoring 0666"
+    chmod 0666 "$f"
+done
+
+for f in /usr/bin/ping /usr/bin/mtr-packet /usr/bin/arping; do
+    [ -x "$f" ] || continue
+    getcap "$f" 2>/dev/null | grep -q cap_net_raw || setcap cap_net_raw+ep "$f" 2>/dev/null || true
+done
+
+# Ownership and set-id bits of the Debian base.  Older builds flattened them (a
+# blanket chown root:root in device-build.sh, groups lost on a macOS bind
+# mount): su, passwd, mount came out 0755 root:root, and so did unix_chkpwd --
+# which broke the phosh lock screen, since pam_unix running as the session user
+# needs setgid shadow to read /etc/shadow (every password failed, rc 9).
+# Current builds record the image's real ownership (fetch-debian-rootfs.py ->
+# /var/lib/e5linux/base-perms) and e5-base-perms replays it; a rootfs built
+# before that gets Debian's known modes restored by hand.
+if [ -f /var/lib/e5linux/base-perms ]; then
+    /opt/e5/e5-base-perms / >/dev/null 2>&1 || true
+else
+    for f in /usr/bin/su /usr/bin/mount /usr/bin/umount /usr/bin/passwd /usr/bin/chsh \
+             /usr/bin/chfn /usr/bin/gpasswd /usr/bin/newgrp; do
+        [ -f "$f" ] && chown root:root "$f" && chmod 4755 "$f"
+    done
+    for f in /usr/sbin/unix_chkpwd /usr/bin/chage /usr/bin/expiry; do
+        [ -f "$f" ] && chown root:shadow "$f" && chmod 2755 "$f"
+    done
+    for f in /etc/shadow /etc/shadow- /etc/gshadow /etc/gshadow-; do
+        [ -f "$f" ] && chown root:shadow "$f" && chmod 0640 "$f"
+    done
+fi
+# dbus is not in the base image, so no list covers it; the old bind-mount builds
+# left its activation helper root:root, where messagebus cannot run it
+f=/usr/lib/dbus-1.0/dbus-daemon-launch-helper
+[ -f "$f" ] && getent group messagebus >/dev/null && chown root:messagebus "$f" && chmod 4754 "$f"
+
+# /opt/e5 is on nobody's PATH, and sudo's secure_path cannot see it at all, so the
+# commands the documentation tells people to run need links from a directory that
+# is: `sudo e5-next-boot android`, `mobile-data status`, `e5-at "AT+CSQ"`.
+for c in e5-next-boot e5-os mobile-data e5-at; do
+    [ -x "/opt/e5/$c" ] || continue
+    [ -e "/usr/local/bin/$c" ] || ln -sfn "/opt/e5/$c" "/usr/local/bin/$c" 2>/dev/null || true
+done
+true

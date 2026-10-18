@@ -1,0 +1,45 @@
+--- a/drivers/power/supply/sprd_fuel_gauge_core.c
++++ b/drivers/power/supply/sprd_fuel_gauge_core.c
+@@ -2010,7 +2010,7 @@
+ static int sprd_fgu_save_capacity(struct sprd_fgu_data *data, int ui_cap)
+ {
+ 	struct sprd_fgu_info *info = data->fgu_info;
+-	int attempt, ret, actual;
++	int attempt, ret, actual = -1;
+ 
+ 	if (ui_cap < 0 || ui_cap > SPRD_FGU_FCC_PERCENT)
+ 		return -ERANGE;
+@@ -2018,6 +2018,7 @@
+ 	    (data->normal_temp_cap < 0 || data->normal_temp_cap > SPRD_FGU_FCC_PERCENT))
+ 		return -ERANGE;
+ 	for (attempt = 0; attempt < 2; attempt++) {
++		actual = -1;
+ 		ret = info->ops->save_last_cap(info, ui_cap);
+ 		if (ret)
+ 			continue;
+@@ -2027,11 +2028,15 @@
+ 		if (!ret)
+ 			ret = -EIO;
+ 	}
+-	if (ret)
++	if (ret) {
++		dev_err(data->dev, "SOC retention UI: requested=%d read=%d ret=%d\n",
++			ui_cap, actual, ret);
+ 		return ret;
++	}
+ 	if (data->normal_temp_cap == SPRD_FGU_MAGIC_NUMBER)
+ 		return 0;
+ 	for (attempt = 0; attempt < 2; attempt++) {
++		actual = -1;
+ 		ret = info->ops->save_normal_temperature_cap(info, data->normal_temp_cap);
+ 		if (ret)
+ 			continue;
+@@ -2041,6 +2046,8 @@
+ 		if (!ret)
+ 			ret = -EIO;
+ 	}
++	dev_err(data->dev, "SOC retention normal: requested=%d read=%d ret=%d\n",
++		data->normal_temp_cap, actual, ret);
+ 	return ret;
+ }
+ 

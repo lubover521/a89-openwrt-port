@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "system": "openwrt",
+  "model": "t551m",
+  "repository": "https://github.com/sprd-linux-devs/openwrt_device_t551m.git"
+}

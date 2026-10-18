@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "system": "linux",
+  "model": "common",
+  "repository": "https://github.com/sprd-linux-devs/linux_device_common.git"
+}

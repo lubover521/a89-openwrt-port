@@ -1,0 +1,60 @@
+#!/bin/sh
+# cage + cog on the panel, run by /etc/init.d/e5-infoscreen (instance "ui").
+export XDG_RUNTIME_DIR=/tmp/run/e5-infoscreen
+mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+export LIBSEAT_BACKEND=seatd
+export XKB_CONFIG_EXTRA_PATH=/usr/share/e5-infoscreen/xkb
+export XKB_DEFAULT_LAYOUT=us
+# E5 phone keys need distinct names in WPE; keep the evdev keycodes intact.
+export XKB_DEFAULT_RULES=e5
+export XKB_DEFAULT_OPTIONS=e5:keypad
+# the page formats times itself: WebKit needs the device's time zone (OpenWrt
+# keeps it in /etc/TZ, a POSIX TZ string, written from uci system.timezone)
+TZ=$(cat /etc/TZ 2>/dev/null)
+export TZ=${TZ:-UTC0}
+export HOME=/tmp/run/e5-infoscreen
+
+# seatd and the api instance start next to this one: wait for both in
+# 100 ms steps while starting; both waits retain their ten-second bounds.
+i=0
+while [ ! -S /var/run/seatd.sock ] && [ $i -lt 100 ]; do /opt/e5/bin/busybox sleep 0.1; i=$((i + 1)); done
+i=0
+# (8088 = 0x1F98, listening = state 0A)
+while ! grep -q ':1F98 00000000:0000 0A' /proc/net/tcp && [ $i -lt 100 ]; do /opt/e5/bin/busybox sleep 0.1; i=$((i + 1)); done
+
+# cog and its WebKit processes outlive cage when cage is stopped -- and then
+# spin, with no compositor to talk to -- so this script stays the procd
+# instance and takes them down with it, whichever of the two ends first.
+CLIENTS="cog WPEWebProcess WPENetworkProcess"
+stop_clients() {
+	# A cold boot has no old browser; avoid an unconditional one-second delay.
+	if pidof $CLIENTS >/dev/null 2>&1; then
+		killall -q $CLIENTS 2>/dev/null
+		sleep 1
+		killall -q -9 $CLIENTS 2>/dev/null
+	fi
+}
+on_term() {
+	[ -n "$CAGE" ] && kill -TERM "$CAGE" 2>/dev/null
+	stop_clients
+	exit 0
+}
+trap on_term TERM INT
+# leftovers of an earlier session (killed without this script's cleanup)
+stop_clients
+# WebKit's HTTP cache, which outlives the session in /tmp/run: uhttpd sends no
+# Cache-Control, so WebKit would keep an updated page's old index.html and
+# app.js on its own heuristic, until the next boot
+rm -rf "$HOME/.cache/wpe/WebKitCache"
+
+# -d: no client-side decorations.  cog: the page, black behind it, the page's
+# console into the log (logread -e e5-infoscreen), a new web process if one dies
+/usr/bin/cage -d -- /usr/bin/cog -P wl --bg-color=black \
+	--enable-write-console-messages-to-stdout=true \
+	--webprocess-failure=restart \
+	http://127.0.0.1:8088/ &
+CAGE=$!
+wait "$CAGE"
+rc=$?
+stop_clients
+exit $rc

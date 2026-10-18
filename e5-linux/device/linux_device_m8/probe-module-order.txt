@@ -1,0 +1,16 @@
+sprd-cpufreq-v2-driver.ko
+tlsc6x.ko
+sprd_vpu_pw_domain.ko
+unisoc-iommu.ko
+drm_kms_helper.ko
+drm_dma_helper.ko
+drm_client_lib.ko
+ocp2131.ko
+sprd-drm.ko
+sprd_battery_info.ko
+sprd-charger-manager.ko
+ump96xx_fuel_gauge.ko
+bq2560x-charger.ko
+sc27xx-vibra.ko
+matrix-keymap.ko
+sprd_keypad.ko

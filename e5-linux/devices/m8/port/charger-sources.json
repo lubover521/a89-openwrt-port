@@ -1,0 +1,7 @@
+{
+  "repository": "https://github.com/Enceka/kernel_sprd_ums9158",
+  "commit": "63b8011056a5060e274fc1dcc9051c94d9a7bab8",
+  "files": {
+    "drivers/power/supply/bq2560x-charger.c": "e7a99ea539a66a5dfcf2b25f8a275c8eb0567a675ed029fdb0b087133822dd51"
+  }
+}

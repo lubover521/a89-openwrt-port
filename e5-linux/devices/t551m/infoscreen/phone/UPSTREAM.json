@@ -1,0 +1,13 @@
+{
+  "repository": "https://github.com/Enceka/infoscreen-plugins",
+  "version": "1.5",
+  "source": "installed release before local changes",
+  "original_sha256": {
+    "backend.uc": "2d4d59f1b70ace5521a3b1d15512b46d3c69552f161c6161c49a527c6128b0b6",
+    "voice.uc": "b729a8a96620949c7ce225d3a616cd611c81361a550a8c92382fb4b30cee4aad",
+    "phone.js": "3f5ee9c1165304ab70eb1cda5fb9e33af0b900b1891a0153fd298c9d33a7b6b9",
+    "phone.css": "563c407fd19c3952a3f7315970a06b357369c9116c5098f75ccd590f0b1139d3",
+    "index.html": "6cf0cbfeec5b668b04b74659058c9212bcc331056a94d2f750125e37af754aa2",
+    "manifest.json": "0f58b6698a42bea6d6761f443baad4492ae959bc1b8a47259c3d1be8c6edc390"
+  }
+}

@@ -1,0 +1,366 @@
+--- a/drivers/unisoc_platform/net/sipa_delegate/sipa_dele_cp_in_ap.c
++++ b/drivers/unisoc_platform/net/sipa_delegate/sipa_dele_cp_in_ap.c
+@@ -37,57 +37,58 @@
+ 	struct sipa_delegator *delegator = priv;
+ 	int ret = 0;
+ 
+-	pr_info("prod_id:%d, on_cmd, flag = %d\n", delegator->prod_id, flag);
+-
++	/* Serialize CP commands against reset work; PM resume may sleep. */
++	mutex_lock(&delegator->power_lock);
+ 	switch (flag) {
+ 	case SMSG_FLG_DELE_ENABLE:
+-
+-		if (!delegator->cfg->sipa_sys_eb) {
++		/* Duplicate ENABLE needs an ACK, not another power reference. */
++		if (delegator->pd_get_flag)
++			goto enabled;
++		if (delegator->cfg->sipa_sys_eb) {
++			ret = pm_runtime_resume_and_get(delegator->pdev);
++			if (ret < 0)
++				goto enable_failed;
++		} else {
+ 			pm_stay_awake(delegator->pdev);
+-			pr_info("sipa_dele pm stay awake\n");
+-		}
++		}
++		ret = sipa_set_enabled(true);
++		if (ret < 0) {
++			/* set_enabled() increments its reference even on HAL failure. */
++			sipa_set_enabled(false);
++			if (delegator->cfg->sipa_sys_eb)
++				pm_runtime_put(delegator->pdev);
++			else
++				pm_relax(delegator->pdev);
++			goto enable_failed;
++		}
++		delegator->pd_get_flag = true;
++enabled:
+ 		delegator->pd_eb_flag = true;
+-
+-		if (!s_cp_delegator->delegator.cfg->sipa_sys_eb)
+-			goto sipa_eb;
+-check_again:
+-		ret = pm_runtime_get_sync(delegator->pdev);
+-		if (ret) {
+-			pm_runtime_put(delegator->pdev);
+-			pr_warn("sipa_dele get pd fail ret = %d\n", ret);
+-			mdelay(1);
+-			goto check_again;
+-		} else {
+-sipa_eb:
+-			delegator->pd_get_flag = true;
+-			sipa_set_enabled(true);
+-			sipa_dele_start_done_work(delegator,
+-						  SMSG_FLG_DELE_ENABLE,
+-						  SMSG_VAL_DELE_REQ_SUCCESS);
+-			pr_info("sipa_dele get pd success ret = %d\n", ret);
+-		}
++		sipa_dele_start_done_work(delegator, SMSG_FLG_DELE_ENABLE,
++					  SMSG_VAL_DELE_REQ_SUCCESS);
++		break;
++enable_failed:
++		delegator->pd_eb_flag = false;
++		dev_warn_ratelimited(delegator->pdev, "SIPA enable failed: %d\n", ret);
++		sipa_dele_start_done_work(delegator, SMSG_FLG_DELE_ENABLE,
++					  SMSG_VAL_DELE_REQ_FAIL);
+ 		break;
+ 	case SMSG_FLG_DELE_DISABLE:
+ 		delegator->pd_eb_flag = false;
+-		sipa_set_enabled(false);
+-		if (s_cp_delegator->delegator.cfg->sipa_sys_eb)
+-			pm_runtime_put(delegator->pdev);
+-		delegator->pd_get_flag = false;
+-
+-		if (!delegator->cfg->sipa_sys_eb) {
+-			pm_relax(delegator->pdev);
+-			pr_info("sipa_dele pm relax\n");
++		if (delegator->pd_get_flag) {
++			sipa_set_enabled(false);
++			if (delegator->cfg->sipa_sys_eb)
++				pm_runtime_put(delegator->pdev);
++			else
++				pm_relax(delegator->pdev);
++			delegator->pd_get_flag = false;
+ 		}
+ 		break;
+ 	default:
+ 		break;
+ 	}
+-
+-	pr_info("sipa pd_eb_flag = %d, pd_get_flag = %d\n",
+-		delegator->pd_eb_flag, delegator->pd_get_flag);
+-
+-	/* do default operations */
+ 	sipa_dele_on_commad(priv, flag, data);
++	mutex_unlock(&delegator->power_lock);
+ }
+ 
+ static void cp_dele_on_event(void *priv, u16 flag, u32 data)
+@@ -118,32 +119,23 @@
+ {
+ 	struct delayed_work *restart_delayed_work = to_delayed_work(work);
+ 	struct sipa_delegator *delegator = container_of(restart_delayed_work,
+-							struct sipa_delegator,
+-							restart_work);
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&delegator->lock, flags);
+-	if (delegator->pd_eb_flag && delegator->pd_get_flag) {
+-		pr_info("sipa will power off\n");
++					struct sipa_delegator, restart_work);
++
++	mutex_lock(&delegator->power_lock);
++	if (delegator->pd_get_flag) {
+ 		sipa_set_enabled(false);
+-		if (s_cp_delegator->delegator.cfg->sipa_sys_eb)
++		if (delegator->cfg->sipa_sys_eb)
+ 			pm_runtime_put(delegator->pdev);
+-		delegator->pd_eb_flag = false;
++		else
++			pm_relax(delegator->pdev);
+ 		delegator->pd_get_flag = false;
+ 	}
+-
++	delegator->pd_eb_flag = false;
+ 	if (delegator->cons_ref_cnt) {
+-		pr_info("sipa will release resource\n");
+ 		delegator->cons_ref_cnt--;
+ 		sipa_rm_release_resource(delegator->cons_user);
+ 	}
+-
+-	if (!delegator->cfg->sipa_sys_eb) {
+-		pm_relax(delegator->pdev);
+-		pr_info("sipa_dele pm relax\n");
+-	}
+-
+-	spin_unlock_irqrestore(&delegator->lock, flags);
++	mutex_unlock(&delegator->power_lock);
+ }
+ 
+ static ssize_t sipa_dele_reset_show(struct device *dev,
+@@ -227,7 +219,6 @@
+ 	s_cp_delegator->delegator.pd_eb_flag = false;
+ 	s_cp_delegator->delegator.pd_get_flag = false;
+ 	s_cp_delegator->delegator.smsg_cnt = 0;
+-	sipa_delegator_start(&s_cp_delegator->delegator);
+ 
+ 	if (s_cp_delegator->delegator.cfg->sipa_sys_eb)
+ 		pm_runtime_enable(s_cp_delegator->delegator.pdev);
+@@ -235,22 +226,36 @@
+ 	if (!s_cp_delegator->delegator.restart_wq) {
+ 		dev_err(s_cp_delegator->delegator.pdev,
+ 			"sipa_dele_restart_wq create failed\n");
++		sipa_delegator_exit(&s_cp_delegator->delegator);
++		if (s_cp_delegator->delegator.cfg->sipa_sys_eb)
++			pm_runtime_disable(s_cp_delegator->delegator.pdev);
+ 		return -ENOMEM;
+ 	}
+ 	INIT_DELAYED_WORK(&s_cp_delegator->delegator.restart_work,
+ 			  cp_dele_restart_handler);
++	mutex_init(&s_cp_delegator->delegator.power_lock);
++	ret = sipa_delegator_start(&s_cp_delegator->delegator);
++	if (ret) {
++		destroy_workqueue(s_cp_delegator->delegator.restart_wq);
++		sipa_delegator_exit(&s_cp_delegator->delegator);
++		if (s_cp_delegator->delegator.cfg->sipa_sys_eb)
++			pm_runtime_disable(s_cp_delegator->delegator.pdev);
++		return ret;
++	}
+ 
+ 	ret = sipa_rm_add_dependency(SIPA_RM_RES_CONS_WIFI_UL,
+ 				     s_cp_delegator->delegator.prod_id);
+-	if (ret)
+-		return ret;
++	if (ret && ret != -EINPROGRESS)
++		dev_warn(params->pdev, "CONS_WIFI_UL dependency: %d\n", ret);
+ 
+ 	ret = sipa_rm_add_dependency(SIPA_RM_RES_CONS_WIFI_DL,
+ 				     s_cp_delegator->delegator.prod_id);
+-	if (ret)
+-		return ret;
++	if (ret && ret != -EINPROGRESS)
++		dev_warn(params->pdev, "CONS_WIFI_DL dependency: %d\n", ret);
+ 
+ 	sipa_dele_init_sysfs(s_cp_delegator);
++	/* All callbacks, power state and resources are ready before CP commands. */
++	wake_up_process(s_cp_delegator->delegator.thread);
+ 
+ 	return 0;
+ }
+--- a/drivers/unisoc_platform/net/sipa_delegate/sipa_dele_cmn.c
++++ b/drivers/unisoc_platform/net/sipa_delegate/sipa_dele_cmn.c
+@@ -334,7 +334,7 @@
+ 		break;
+ 	case SIPA_DELE_REQUESTING:
+ 		delegator->stat = SIPA_DELE_RELEASING;
+-		sipa_dele_start_rls_work(delegator);
++		/* Wait for REQUEST completion; on_done emits exactly one RELEASE. */
+ 		ret = -EINPROGRESS;
+ 		break;
+ 	case SIPA_DELE_RELEASING:
+@@ -469,8 +469,7 @@
+ 	int ret;
+ 
+ 	pr_debug("prod_id:%d\n", delegator->prod_id);
+-	/* start monitor thread */
+-	wake_up_process(delegator->thread);
++	/* cp_delegator_init starts the thread after all setup succeeds. */
+ 
+ 	/* sipa resource manage operations */
+ 	rm_params.name = delegator->prod_id;
+@@ -486,6 +485,9 @@
+ 
+ 	ret = sipa_rm_add_dependency(delegator->cons_prod,
+ 				     delegator->prod_id);
++	/* Like MU300: the asynchronous grant is a valid dependency. */
++	if (ret == -EINPROGRESS)
++		ret = 0;
+ 	if (ret)
+ 		goto del_res;
+ 
+--- a/drivers/unisoc_platform/net/sipa_delegate/sipa_dele_priv.h
++++ b/drivers/unisoc_platform/net/sipa_delegate/sipa_dele_priv.h
+@@ -13,6 +13,7 @@
+ 
+ #ifndef _SIPA_DELE_PRIV_H_
+ #define _SIPA_DELE_PRIV_H_
++#include <linux/mutex.h>
+ #include <linux/sipc.h>
+ #include <linux/sipa.h>
+ 
+@@ -75,6 +76,7 @@
+ 	atomic_t requesting_cons;
+ 	bool pd_eb_flag;
+ 	bool pd_get_flag;
++	struct mutex power_lock;
+ 	spinlock_t lock;
+ 	struct task_struct *thread;
+ 	struct work_struct notify_work;
+--- a/drivers/unisoc_platform/net/sipa_v3/sipa_skb_send.c
++++ b/drivers/unisoc_platform/net/sipa_v3/sipa_skb_send.c
+@@ -112,7 +112,6 @@
+ 
+ static bool sipa_do_free_skb(struct sipa_node_desc_tag *node)
+ {
+-	int retry_cnt = 10;
+ 	unsigned long flags;
+ 	struct sipa_skb_dma_addr_pair *iter, *_iter;
+ 	struct sipa_plat_drv_cfg *ipa = sipa_get_ctrl_pointer();
+@@ -120,7 +119,6 @@
+ 
+ 	spin_lock_irqsave(&sender->send_lock, flags);
+ 
+-check_again:
+ 	list_for_each_entry_safe(iter, _iter,
+ 				 &sender->sending_list, list) {
+ 		if (iter->dma_addr == node->address) {
+@@ -142,9 +140,6 @@
+ 		}
+ 	}
+ 
+-	if (retry_cnt-- != 0)
+-		goto check_again;
+-
+ 	spin_unlock_irqrestore(&sender->send_lock, flags);
+ 
+ 	return false;
+@@ -165,7 +160,7 @@
+ 	sipa_hal_cmn_fifo_get_filled_depth(sender->dev,
+ 					   sender->ep->send_fifo.idx,
+ 					   NULL, &num);
+-	if (!num || list_empty(&sender->sending_list))
++	if (!num)
+ 		return;
+ 
+ 	sipa_hal_sync_node_from_tx_fifo(sender->dev,
+@@ -175,24 +170,25 @@
+ 		node = sipa_hal_get_tx_node_rptr(sender->dev,
+ 						 sender->ep->send_fifo.idx, i);
+ 		if (!node) {
+-			dev_err(sender->dev, "sender node is null\n");
+-			return;
++			dev_err_ratelimited(sender->dev, "sender node is null\n");
++			break;
+ 		}
+ 
++		/* An errored completion still owns a buffer that must be reclaimed. */
+ 		ret = sipa_do_free_skb(node);
+ 		if (ret)
+ 			success_cnt++;
+ 		else
+-			break;
++			dev_warn_ratelimited(sender->dev, "unmatched TX completion at %u\n", i);
+ 	}
+ 
+ 	if (success_cnt != num)
+-		dev_err(sender->dev,
++		dev_err_ratelimited(sender->dev,
+ 			"skb can not free, recv num = %d release num = %d\n",
+ 			num, success_cnt);
+ 
+ 	sipa_hal_add_tx_fifo_rptr(sender->dev,
+-				  sender->ep->send_fifo.idx, num);
++				  sender->ep->send_fifo.idx, i);
+ 	atomic_add(success_cnt, &sender->left_cnt);
+ 	if (sender->free_notify_net &&
+ 	    atomic_read(&sender->left_cnt) >
+--- a/drivers/unisoc_platform/net/sipa_v3/sipa_eth.c
++++ b/drivers/unisoc_platform/net/sipa_v3/sipa_eth.c
+@@ -93,6 +93,7 @@
+ 	int ret = 0;
+ 	int netid;
+ 	unsigned int len;
++	bool pushed_header = false;
+ 	struct iphdr *iph;
+ 	struct ipv6hdr *ipv6h;
+ 
+@@ -107,7 +108,7 @@
+ 	if (unlikely(ret)) {
+ 		stats->tx_dropped++;
+ 		dev_kfree_skb_any(skb);
+-		return ret;
++		return NETDEV_TX_OK;
+ 	}
+ 
+ 	netid = pdata->netid;
+@@ -133,25 +134,27 @@
+ 	 * the IPv6 forwarding packet is without ethernet header
+ 	 */
+ 	if (likely(skb_headroom(skb) >= ETH_HLEN)) {
+-		if (skb->mac_header == skb->network_header)
++		if (skb->mac_header == skb->network_header) {
+ 			skb_push(skb, ETH_HLEN);
++			pushed_header = true;
++		}
+ 	}
+ 
+ 	ret = sipa_nic_tx(sipa_eth->nic_id, pdata->src_id, netid, skb);
+ 	if (unlikely(ret != 0)) {
+-        pr_err("%s fail to send, ret %d\n",
+-               dev->name, ret);
+-        stats->tx_dropped++;
+-		stats->tx_errors++;
+-        if (ret == -EAGAIN ||
+-            sipa_nic_check_flow_ctrl(sipa_eth->nic_id)) {
+-            spin_lock_irqsave(&queue_lock, queue_lock_flags);
++		/* BUSY leaves skb ownership with the stack. Undo our header first. */
++		if (pushed_header)
++			skb_pull(skb, ETH_HLEN);
++		spin_lock_irqsave(&queue_lock, queue_lock_flags);
++		if (ret == -EAGAIN || sipa_nic_check_flow_ctrl(sipa_eth->nic_id))
+ 			netif_stop_queue(dev);
+-            spin_unlock_irqrestore(&queue_lock, queue_lock_flags);
+-			pr_info("stop queue on dev %s\n", dev->name);
+-            return NETDEV_TX_BUSY;
++		spin_unlock_irqrestore(&queue_lock, queue_lock_flags);
++		/* Like MU300: arm recovery even after the queue has been stopped. */
++		sipa_nic_trigger_flow_ctrl_work(sipa_eth->nic_id, ret);
++		if (ret != -EAGAIN && ret != -EINPROGRESS) {
++			stats->tx_errors++;
++			pr_err_ratelimited("%s fail to send, ret %d\n", dev->name, ret);
+ 		}
+-		sipa_nic_trigger_flow_ctrl_work(sipa_eth->nic_id, ret);
+ 		return NETDEV_TX_BUSY;
+ 	}
+ 

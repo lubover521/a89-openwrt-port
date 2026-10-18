@@ -1,0 +1,19 @@
+#!/bin/sh /etc/rc.common
+# Gadget rebind can recreate usb0 after netifd's one-shot LAN hotplug event.
+START=25
+USE_PROCD=1
+
+start_service() {
+    procd_open_instance
+    procd_set_param command /bin/sh -c '
+        while :; do
+            if [ -e /sys/class/net/usb0 ] && [ -d /sys/class/net/br-lan/bridge ] &&
+               [ ! -e /sys/class/net/br-lan/brif/usb0 ]; then
+                ip link set usb0 master br-lan &&
+                    logger -t t551m-usb "Attached USB to LAN bridge"
+            fi
+            sleep 3
+        done'
+    procd_set_param respawn 60 5 3
+    procd_close_instance
+}

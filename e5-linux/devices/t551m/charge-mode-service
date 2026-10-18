@@ -1,0 +1,8 @@
+#!/bin/sh /etc/rc.common
+# Synchronous boot gate, after hardware/logging and before vendor/network.
+# A manual service start on a running system must never re-enter charging.
+START=14
+
+boot() {
+    /usr/bin/python3 /usr/libexec/e5-charge-mode
+}

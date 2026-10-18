@@ -1,0 +1,171 @@
+#!/bin/sh
+# The info screen's apps (plugins): list, install, remove.
+#
+#   plugin list              one line per app: id<TAB>version<TAB>builtin|user<TAB>name
+#   plugin install FILE      a .tar.gz / .tgz / .zip holding one app (docs/API.md 5.5)
+#   plugin remove ID
+#   plugin link              the installed apps into the web root (at every start)
+#   plugin store             the app store's index into $STORE (e5-infoscreen.main.store_url)
+#   plugin get ID            ID from the store: its package, checked against the index's SHA-256
+#                            and size, then installed as above
+#
+# The two that come with the screen live in the image (www/plugins, "builtin");
+# installed ones in /etc/e5-infoscreen/plugins, which an image update keeps
+# (e5-linux's device-install-image.sh carries /etc/e5-infoscreen over), each
+# linked into www/plugins/<id> for the web server.  An installed app with the
+# id of a built-in one takes its place.
+#
+# A package is trusted code (a backend runs as root, docs/API.md 1): install
+# only what you have read.  What is checked: a manifest.json with a valid id
+# and an api_version the screen has, at the top of the archive or in its one
+# top directory; no absolute path, no "..", no link, at most 20 MB unpacked.
+WWW=/usr/share/e5-infoscreen/www/plugins
+USER_DIR=/etc/e5-infoscreen/plugins
+API_VERSION=2
+MAX_KB=20480
+STORE=/tmp/run/e5-infoscreen/store.json
+STORE_URL=https://enceka.github.io/infoscreen-plugins/index.json
+
+die() { echo "error: $*" >&2; exit 1; }
+valid_id() { echo "$1" | grep -qE '^[a-z0-9][a-z0-9_-]{0,31}$'; }
+unzip_() { command -v unzip >/dev/null && unzip "$@" || /opt/e5/bin/busybox unzip "$@"; }
+
+manifest_get() { jsonfilter -i "$1/manifest.json" -e "$2" 2>/dev/null; }
+
+do_link() {
+	mkdir -p "$USER_DIR" "$WWW"
+	# stale links (an app removed, an image update) out, the installed ones in
+	for l in "$WWW"/*; do
+		[ -L "$l" ] && [ ! -d "$l" ] && rm -f "$l"
+	done
+	for d in "$USER_DIR"/*; do
+		[ -f "$d/manifest.json" ] || continue
+		id=$(basename "$d")
+		# (a built-in directory of the same id gives way to the installed app)
+		[ -d "$WWW/$id" ] && [ ! -L "$WWW/$id" ] && rm -rf "$WWW/$id"
+		[ -L "$WWW/$id" ] || ln -s "$d" "$WWW/$id"
+	done
+}
+
+do_list() {
+	for d in "$WWW"/*; do
+		[ -f "$d/manifest.json" ] || continue
+		id=$(basename "$d")
+		kind=builtin; [ -L "$d" ] && kind=user
+		name=$(manifest_get "$d" '@.name.zh' || true)
+		[ -n "$name" ] || name=$(manifest_get "$d" '@.name' || true)
+		printf '%s\t%s\t%s\t%s\n' "$id" "$(manifest_get "$d" '@.version')" "$kind" "$name"
+	done
+}
+
+do_install() {
+	f=${1:?file}
+	[ -f "$f" ] || die "no such file: $f"
+	T=$(mktemp -d /tmp/e5-plugin.XXXXXX) || die "no temporary directory"
+	trap 'rm -rf "$T"' EXIT
+	# the kind by its first bytes (LuCI's upload has one file name for both)
+	case "$(head -c 2 "$f" | od -An -tx1 | tr -d ' \n')" in
+		504b) kind=zip ;;
+		1f8b) kind=tgz ;;
+		*) die "not a .tar.gz or .zip archive" ;;
+	esac
+	case $kind in
+		zip) list=$(unzip_ -l "$f" 2>/dev/null | awk 'NR > 3 && $4 != "" && $4 != "----" {print $4}') ;;
+		tgz) list=$(tar -tzf "$f" 2>/dev/null) ;;
+	esac
+	[ -n "$list" ] || die "not a .tar.gz or .zip archive"
+	echo "$list" | grep -qE '(^/|(^|/)\.\.(/|$))' && die "the archive has absolute paths or .."
+	mkdir "$T/x"
+	case $kind in
+		zip) unzip_ -q "$f" -d "$T/x" >/dev/null 2>&1 || die "cannot unpack" ;;
+		tgz) tar -xzf "$f" -C "$T/x" 2>/dev/null || die "cannot unpack" ;;
+	esac
+	[ -z "$(find "$T/x" -type l)" ] || die "the archive has links"
+	[ "$(du -sk "$T/x" | cut -f1)" -le $MAX_KB ] || die "more than 20 MB unpacked"
+	# the app: the top of the archive, or its one top directory
+	src=$T/x
+	if [ ! -f "$src/manifest.json" ]; then
+		set -- "$T"/x/*
+		[ $# = 1 ] && [ -d "$1" ] && [ -f "$1/manifest.json" ] && src=$1
+	fi
+	[ -f "$src/manifest.json" ] || die "no manifest.json"
+	id=$(manifest_get "$src" '@.id')
+	valid_id "$id" || die "the manifest's id is not valid: $id"
+	required=$(manifest_get "$USER_DIR/$id" '@.device_integration')
+	[ -n "$required" ] || required=$(manifest_get "$WWW/$id" '@.device_integration')
+	[ -z "$required" ] || [ "$(manifest_get "$src" '@.device_integration')" = "$required" ] ||
+		die "This app requires its device-integrated update; the generic package would replace platform features"
+	# (from the store: the app the index said)
+	[ -z "${EXPECT_ID:-}" ] || [ "$id" = "$EXPECT_ID" ] || die "the package holds $id, not $EXPECT_ID"
+	av=$(manifest_get "$src" '@.api_version')
+	case "$av" in ''|*[!0-9]*) die "the manifest has no api_version" ;; esac
+	[ "$av" -le $API_VERSION ] || die "the app needs API $av, the screen has $API_VERSION"
+	[ -n "$(manifest_get "$src" '@.name')" ] || die "the manifest has no name"
+	mkdir -p "$USER_DIR"
+	rm -rf "$USER_DIR/$id.new"
+	cp -a "$src" "$USER_DIR/$id.new" || die "cannot copy"
+	chmod -R u=rwX,go=rX "$USER_DIR/$id.new"
+	rm -rf "$USER_DIR/$id"
+	mv "$USER_DIR/$id.new" "$USER_DIR/$id"
+	do_link
+	echo "installed $id $(manifest_get "$USER_DIR/$id" '@.version')"
+}
+
+do_remove() {
+	id=${1:?id}
+	valid_id "$id" || die "not a valid id: $id"
+	if [ -d "$USER_DIR/$id" ]; then
+		rm -rf "$USER_DIR/$id"
+		rm -f "$WWW/$id"
+	elif [ -d "$WWW/$id" ]; then
+		# a built-in one: gone until the next image update puts it back
+		rm -rf "$WWW/$id"
+	else
+		die "no app $id"
+	fi
+	echo "removed $id"
+}
+
+# (curl when the image has it, else OpenWrt's own wget -- uclient-fetch, which does HTTPS too)
+fetch() {
+	if command -v curl >/dev/null 2>&1; then
+		curl -fsSL --connect-timeout 10 --max-time "$3" -o "$2" "$1"
+	else
+		timeout "$3" wget -q -T 10 -O "$2" "$1"
+	fi
+}
+
+do_store() {
+	url=$(uci -q get e5-infoscreen.main.store_url); [ -n "$url" ] || url=$STORE_URL
+	mkdir -p "$(dirname "$STORE")"
+	fetch "$url" "$STORE.part" 30 || { rm -f "$STORE.part"; die "cannot fetch $url"; }
+	jsonfilter -i "$STORE.part" -e '@.plugins' >/dev/null 2>&1 || { rm -f "$STORE.part"; die "not a store index"; }
+	mv "$STORE.part" "$STORE"
+	jsonfilter -i "$STORE" -e '@.plugins[*].id' | wc -l | sed 's/$/ apps in the store/'
+}
+
+do_get() {
+	id=${1:?id}
+	valid_id "$id" || die "not a valid id: $id"
+	[ -f "$STORE" ] || do_store >/dev/null || exit 1
+	q() { jsonfilter -i "$STORE" -e "@.plugins[@.id='$id'].$1" 2>/dev/null; }
+	url=$(q url) sum=$(q sha256) size=$(q size)
+	[ -n "$url" ] && [ -n "$sum" ] || die "$id is not in the store"
+	[ -z "$size" ] || [ "$size" -le $((MAX_KB * 1024)) ] || die "the package is too big"
+	f=$(mktemp /tmp/e5-store.XXXXXX) || die "no temporary file"
+	fetch "$url" "$f" 300 || { rm -f "$f"; die "cannot fetch $url"; }
+	if [ "$(sha256sum "$f" | cut -d' ' -f1)" != "$sum" ]; then rm -f "$f"; die "SHA-256 mismatch"; fi
+	( EXPECT_ID=$id do_install "$f" ); rc=$?
+	rm -f "$f"
+	return $rc
+}
+
+case "${1:-}" in
+	list) do_list ;;
+	store) do_store ;;
+	get) do_get "$2" ;;
+	install) do_install "$2" ;;
+	remove) do_remove "$2" ;;
+	link) do_link ;;
+	*) sed -n '2,12p' "$0"; exit 2 ;;
+esac

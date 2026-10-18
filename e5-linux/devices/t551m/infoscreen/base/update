@@ -1,0 +1,127 @@
+#!/bin/sh
+# The info screen's own update, online (docs/API.md 6): its files only, no new
+# system image needed.
+#
+#   update version    this version (/usr/share/e5-infoscreen/VERSION)
+#   update fetch      the latest release's description into $STATE
+#   update apply      that release, when it is newer: download, check, install,
+#                     restart the screen
+#   update rollback   the files the last update replaced, back
+#
+# The release description (e5-infoscreen.main.update_url, by default the
+# Pages update feed; the GitHub Releases feed remains a fallback for old
+# installations and explicit legacy settings):
+#   { "version": "1.2.0", "url": "https://.../e5-infoscreen-1.2.0.tar.gz",
+#     "sha256": "...", "size": 123456, "notes": { "zh": "...", "en": "..." } }
+# The package is the repository's root/ tree.  Checked: its size and SHA-256,
+# and every path in it -- under usr/, www/ or etc/, not etc/config (the
+# settings) nor etc/e5-infoscreen (the installed apps), no "..", no absolute
+# path, no link, at most 20 MB.  What it replaces goes into $BACKUP first.
+VF=/usr/share/e5-infoscreen/VERSION
+RUN=/tmp/run/e5-infoscreen
+STATE=$RUN/latest.json
+BACKUP=/etc/e5-infoscreen/update-backup.tar.gz
+DEFAULT_URL=https://enceka.github.io/infoscreen/latest.json
+LEGACY_URL=https://github.com/Enceka/e5-infoscreen/releases/latest/download/latest.json
+MAX_BYTES=20971520
+
+die() { echo "error: $*" >&2; exit 1; }
+current() { cat "$VF" 2>/dev/null || echo 0; }
+compatible_archive() {
+	marker=usr/share/e5-infoscreen/ADAPTATION
+	[ -s "/$marker" ] || return 0
+	expected=$(cat "/$marker")
+	actual=$(tar -xzOf "$1" "$marker" 2>/dev/null || tar -xzOf "$1" "./$marker" 2>/dev/null || true)
+	[ "$actual" = "$expected" ] || die "This package does not include the device UI integration; use a compatible firmware/update package"
+}
+# true when dotted version $1 is newer than $2
+newer() {
+	awk -v a="$1" -v b="$2" 'BEGIN { n = split(a, x, "."); m = split(b, y, "."); k = n > m ? n : m
+		for (i = 1; i <= k; i++) { if (x[i] + 0 > y[i] + 0) exit 0; if (x[i] + 0 < y[i] + 0) exit 1 }
+		exit 1 }'
+}
+# (curl when the image has it, else OpenWrt's own wget -- uclient-fetch, which does HTTPS too)
+fetch() {
+	if command -v curl >/dev/null 2>&1; then
+		curl -fsSL --connect-timeout 10 --max-time "$3" -o "$2" "$1"
+	else
+		timeout "$3" wget -q -T 10 -O "$2" "$1"
+	fi
+}
+get() { jsonfilter -i "$STATE" -e "$1" 2>/dev/null; }
+
+do_fetch() {
+	configured=$(uci -q get e5-infoscreen.main.update_url)
+	url=$configured; [ -n "$url" ] || url=$DEFAULT_URL
+	mkdir -p "$RUN"
+	if ! fetch "$url" "$STATE.part" 30 || ! jsonfilter -i "$STATE.part" -e '@.version' >/dev/null 2>&1; then
+		rm -f "$STATE.part"
+		if [ -n "$configured" ] || [ "$url" = "$LEGACY_URL" ] || ! fetch "$LEGACY_URL" "$STATE.part" 30 || ! jsonfilter -i "$STATE.part" -e '@.version' >/dev/null 2>&1; then
+			rm -f "$STATE.part"; die "cannot fetch a release description from $url or $LEGACY_URL"
+		fi
+		url=$LEGACY_URL
+	fi
+	mv "$STATE.part" "$STATE"
+	v=$(get '@.version')
+	if newer "$v" "$(current)"; then echo "newer $v"; else echo "current $(current) (latest $v)"; fi
+}
+
+install_archive() {
+	archive=$1
+	[ -f "$archive" ] || die "no such package"
+	compatible_archive "$archive"
+	[ "$(wc -c < "$archive")" -le "$MAX_BYTES" ] || die "the package is too big"
+	T=$(mktemp -d /tmp/e5-update.XXXXXX) || die "no temporary directory"
+	tar -tzvf "$archive" > "$T/list" 2>/dev/null || die "not a tar.gz"
+	# (the type is the first character of tar -v: - regular, d directory)
+	awk '{ print substr($1, 1, 1) }' "$T/list" | grep -qv '^[-d]$' && die "the package holds links or special files"
+	tar -tzf "$archive" | sed 's|^\./||' | grep -v '^$' > "$T/names"
+	grep -qE '(^|/)\.\.(/|$)|^/' "$T/names" && die "the package holds absolute paths or .."
+	grep -qvE '^(usr|www|etc)(/|$)' "$T/names" && die "the package holds paths outside usr/, www/ and etc/"
+	grep -qE '^etc/(config|e5-infoscreen)(/|$)' "$T/names" && die "the package would touch the settings or the installed apps"
+	grep -qx 'usr/share/e5-infoscreen/VERSION' "$T/names" || die "the package has no VERSION"
+	v=$(tar -xzOf "$archive" usr/share/e5-infoscreen/VERSION 2>/dev/null || tar -xzOf "$archive" ./usr/share/e5-infoscreen/VERSION 2>/dev/null || true)
+	v=$(printf '%s' "$v" | tr -d '\r\n')
+	newer "$v" "$(current)" || die "$v is not newer than $(current)"
+	# the files it replaces, for update rollback
+	( cd / && for f in $(cat "$T/names"); do [ -f "$f" ] && echo "$f"; done ) > "$T/old"
+	mkdir -p "$(dirname "$BACKUP")"
+	tar -czf "$BACKUP" -C / -T "$T/old" 2>/dev/null || die "cannot save the files it replaces"
+	tar -xzf "$archive" -C / || die "unpacking failed (the old files: update rollback)"
+	/etc/init.d/rpcd reload >/dev/null 2>&1
+	echo "installed $v (was: $(tar -xzOf "$BACKUP" usr/share/e5-infoscreen/VERSION 2>/dev/null || echo '?'))"
+	rm -rf "$T"
+	( sleep 1; /etc/init.d/e5-infoscreen restart ) >/dev/null 2>&1 &
+}
+
+do_apply() {
+	[ -f "$STATE" ] || do_fetch >/dev/null || exit 1
+	v=$(get '@.version') url=$(get '@.url') sum=$(get '@.sha256') size=$(get '@.size')
+	[ -n "$v" ] && [ -n "$url" ] && [ -n "$sum" ] || die "the release description lacks version, url or sha256"
+	[ "$1" = --force ] || newer "$v" "$(current)" || die "$v is not newer than $(current)"
+	[ -z "$size" ] || [ "$size" -le "$MAX_BYTES" ] || die "the package is too big ($size bytes)"
+	D=$(mktemp -d /tmp/e5-update.XXXXXX) || die "no temporary directory"
+	trap 'rm -rf "$D"' EXIT
+	echo "downloading $v"
+	fetch "$url" "$D/p.tar.gz" 300 || die "cannot fetch $url"
+	[ "$(sha256sum "$D/p.tar.gz" | cut -d' ' -f1)" = "$sum" ] || die "SHA-256 mismatch"
+	install_archive "$D/p.tar.gz"
+}
+
+do_rollback() {
+	[ -f "$BACKUP" ] || die "no backup: no update was installed"
+	compatible_archive "$BACKUP"
+	tar -xzf "$BACKUP" -C / || die "restoring failed"
+	echo "back to $(current)"
+	rm -f "$BACKUP" "$STATE"
+	( sleep 1; /etc/init.d/e5-infoscreen restart ) >/dev/null 2>&1 &
+}
+
+case "${1:-}" in
+	version) current ;;
+	fetch) do_fetch ;;
+	apply) do_apply "${2:-}" ;;
+	rollback) do_rollback ;;
+	install) install_archive "${2:-}" ;;
+	*) echo "usage: update version | fetch | apply [--force] | install FILE | rollback" >&2; exit 2 ;;
+esac

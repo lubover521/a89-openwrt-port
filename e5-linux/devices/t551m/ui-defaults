@@ -1,0 +1,27 @@
+#!/bin/sh
+set -e
+cd /opt/e5/ui-packages
+sha256sum -c SHA256SUMS
+apk add --no-network --allow-untrusted ./*.apk
+python3 /opt/e5/t551m-ui-compat
+uci set luci.main.mediaurlbase='/luci-static/aurora'
+uci commit luci
+# Aurora replaces Argon; keep LuCI's Bootstrap fallback available.
+for package in luci-theme-argon luci-app-argon-config luci-i18n-argon-config-zh-cn; do
+    if apk info -e "$package" >/dev/null 2>&1; then apk del --no-network "$package"; fi
+done
+# Remove the superseded pages, retaining the shared inbox/forwarding backend.
+python3 /opt/e5/t551m-ui-cleanup
+# Independent nr2 terminal and nr6/nr7 collector workers; MM owns network/SMS.
+/etc/init.d/t551m-at enable
+/etc/init.d/t551m-screen-power enable
+/usr/libexec/rpcd/t551m-screen setup
+/etc/init.d/unisoc-modem-ui enable
+/etc/init.d/unisoc-traffic enable
+/etc/init.d/e5-cpu disable
+/etc/init.d/e5-cpu enable
+# Existing e5-sms-notify still owns receipt; this service only watches power.
+/etc/init.d/unisoc-sms-forward enable
+/etc/init.d/unisoc-sms-forward start
+rm -f /tmp/luci-indexcache
+exit 0

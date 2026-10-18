@@ -1,0 +1,9 @@
+.DS_Store
+__pycache__/
+*.pyc
+/out/
+/work/
+/overlay/lib/firmware/*
+!/overlay/lib/firmware/regulatory.db
+!/overlay/lib/firmware/regulatory.db.p7s
+/overlay/mnt/vendor/*

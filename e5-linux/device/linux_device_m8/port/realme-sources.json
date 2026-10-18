@@ -1,0 +1,7 @@
+{
+  "repository": "https://github.com/realme-kernel-opensource/realme_C51_C53_Narzo-N53-AndroidT-kernel-source",
+  "commit": "4381465ccaf87fcf3215b9cd42f4a685df40e5e0",
+  "files": {
+    "drivers/pinctrl/sprd/pinctrl-sprd-qogirn6pro.c": "0b45a6c2ac3dede193f524957b669757719e2a44beba87540c46eee4fdd37db4"
+  }
+}
