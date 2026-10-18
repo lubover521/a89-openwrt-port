@@ -1,0 +1,5 @@
+# a89-openwrt-port 根目录补充规则。
+# 嵌套的 e5-linux/.gitignore 已覆盖 dumps/ work/ out/ out_linux/ *.img *.ko
+# 等全部构建产物与手机转储，这里只补顶层缺的：
+e5-linux/linux-lts-e5/
+portable-git/

@@ -1,0 +1,66 @@
+# e5-linux: build outputs, device dumps and vendor blobs are never committed.
+# The reference checkouts used while bringing this up are not part of the repo:
+# mu300-linux/ and kernel_sprd_ums9158/ (upstream sources to compare against) and
+# UFI-TOOLS/, which is a checkout with a git repository of its own.
+mu300-linux/
+kernel_sprd_ums9158/
+UFI-TOOLS/
+
+# unisoc-cpd is an independent repository of its own
+# (https://github.com/Enceka/unisoc-cpd), developed outside this tree with its
+# own findings log; a checkout may sit here untracked, but nothing in this
+# repo depends on it being present.  Anchored: the overlay's etc/unisoc-cpd/
+# is tracked (rootfs/stage-unisoc-cpd.sh writes it).
+/unisoc-cpd/
+
+# linux-lts-e5 is the mainline kernel, a repository of its own
+# (https://github.com/Enceka/linux-lts-e5, Linux 6.18.y plus the E5 port);
+# upstream/ builds it.
+/linux-lts-e5/
+
+# Separate source repositories checked out by GitHub Actions.
+/ci/
+
+# build trees / outputs
+out_linux/
+out_modules/
+work/
+*.img
+*.dtb
+*.dtbo
+*.ko
+!boot/*.ko
+
+# device dumps and Android runtime subsets (extracted from *your* device)
+dumps/
+stock-img/
+kernel_probe/
+log-img/
+logs/
+android-subset/
+refer/
+firmware/
+busybox
+
+# rootfs build products
+rootfs/*.tar
+rootfs/*.tar.gz
+rootfs/*.ext4
+
+# WCN factory data pulled off the device by rootfs/pull-wcn-firmware.sh (vendor
+# blobs, never committed; the firmware/ rule above already covers /lib/firmware)
+rootfs/overlay/mnt/vendor/wifimac.txt
+rootfs/overlay/mnt/vendor/btmac.txt
+
+# Vendor blob bundles fetched from upstream (e.g. CoreELEC opengl-meson):
+# 100 MB of GPU binaries that the repo must never carry.
+opengl-meson.tgz
+
+# rootfs build output (out/rootfs.ext4 is 8 GiB) and macOS droppings: the repo
+# carries the scripts that build these, never the results.
+out/
+out-release/
+.DS_Store
+
+# python bytecode left by running the tools
+__pycache__/

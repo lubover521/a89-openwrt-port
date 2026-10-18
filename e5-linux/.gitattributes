@@ -1,0 +1,8 @@
+# Imported M8 sources are checksum-pinned to their upstream bytes. Preserve
+# original line endings and whitespace; adaptation lives in the port scripts.
+devices/m8/port/** -text -whitespace
+
+# Shared installer build fingerprints must match Windows and Linux checkouts.
+installer/** text=auto eol=lf
+installer/ui/src-tauri/icons/*.ico binary
+installer/screenshots/*.png binary

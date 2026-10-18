@@ -1,0 +1,1073 @@
+#!/bin/busybox sh
+# e5-linux standalone initramfs init for the Rongyue E5 (Unisoc UMS9621 / ums9158_1h10).
+#
+# Booted from slot b. Follows the mu300-linux design:
+#   * load the rebuilt modules in a fixed order (boot/module-order.txt)
+#   * restore slot a in misc unless /etc/e5linux/default-boot says otherwise,
+#     so a Linux boot that never reaches userspace falls back to Android
+#   * bring up a USB gadget (ECM network + CDC-ACM console) before anything else
+#   * mount the Linux root filesystem and switch_root to systemd
+#   * if there is no root filesystem, stay standalone (telnet + serial) and
+#     reboot back to Android after a timeout
+#
+# Everything is written to /dev/kmsg (-> ramoops console) and to a 4 MiB block
+# inside boot_b, which survives a cold power cycle (pstore does not).
+/bin/busybox mkdir -p /bin /sbin /proc /sys /dev /run /tmp /root /etc
+/bin/busybox --install -s /bin
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin HOME=/root TERM=vt100
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+# 4, not 7: at 7 each info line costs ~10 ms of synchronous serial console
+# output in whoever printed it, and the module-loading phase prints ~2000 of
+# them (~20 s of boot time, measured 2026-10-12 on T551M). The E5-LINUX:
+# stage lines are err-level, so the boot progression stays on the console;
+# the real root also uses 4 (etc/sysctl.d/10-e5-printk.conf).
+echo 4 > /proc/sys/kernel/printk
+if ! mount -t devtmpfs -o mode=0755 devtmpfs /dev 2>/dev/null; then
+    mount -t tmpfs -o mode=0755 tmpfs /dev
+    mknod /dev/null c 1 3
+    mknod /dev/console c 5 1
+    mknod /dev/kmsg c 1 11
+    mknod /dev/zero c 1 5
+    mknod /dev/urandom c 1 9
+fi
+pmsg_major=$(awk '$2=="pmsg"{print $1}' /proc/devices)
+[ -n "$pmsg_major" ] && [ ! -e /dev/pmsg0 ] && mknod /dev/pmsg0 c "$pmsg_major" 0
+
+log() {
+    echo "<3>E5-LINUX: $*" > /dev/kmsg
+    [ -c /dev/pmsg0 ] && echo "E5-LINUX: $*" > /dev/pmsg0
+    echo "$(cut -d' ' -f1 /proc/uptime) $*" >> /run/stages
+}
+
+# Persistent log: 4 MiB at 56 MiB inside boot_b, past the image and its AVB data.
+# boot/build-boot-image.py refuses to build an image that overlaps this block.
+bootb=
+PERSIST_SEEK_BLOCKS=14336      # 56 MiB / 4096
+persist() {
+    [ -n "$bootb" ] && [ -b "$bootb" ] || return
+    # The lock keeps the periodic loop from racing the script's own calls, and it has
+    # to expire on its own: a persist interrupted half way used to leave the lock
+    # behind, after which every later call returned silently and the log simply
+    # stopped, so a boot that died after five minutes had its last record at 14 s.
+    # The stamp deliberately lives *next to* the lock instead of inside it: rmdir
+    # cannot remove a directory that holds the stamp, which is exactly how the lock
+    # stopped being released at all.  Anything older than two minutes is stale by
+    # definition, since the loop runs every fifteen seconds.
+    if [ -d /run/persist.lock ]; then
+        now=$(cut -d. -f1 /proc/uptime)
+        made=$(cat /run/persist.stamp 2>/dev/null)
+        case "$made" in
+            ''|*[!0-9]*) made=0 ;;
+        esac
+        [ $((now - made)) -gt 120 ] || return
+        rm -rf /run/persist.lock /run/persist.stamp
+    fi
+    mkdir /run/persist.lock 2>/dev/null || return
+    echo "$(cut -d. -f1 /proc/uptime)" > /run/persist.stamp 2>/dev/null
+    {
+        echo "E5-PERSIST-BEGIN uptime=$(cut -d' ' -f1 /proc/uptime) release=$(uname -r)"
+        cat /run/stages
+        for f in /run/f2fs-before.log /run/f2fs-repair.log /run/f2fs-after.log \
+                 /run/part-fsck.log /run/part-resize.log /run/part-shrink-check.log \
+                 /run/part-carve.log /run/part-growfs.log /run/part-dd.err; do
+            [ ! -f "$f" ] || { echo "--- $f"; tail -c 131072 "$f"; }
+        done
+        echo "--- cmdline"; cat /proc/cmdline
+        echo "--- lsmod"; cat /proc/modules
+        echo "--- udc"; ls /sys/class/udc 2>&1
+        echo "--- deferred"; cat /sys/kernel/debug/devices_deferred 2>&1
+        echo "--- block"; ls /dev/mmcblk0p* 2>&1 | tr '\n' ' '
+        # pstore records from the PREVIOUS boot (panic/oops tail survive the warm
+        # reset that panic=10 performs).  This persist runs right before
+        # switch-root, so on the second try of an armed trial it carries the
+        # first boot's panic out to Android.  .enc.z records are deflate; the
+        # raw bytes are dumped between markers and inflated on the host.
+        echo; echo "--- pstore"
+        mkdir -p /sys/fs/pstore 2>/dev/null
+        mount -t pstore pstore /sys/fs/pstore 2>/dev/null
+        for f in /sys/fs/pstore/*; do
+            [ -f "$f" ] || continue
+            echo "== pstore file $f"
+            case "$f" in
+                *.enc.z) echo "PSTORE-ZBEGIN $f"; cat "$f"; echo "PSTORE-ZEND $f" ;;
+                *) head -c 262144 "$f" ;;
+            esac
+            echo
+        done
+        umount /sys/fs/pstore 2>/dev/null
+        echo; echo "--- dmesg"; dmesg | tail -c 2000000
+        echo "E5-PERSIST-END"
+    } > /run/persist.txt 2>&1
+    head -c 65536 /dev/zero >> /run/persist.txt
+    dd if=/run/persist.txt of="$bootb" bs=4096 seek=$PERSIST_SEEK_BLOCKS conv=notrunc 2>/dev/null
+    sync
+    rm -rf /run/persist.lock /run/persist.stamp
+}
+
+log "stage=init-start pid=$$ release=$(uname -r)"
+
+mkdir -p /dev/pts
+mount -t devpts -o mode=0620,ptmxmode=0666 devpts /dev/pts 2>/dev/null
+ln -sf pts/ptmx /dev/ptmx
+mount -t tmpfs tmpfs /run
+mount -t tmpfs tmpfs /tmp
+mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+echo /bin/mdev > /proc/sys/kernel/hotplug
+mdev -s
+log "stage=devfs-ready"
+
+# The initramfs carries the rootfs overlay (firmware, factory data, the e5-linux
+# units) so it does not have to be baked into rootfs.ext4 separately.  Materialise
+# it here, before the module pass: the WCN driver's request_firmware() then finds
+# wcnmodem.bin in this root, instead of waiting for the real root filesystem.
+if [ -d /e5-overlay ]; then
+    mkdir -p /lib /mnt
+    cp -a /e5-overlay/lib/. /lib/ 2>/dev/null
+    cp -a /e5-overlay/mnt/. /mnt/ 2>/dev/null
+    cp -a /e5-overlay/etc/. /etc/ 2>/dev/null
+    log "stage=overlay-early files=$(find /e5-overlay -type f | wc -l) firmware=$(ls /lib/firmware 2>/dev/null | wc -l)"
+fi
+
+# Turn hangs into panics so the bootloader slot logic can roll back to Android.
+echo 1 > /proc/sys/kernel/softlockup_panic
+echo 1 > /proc/sys/kernel/panic_on_oops
+echo 1 > /proc/sys/kernel/sysrq
+
+# Locate misc and boot_b.  Reading the partition names out of sysfs needs no
+# modules, so this is attempted before the module pass as well -- but on this
+# platform the eMMC partitions do not appear in /sys/class/block for several
+# seconds, and an attempt that ran only here came up empty for twenty seconds
+# straight (misc=none boot_b=none, and with no boot_b there is no log at all).
+# So the authoritative attempt stays after the module pass, and the early one is
+# best effort: it only exists so that a crash during module loading still leaves
+# a record in boot_b.
+find_partitions() {
+    n=0
+    while [ "$n" -lt "${1:-20}" ]; do
+        for u in /sys/class/block/mmcblk*p*/uevent; do
+            grep -qx PARTNAME=misc "$u" 2>/dev/null && misc=/dev/$(basename "$(dirname "$u")")
+            grep -qx PARTNAME=boot_b "$u" 2>/dev/null && bootb=/dev/$(basename "$(dirname "$u")")
+        done
+        [ -b "$misc" ] && return 0
+        n=$((n + 1))
+        mdev -s
+        sleep 1
+    done
+    return 1
+}
+
+misc=
+bootb=
+find_partitions 6 || true
+persist
+(while :; do sleep 15; persist; done) &
+persist_job=$!
+
+# Safety net: reboot after ten minutes, by which time misc points at slot a again.
+# Create /run/stay (through the serial console or telnet) to keep Linux running.
+# This is the fallback path only -- when a root filesystem is found the timer is
+# killed before switch_root, so a real system never inherits it.  Both background
+# jobs are stopped by pid rather than through `jobs -p`: `jobs -p` does list them
+# in busybox ash, but naming the two pids says exactly what is being stopped and
+# cannot silently stop covering a job if another one is ever added.
+#
+# The decision is written to /dev/kmsg as well as the persistent block, because
+# the persistent block is written through the same code path this timer is
+# supposed to survive, and a reboot with no recorded reason is impossible to
+# diagnose after the fact.
+(sleep 600
+ while [ -e /run/f2fs-repair.running ] || [ -e /run/part-install.running ]; do sleep 5; done
+ if [ -e /run/stay ] || [ -e /data/e5linux/stay ]; then log "stage=timer-skipped"; persist; exit 0; fi
+ log "stage=timer-reboot"
+ echo "<3>E5-LINUX: safety timer expired, no /run/stay -- rebooting to slot a" > /dev/kmsg
+ persist; reboot -f; sleep 10; echo b > /proc/sysrq-trigger) &
+timer_job=$!
+
+# A boot image without the overlay (the flash package's,
+# openwrt/make-flash-bundle.sh) has no firmware of its own: the device's own
+# is on userdata, in the archive its installer pulled
+# (e5linux/device-files.tar), and the WCN driver asks for it as soon as it is
+# loaded, before any root is mounted -- without it the chip never powers on
+# ("failed to power on WCN", no wlan0).  So right before wcn_bsp in the module
+# pass: the eMMC is only probed about 9 s into the boot, after the pass has
+# begun, but it is there by then.  userdata is mounted for the copy and let go
+# again; the root filesystem section mounts it for good.
+# userdata's last F2FS checkpoint, before anything mounts it: whether the
+# system before shut down cleanly (CP_UMOUNT) or left it dirty under the reset
+# (a roll-forward at this mount).  Userdata's F2FS was twice found with foreign
+# blocks in its NAT after a reset; this says what the reset before was.
+f2fs_last_cp() {
+    local dev=$1 cp bpseg base tot ver tail fl best= bestfl=
+    [ -z "$f2fs_cp_logged" ] || return 0
+    f2fs_cp_logged=1
+    u32() { od -A n -t u4 -j "$2" -N 4 "$1" 2>/dev/null | tr -d ' '; }
+    [ "$(u32 "$dev" 1024)" = 4076150800 ] || { log "stage=data-last-cp no-f2fs"; return 0; }
+    cp=$(u32 "$dev" 1100) bpseg=$((1 << $(u32 "$dev" 1044)))
+    for base in "$cp" $((cp + bpseg)); do
+        ver=$(u32 "$dev" $((base * 4096)))
+        tot=$(u32 "$dev" $((base * 4096 + 136)))
+        [ -n "$tot" ] && [ "$tot" -gt 0 ] && [ "$tot" -lt 64 ] || continue
+        tail=$(u32 "$dev" $(((base + tot - 1) * 4096)))
+        fl=$(u32 "$dev" $((base * 4096 + 132)))
+        [ "$ver" = "$tail" ] && { [ -z "$best" ] || [ "$ver" -gt "$best" ]; } && best=$ver bestfl=$fl
+    done
+    [ -n "$best" ] || { log "stage=data-last-cp none-valid"; return 0; }
+    log "stage=data-last-cp ver=$(printf %x "$best") flags=0x$(printf %x "$bestfl") $([ $((bestfl & 1)) = 1 ] && echo clean-unmount || echo dirty)"
+}
+
+# A fresh SD install keeps the hardware files on the card, not in userdata.
+# Read only the firmware before loading WCN; system/trial selection is still
+# performed later by the registry. Firmware is identical across this device's
+# registered roots. ro,noload prevents replaying a journal during this probe.
+early_card_firmware() {
+    local skip=$1 n=0 d name part found=
+    mkdir -p /tmp/e5-early-fw
+    while [ "$n" -lt 10 ]; do
+        mdev -s
+        for d in /sys/class/block/mmcblk*; do
+            [ -d "$d" ] || continue
+            name=${d##*/}
+            case "$name" in *p[0-9]*|*boot*) continue ;; esac
+            [ "$name" = "$skip" ] && continue
+            for part in /dev/$name /dev/${name}p*; do
+                [ -b "$part" ] || continue
+                mount -t ext4 -o ro,noload,noatime "$part" /tmp/e5-early-fw 2>/dev/null || continue
+                if [ -f /tmp/e5-early-fw/etc/e5/sd-root ] &&
+                   [ -x /tmp/e5-early-fw/sbin/init ] &&
+                   [ -s /tmp/e5-early-fw/lib/firmware/wcnmodem.bin ]; then
+                    mkdir -p /lib/firmware
+                    if cp -a /tmp/e5-early-fw/lib/firmware/. /lib/firmware/; then
+                        found=$part
+                    fi
+                fi
+                umount /tmp/e5-early-fw
+                if [ -n "$found" ]; then
+                    log "stage=device-firmware-early sd=$found firmware=$(ls /lib/firmware | wc -l)"
+                    return 0
+                fi
+            done
+        done
+        n=$((n + 1))
+        sleep 1
+    done
+    return 1
+}
+
+early_userdata_firmware() {
+    local dev=$1 loaded=1
+    [ -n "$dev" ] || return 1
+    [ -b "$dev" ] || mdev -s
+    f2fs_last_cp "$dev"
+    mkdir -p /data /tmp/devfiles
+    # (read-only, no roll-forward: this pass only reads, and writes nothing to
+    # userdata -- in charger mode nothing else mounts it)
+    if mount -t f2fs -o ro,norecovery "$dev" /data 2>/run/early-data.err; then
+        if [ -f /data/e5linux/device-files.tar ] &&
+           tar -xf /data/e5linux/device-files.tar -C /tmp/devfiles 2>/dev/null &&
+           mkdir -p /lib/firmware && cp -a /tmp/devfiles/lib/firmware/. /lib/firmware/ &&
+           [ -s /lib/firmware/wcnmodem.bin ]; then
+            loaded=0
+            log "stage=device-firmware-early firmware=$(ls /lib/firmware | wc -l)"
+        else
+            log "stage=device-firmware-early none on userdata"
+        fi
+        umount /data
+    else
+        log "stage=device-firmware-early mount-fail $(cat /run/early-data.err)"
+    fi
+    rm -rf /tmp/devfiles
+    return "$loaded"
+}
+
+early_device_firmware() {
+    local n=0 dev= emmc= image=
+    [ -f /lib/firmware/wcnmodem.bin ] && return 0
+    while [ -z "$dev" ] && [ "$n" -lt 10 ]; do
+        for u in /sys/class/block/mmcblk*p*/uevent; do
+            grep -qx PARTNAME=userdata "$u" 2>/dev/null && dev=/dev/$(basename "$(dirname "$u")")
+        done
+        [ -n "$dev" ] || { n=$((n + 1)); mdev -s; sleep 1; }
+    done
+    emmc=${dev#/dev/}; emmc=${emmc%%p*}
+    # A system installed in its own partition keeps its firmware on e5root, and
+    # by then the payload on userdata is gone (install-part.sh removes it), so
+    # this is the only source.  It cannot be gated on the two-stage marker in
+    # the command line: the plain internal-partition install (boot-os=part) has
+    # no marker either, and without the firmware in the initramfs the WCN's GNSS
+    # half fails its single request_firmware, never powers the chip on and Wi-Fi
+    # is gone (measured on all three models, 2026-10-13).  Probing is cheap and
+    # harmless when there is no e5root or no firmware there, and the search does
+    # not wait for userdata -- mdev may not have settled it yet.
+    mkdir -p /tmp/part-fw /lib/firmware
+    for u in /sys/class/block/mmcblk*p*/uevent; do
+        grep -qx PARTNAME=e5root "$u" 2>/dev/null || continue
+        if mount -t ext4 -o ro,noload /dev/$(basename "$(dirname "$u")") /tmp/part-fw; then
+            if [ -f /tmp/part-fw/etc/e5/part-root ] && [ -s /tmp/part-fw/lib/firmware/wcnmodem.bin ]; then
+                [ ! -f /tmp/part-fw/etc/e5/part-autoboot ] || touch /run/part-default
+                if [ -f /tmp/part-fw/.e5-update/request ]; then
+                    printf '/dev/%s\n' "$(basename "$(dirname "$u")")" > /run/part-update-pending
+                fi
+                cp -a /tmp/part-fw/lib/firmware/. /lib/firmware/
+                log "stage=device-firmware-source e5root"
+            fi
+            umount /tmp/part-fw
+            [ ! -s /lib/firmware/wcnmodem.bin ] || return 0
+        fi
+    done
+    # An explicit image already bypasses SD root selection below. Read its
+    # userdata firmware first instead of spending ten seconds searching a card.
+    # Ordinary/TF boots keep SD-first discovery, including the full card wait.
+    # A missing or damaged userdata bundle still falls back to card firmware.
+    image=$(echo " $(cat /proc/cmdline)" | sed -n 's/.* e5\.openwrt=\([A-Za-z0-9._-]*\).*/\1/p')
+    if [ -n "$image" ]; then
+        log "stage=device-firmware-source userdata-first image=$image"
+        early_userdata_firmware "$dev" && return 0
+        early_card_firmware "$emmc" && return 0
+    else
+        early_card_firmware "$emmc" && return 0
+        early_userdata_firmware "$dev" && return 0
+    fi
+    log "stage=device-firmware-early no usable userdata or SD firmware"
+    return 0
+}
+
+# WCN's module probe schedules its firmware download on a delayed workqueue.
+# switch_root deletes the old initramfs: a request in that interval sees ENOENT
+# even though both roots have the firmware. The driver then permanently selects
+# an unavailable Android partition fallback. A registered PHY means the initial
+# GNSS/BT/Wi-Fi downloads finished; do not destroy their source before that.
+early_wcn_ready() {
+    local n=0 phy
+    [ -d /sys/module/wcn_bsp ] && [ -d /sys/module/sprd_wlan_combo ] || return 0
+    log "stage=wcn-handoff-wait"
+    while :; do
+        for phy in /sys/class/ieee80211/*; do
+            if [ -d "$phy" ]; then
+                log "stage=wcn-handoff-ready waited=${n}s"
+                return 0
+            fi
+        done
+        # A genuinely failed radio must not prevent the management system boot.
+        [ "$n" -ge 15 ] && break
+        sleep 1
+        n=$((n + 1))
+    done
+    log "stage=wcn-handoff-timeout waited=${n}s"
+    return 0
+}
+
+loaded=0
+failed=0
+if [ -f /etc/module-order ]; then
+    while read module; do
+        [ -n "$module" ] || continue
+        [ "$module" = wcn_bsp.ko ] && early_device_firmware
+        if insmod "/linux-modules/$module" 2>/run/insmod.err; then
+            loaded=$((loaded + 1))
+        else
+            failed=$((failed + 1))
+            log "insmod-fail $module $(cat /run/insmod.err)"
+        fi
+    done < /etc/module-order
+fi
+mdev -s
+log "stage=modules-done loaded=$loaded failed=$failed"
+
+# Diagnostic only: log the SoC watchdog's state.  This is *not* what used to reset the
+# machine five minutes in -- that was the PMIC watchdog, fixed by loading
+# sprd_pmic_wdt.ko (docs/FINDINGS.md section 9).  Reading these registers needs the
+# CONFIG_DEVMEM=y this image sets; the SoC counter-enable bit is clear (CTRL = 0x4),
+# so it is not counting.  Offsets from drivers/watchdog/sprd_wdt_fiq.c (base
+# 0x641e0000).
+wdt=0x641e0000
+if [ -c /dev/mem ]; then
+    log "stage=wdt ctrl=$(devmem $((wdt + 0x8)) 32) int_raw=$(devmem $((wdt + 0x10)) 32) cnt=$(devmem $((wdt + 0x18)) 32)"
+else
+    log "stage=wdt-skip no-devmem"
+fi
+find_partitions 20 || true
+log "stage=partitions misc=${misc:-none} boot_b=${bootb:-none}"
+persist
+
+write_misc_bc() {  # write_misc_bc FILE STAGE
+    [ -n "$misc" ] || { log "stage=misc-NOT-FOUND"; return 1; }
+    dd if="$1" of="$misc" bs=1 seek=2048 conv=notrunc 2>/dev/null
+    sync
+    dd if="$misc" of=/run/bc.bin bs=1 skip=2048 count=32 2>/dev/null
+    if cmp -s /run/bc.bin "$1"; then log "stage=$2 dev=$misc"; else log "stage=$2-MISMATCH dev=$misc"; fi
+}
+restore_slot_a() { write_misc_bc /etc/misc-bc-slot-a.bin misc-restored-slot-a; }
+
+# Powered off with a charger connected (or a charger plugged into an E5 that is
+# off), the PMIC powers the E5 up and LK starts the kernel in charger mode
+# (sprdboot.mode=charger, bootcause "in charging during shutdown the devices").
+# Android shows its charging screen there; this boots the system, as when power
+# comes back -- a power off with the charger in is followed by a boot.  Only
+# logged.
+if tr '\0' ' ' < /proc/device-tree/chosen/bootargs 2>/dev/null |
+   grep -qE '(sprdboot|androidboot)\.mode=charger'; then
+    log "stage=charger-boot $(cat /sys/class/power_supply/battery/capacity 2>/dev/null)% (booting the system)"
+fi
+
+hostname e5-linux
+ifconfig lo 127.0.0.1 up
+
+# ---------------------------------------------------------------- USB gadget
+log "stage=usb-configfs"
+mount -t configfs configfs /config 2>/run/configfs.err || log "stage=configfs-fail $(cat /run/configfs.err)"
+g=/config/usb_gadget/linux
+mkdir -p "$g/strings/0x409" "$g/configs/c.1/strings/0x409" "$g/functions/ncm.usb0"
+echo 0x0525 > "$g/idVendor"
+echo 0xa4a1 > "$g/idProduct"
+echo 0x0200 > "$g/bcdUSB"
+echo E5LINUX > "$g/strings/0x409/serialnumber"
+echo Unisoc > "$g/strings/0x409/manufacturer"
+echo "E5 Linux USB Ethernet" > "$g/strings/0x409/product"
+echo "Linux NCM + ACM console" > "$g/configs/c.1/strings/0x409/configuration"
+echo 250 > "$g/configs/c.1/MaxPower"
+echo 02:50:00:00:e5:01 > "$g/functions/ncm.usb0/dev_addr"
+echo 02:50:00:00:e5:02 > "$g/functions/ncm.usb0/host_addr"
+ln -s "$g/functions/ncm.usb0" "$g/configs/c.1/f1"
+mkdir -p "$g/functions/acm.GS0" && ln -s "$g/functions/acm.GS0" "$g/configs/c.1/f2"
+
+log "stage=usb-wait-udc"
+udc=
+for n in $(seq 1 40); do
+    for u in /sys/class/udc/*; do
+        [ -e "$u" ] && { udc=$(basename "$u"); break; }
+    done
+    [ -n "$udc" ] && break
+    sleep 1
+done
+log "stage=udc udc=${udc:-none} available=$(ls /sys/class/udc 2>/dev/null | tr '\n' ',')"
+persist
+if [ -n "$udc" ]; then
+    # ADB is *not* added here on purpose: FunctionFS cannot be bound without a daemon
+    # already holding ep0 (the composite bind fails and the board loses USB entirely, no
+    # network and no console).  The ADB experiment was taken back out of the tree;
+    # docs/FINDINGS.md 28 has what it established, and telnet on the management LAN is
+    # the way in.
+    echo "$udc" > "$g/UDC"
+    log "stage=usb-bind-done rc=$?"
+fi
+ifconfig usb0 up 2>/dev/null
+persist
+
+# The PC installer alone arms a TF update. Probe all TF roots, including legacy
+# cards, before mounting the root read/write. CONFIG_CMDLINE_FORCE and LK may
+# discard boot-header flags, so the verified on-card request is the trigger.
+# No polling service is installed in the running system.
+tf_update_probe() {
+    mkdir -p /tmp/tf-update-probe
+    for sysdev in /sys/class/block/mmcblk*; do
+        tf=${sysdev##*/}
+        case "$tf" in *p[0-9]*|*boot*) continue ;; esac
+        [ "$(cat "$sysdev/device/type" 2>/dev/null)" = SD ] || continue
+        for target in /dev/$tf /dev/${tf}p*; do
+            [ -b "$target" ] || continue
+            mount -t ext4 -o ro,noload "$target" /tmp/tf-update-probe 2>/dev/null || continue
+            if [ -f /tmp/tf-update-probe/etc/e5/sd-root ] && [ -f /tmp/tf-update-probe/.e5-update/request ]; then
+                [ ! -s /run/tf-update-found ] || touch /run/tf-update-conflict
+                echo "$target" > /run/tf-update-found
+                echo "$target" > /run/part-update-pending
+            fi
+            umount /tmp/tf-update-probe
+        done
+    done
+}
+tf_update_probe
+. /etc/part-update.sh
+if ! part_update_pending; then
+    part_fail 'offline update stopped; logs and RAM payload retained'
+    while :; do sleep 10; done
+fi
+
+. /etc/part-prepare.sh
+if ! part_prepare; then
+    part_fail 'partition preparation stopped; inspect /run/part-carve.log'
+    while :; do sleep 10; done
+fi
+
+# ------------------------------------------------------- root filesystem
+# The E5 has no unallocated eMMC space (userdata runs to the last usable LBA),
+# so the Linux root filesystem lives in a file on Android /data, which is
+# f2fs and mounted directly from mmcblk0p70 (no metadata encryption).
+ROOT_FILE=/data/e5linux/rootfs.ext4
+OPENWRT_FILE=/data/e5linux/openwrt.ext4
+# e5.openwrt=<file in e5linux/> on the kernel's command line boots another OpenWrt image: the mainline
+# kernel's trials (upstream/) run a copy, so that a half-working system neither writes to the one in use nor
+# becomes the default boot
+w=$(echo " $(cat /proc/cmdline)" | sed -n 's/.* e5\.openwrt=\([A-Za-z0-9._-]*\).*/\1/p')
+[ -n "$w" ] && OPENWRT_FILE=/data/e5linux/$w e5_trial=1
+data=
+for u in /sys/class/block/mmcblk*p*/uevent; do
+    grep -qx PARTNAME=userdata "$u" 2>/dev/null && data=/dev/$(basename "$(dirname "$u")")
+done
+log "stage=data-partition dev=${data:-none}"
+
+has_init() { [ -x "$1/lib/systemd/systemd" ] || [ -x "$1/sbin/init" ]; }
+
+. /etc/sd-registry.sh
+SDMETA= SDOS= SDMETA_INVALID=
+sd_metadata() {
+    [ -z "$SDMETA" ] || return 0
+    for u in /sys/class/block/mmcblk*p*/uevent; do
+        grep -qx PARTNAME=e5boot "$u" 2>/dev/null || continue
+        dev=/dev/$(basename "$(dirname "$u")")
+        mkdir -p /sdboot
+        mount -t ext4 -o noatime "$dev" /sdboot 2>/dev/null || continue
+        if ! sd_registry_valid /sdboot ||
+           [ "$(cat /sdboot/kernel-release 2>/dev/null)" != "$(uname -r)" ]; then
+            log "stage=sd-registry-invalid $dev"
+            SDMETA_INVALID=1
+            umount /sdboot
+            return 1
+        fi
+        SDMETA=$dev SDOS=$(cat /sdboot/default)
+        next=$(cat /sdboot/next 2>/dev/null)
+        if sd_id_valid "$next" && [ -d "/sdboot/systems/$next" ]; then
+            SDOS=$next
+            rm -f /sdboot/next && sync
+            log "stage=sd-system-once $SDOS"
+        fi
+        log "stage=sd-registry $dev system=$SDOS"
+        return 0
+    done
+    return 1
+}
+
+# SD card root: openwrt/bundle/flash.py (its default install; `--data` is the
+# old one) writes the OpenWrt image to a partition of the removable card and
+# marks it /etc/e5/sd-root.  The card may move between units, so it is recognised
+# by its content, not by a label; the partition the marker sits on goes to
+# SDROOT.  "Removable" cannot be asked of this controller (both mmcblk devices
+# report removable=0), so it is the mmcblk device that is not the one carrying
+# Android's partitions -- the one misc lives on.
+# A card can hold more than one marked root: an update (device-install-image.sh)
+# writes the new system into another partition of the card while the old one
+# runs.  Each carries a generation (/etc/e5/sd-gen, 0 when there is none) and the
+# highest boots.  A new one comes with /etc/e5/sd-trial: set to 0 here as it is
+# booted, removed by e5-boot-ok once the system is up -- one still at 0 did not
+# come up and is passed over, so the one before it boots again.
+sd_root() {
+    [ -n "$misc" ] || return 1
+    sd_metadata || true
+    [ -z "$SDMETA_INVALID" ] || return 1
+    emmc=${misc#/dev/}; emmc=${emmc%%p*}
+    SDROOT= SDTRIAL= best=-1
+    for d in /sys/class/block/mmcblk*; do
+        n=${d##*/}
+        case "$n" in *p[0-9]*|*boot*) continue ;; esac
+        [ "$n" = "$emmc" ] && continue
+        for part in /dev/$n /dev/${n}p*; do
+            [ -b "$part" ] || continue
+            if [ -n "$SDMETA" ]; then
+                uuid=$(sed -n 's/^PARTUUID=//p' "/sys/class/block/${part##*/}/uevent")
+                sd_registered /sdboot "$SDOS" "$uuid" || continue
+            fi
+            mount -t ext4 -o ro,noatime "$part" /sdtry 2>/dev/null || continue
+            if [ -x /sdtry/sbin/init ] && [ -f /sdtry/etc/e5/sd-root ]; then
+                if [ -n "$SDMETA" ]; then
+                    id=$(cat /sdtry/etc/e5/sd-system 2>/dev/null)
+                    # Existing OpenWrt roots predate the explicit identity.
+                    [ -n "$id" ] || { [ -f /sdtry/etc/openwrt_release ] && id=openwrt; }
+                    if [ "$id" != "$SDOS" ]; then
+                        log "stage=sd-identity-mismatch $part registered=$SDOS root=$id"
+                        umount /sdtry; continue
+                    fi
+                fi
+                gen=$(cat /sdtry/etc/e5/sd-gen 2>/dev/null)
+                case "$gen" in ''|*[!0-9]*) gen=0 ;; esac
+                trial=
+                [ -f /sdtry/etc/e5/sd-trial ] && trial=$(cat /sdtry/etc/e5/sd-trial 2>/dev/null)
+                if [ -f /sdtry/etc/e5/sd-trial ] && [ "$trial" = 0 ]; then
+                    log "stage=sd-candidate $part gen=$gen failed-trial (passed over)"
+                elif [ "$gen" -gt "$best" ]; then
+                    log "stage=sd-candidate $part gen=$gen${trial:+ trial}"
+                    best=$gen SDROOT=$part SDTRIAL=
+                    [ -f /sdtry/etc/e5/sd-trial ] && SDTRIAL=1
+                else
+                    log "stage=sd-candidate $part gen=$gen (older)"
+                fi
+            fi
+            umount /sdtry
+        done
+    done
+    [ -n "$SDROOT" ]
+}
+# e5linux/boot-os names the system to start: a directory of that name on the
+# image (/openwrt), or the Debian root at the top of it (anything else).
+# e5linux/boot-os-next does the same for one boot only, and is removed as it is
+# read: a system tried that way (e5-os <name> --once) that does not come up
+# leaves the next boot to the one before it.
+# The system to start is e5linux/boot-os on userdata (e5-os writes it there),
+# or e5linux/boot-os-next first, removed as it is read (one boot).  An older
+# e5-os kept them inside the Debian root image: read there when userdata has
+# none.
+read_boot_os() {
+    local d=$1 w
+    w=$(cat "$d/e5linux/boot-os-next" 2>/dev/null)
+    if [ -n "$w" ]; then
+        rm -f "$d/e5linux/boot-os-next"
+        log "stage=boot-os-next os=$w (one boot, $d)"
+    else
+        w=$(cat "$d/e5linux/boot-os" 2>/dev/null)
+    fi
+    echo "$w"
+}
+
+# a system in the Debian root image: Debian itself, or one in a directory
+pick_root() {
+    want=$1
+    if [ -n "$want" ]; then
+        # (userdata decided; a one-boot choice an older e5-os left in the image
+        # must not outlive this boot)
+        rm -f /disk/e5linux/boot-os-next
+    else
+        want=$(read_boot_os /disk)
+    fi
+    for os in $want ubuntu; do
+        [ -d "/disk/$os" ] && has_init "/disk/$os" && { echo "/disk/$os"; return; }
+        [ "$os" = ubuntu ] && [ -x /disk/lib/systemd/systemd ] && { echo /disk; return; }
+    done
+}
+
+mkdir -p /newroot /data /disk /sdtry
+mount_userdata_root() {
+    mount -t f2fs -o noatime,nodiratime "$data" /data 2>>/run/datamount.err && return 0
+    # No fsck on the fast path, TF boot, boot-choice or firmware probes.
+    # Reload firmware from a clean boot after recovery: it may have failed
+    # earlier while userdata was corrupt. Only the fault path reboots.
+    . /etc/f2fs-repair.sh
+    if f2fs_repair_userdata "$data"; then
+        log "stage=f2fs-repaired reboot-for-clean-firmware-load"
+        write_misc_bc /etc/misc-bc-slot-b-trial.bin f2fs-repair-rearm
+        sync
+        persist
+        reboot -f
+    fi
+    log "stage=f2fs-recovery-incomplete retaining-rescue-fallback"
+    return 1
+}
+rootdir= data_mounted= on_card= on_part= PARTROOT= PARTTRIAL=
+[ -n "$data" ] && f2fs_last_cp "$data"
+# A pending internal-partition install (flash.py --part): userdata is
+# unmounted here, which is the only place its vendor F2FS may be shrunk
+# (raw tools only, docs/FINDINGS.md 48).  A finished install restarts into
+# the new system itself (its partition is unknown to this boot's kernel
+# table); a failed or absent one leaves the chain below to decide.
+[ -z "$data" ] || { . /etc/install-part.sh && install_part_pending "$data"; }
+# The SD card system is the one maintained (the systems on userdata are for
+# tests), and it leaves userdata read-only: mainline damaged that F2FS across
+# power cycles even after a clean unmount (docs/FINDINGS.md 48).  So userdata is
+# first mounted read-only, to read e5linux/boot-os, and read-write only for a
+# system that lives on it (or to take a one-boot choice off it).
+card= want= once=
+if [ -n "$data" ] && { mount -t f2fs -o ro,noatime,nodiratime "$data" /data 2>/run/datamount.err ||
+                       mount -t f2fs -o ro,norecovery,noatime,nodiratime "$data" /data 2>>/run/datamount.err; }; then
+    want=$(cat /data/e5linux/boot-os-next 2>/dev/null)
+    [ -n "$want" ] || want=$(cat /data/e5linux/boot-os 2>/dev/null)
+    once=$([ -f /data/e5linux/boot-os-next ] && echo 1)
+    umount /data
+fi
+# The card enumerates during kernel init (~3 s in) and this runs well past
+# 20 s, so a present card is already visible and the cap only guards cards
+# that enumerate unusually late: 4 s is a wide margin over every card seen.
+# A registered card owns its selection even if userdata has an old boot-os
+# choice. An unregistered card retains the legacy userdata choice, including
+# explicit image trials.
+sd_wait() {
+    local i=0
+    while [ "$i" -lt "$1" ]; do
+        sd_root && { log "stage=sd-found after $((i / 2)) s"; return 0; }
+        i=$((i + 1))
+        sleep 0.5
+    done
+    log "stage=sd-none (waited $(($1 / 2)) s)"
+    return 1
+}
+# The internal partition system (openwrt/device-install-part.sh): a real ext4
+# partition on the eMMC, created by that installer with e5-gpt and marked
+# /etc/e5/part-root.  A system that lives there keeps userdata unmounted, so
+# the vendor F2FS is never written under mainline (docs/FINDINGS.md 48) --
+# the same reason the card system leaves userdata read-only.  Chosen when
+# userdata names it (e5linux/boot-os = part); when the partition is gone the
+# selection falls through to the image path below.
+part_root() {
+    local u e dev
+    [ -n "$misc" ] || return 1
+    e=${misc#/dev/}; e=${e%%p*}
+    for u in /sys/class/block/${e}p*/uevent; do
+        grep -qx PARTNAME=e5root "$u" 2>/dev/null || continue
+        dev=/dev/$(basename "$(dirname "$u")")
+        mount -t ext4 -o ro,noatime "$dev" /sdtry 2>/dev/null || continue
+        if [ -x /sdtry/sbin/init ] && [ -f /sdtry/etc/e5/part-root ]; then
+            PARTTRIAL=
+            [ -f /sdtry/etc/e5/part-trial ] && PARTTRIAL=$(cat /sdtry/etc/e5/part-trial 2>/dev/null)
+            umount /sdtry
+            PARTROOT=$dev
+            return 0
+        fi
+        umount /sdtry
+    done
+    return 1
+}
+# The internal partition system, when userdata names it (boot-os = part).  A
+# trial marker on it, like the card's sd-trial, makes a boot that dies before
+# userspace fall back: booting it writes 0 into the file, and the running
+# system removes it once it is up (e5-boot-ok).  A failed trial, a missing
+# partition or an unreadable one drops the choice for this boot only -- the
+# chain below (card, then image) still gets its turn.
+grep -q ' e5.root=part\( \|$\)' /proc/cmdline && want=part
+if [ -f /run/part-default ] && [ -z "$SDMETA" ] && { [ -z "$want" ] || [ "$want" = part ]; }; then
+    want=part
+fi
+if [ -z "$e5_trial" ] && [ "$want" = part ]; then
+    if part_root && [ "$PARTTRIAL" != 0 ] &&
+       mount -t ext4 -o noatime "$PARTROOT" /disk 2>>/run/rootmount.err; then
+        rootdir=/disk on_part=1
+        log "stage=openwrt-part $PARTROOT"
+        if [ -n "$PARTTRIAL" ]; then
+            echo 0 > /disk/etc/e5/part-trial && sync
+            log "stage=openwrt-part-trial $PARTROOT"
+        fi
+    else
+        log "stage=openwrt-part-fail ${PARTROOT:-none}${PARTTRIAL:+ trial=$PARTTRIAL}"
+        want=
+    fi
+fi
+if [ -z "$rootdir" ] && [ -z "$e5_trial" ] && sd_wait 8 &&
+   { [ -n "$SDMETA" ] || [ -z "$want" ] || [ "$want" = sd ]; }; then
+    card=1
+    log "stage=card-system userdata read-only"
+    if [ -z "$SDMETA" ] && [ -n "$once" ] && mount -t f2fs -o noatime,nodiratime "$data" /data 2>>/run/datamount.err; then
+        read_boot_os /data >/dev/null
+        umount /data
+    fi
+    if [ -n "$data" ] && { mount -t f2fs -o ro,noatime,nodiratime "$data" /data 2>>/run/datamount.err ||
+                           mount -t f2fs -o ro,norecovery,noatime,nodiratime "$data" /data 2>>/run/datamount.err; }; then
+        data_mounted=1
+    fi
+elif [ -z "$rootdir" ] && [ -z "$e5_trial" ] && [ "$want" = part ] && part_root && [ "$PARTTRIAL" != 0 ] &&
+     mount -t ext4 -o noatime "$PARTROOT" /disk 2>>/run/rootmount.err; then
+    log "stage=openwrt-part $PARTROOT"
+    rootdir=/disk on_part=1
+elif [ -z "$rootdir" ] && [ -z "$SDMETA" ] && [ -z "$SDMETA_INVALID" ] && [ -n "$data" ] && mount_userdata_root; then
+    log "stage=data-mounted"
+    data_mounted=1
+    want=$(read_boot_os /data)
+    # OpenWrt in an image of its own (openwrt/build-rootfs.sh E5_STANDALONE=1,
+    # openwrt/install-standalone.sh): chosen, or the only system there is
+    # an update the running image could not write over itself
+    # (openwrt/device-install-image.sh): swapped in now, the old one kept
+    if [ -f "$OPENWRT_FILE.new" ]; then
+        rm -f "$OPENWRT_FILE.old"
+        [ -f "$OPENWRT_FILE" ] && mv "$OPENWRT_FILE" "$OPENWRT_FILE.old"
+        mv "$OPENWRT_FILE.new" "$OPENWRT_FILE" && log "stage=openwrt-image-updated"
+    fi
+    if [ -f "$OPENWRT_FILE" ] && { [ -n "$e5_trial" ] || [ "$want" = openwrt ] || [ ! -f "$ROOT_FILE" ]; }; then
+        rootloop=$(losetup -f 2>/run/rootmount.err)
+        if [ -n "$rootloop" ] && losetup "$rootloop" "$OPENWRT_FILE" 2>>/run/rootmount.err \
+           && mount -t ext4 -o noatime "$rootloop" /disk 2>>/run/rootmount.err \
+           && has_init /disk; then
+            rootdir=/disk
+            log "stage=openwrt-image $OPENWRT_FILE"
+        else
+            log "stage=openwrt-image-fail $(cat /run/rootmount.err 2>/dev/null)"
+            umount /disk 2>/dev/null; [ -n "$rootloop" ] && losetup -d "$rootloop" 2>/dev/null
+        fi
+    fi
+    [ -n "$rootdir" ] || [ -f "$ROOT_FILE" ] || log "stage=no-rootfile $ROOT_FILE"
+    # (a trial boots its image or nothing: never the systems in use)
+    if [ -z "$rootdir" ] && [ -z "$e5_trial" ] && [ -f "$ROOT_FILE" ]; then
+        rootloop=$(losetup -f 2>/run/rootmount.err)
+        if [ -n "$rootloop" ] && losetup "$rootloop" "$ROOT_FILE" 2>>/run/rootmount.err \
+           && mount -t ext4 -o noatime "$rootloop" /disk 2>>/run/rootmount.err \
+           && rootdir=$(pick_root "$want") && [ -n "$rootdir" ]; then
+            :
+        else
+            rootdir=
+        fi
+    fi
+elif [ -z "$rootdir" ] && [ -z "$card" ]; then
+    log "stage=data-mount-fail $(cat /run/datamount.err 2>/dev/null)"
+fi
+
+# The marked SD card: openwrt/bundle/flash.py's default install writes the
+# OpenWrt image to a partition of the removable card and marks it
+# /etc/e5/sd-root.  A trial (e5.openwrt=) never uses it.  It is preferred when
+# userdata names no system (e5linux/boot-os, which both installers write: `sd`
+# for the card, `openwrt` for the image in userdata -- so the last install wins;
+# decided above, `card`) and it is the fallback otherwise, so a card whose
+# userdata cannot be mounted still boots.
+if [ -n "$card" ] || { [ -z "$e5_trial" ] && [ -z "$rootdir" ] && sd_root; }; then
+    if mount -t ext4 -o noatime "$SDROOT" /disk 2>>/run/rootmount.err; then
+        rootdir=/disk on_card=1
+        log "stage=openwrt-sd $SDROOT"
+        # (the first boot of an update: e5-boot-ok removes the file once it is up)
+        if [ -n "$SDTRIAL" ]; then
+            echo 0 > /disk/etc/e5/sd-trial && sync
+            log "stage=openwrt-sd-trial $SDROOT"
+        fi
+    else
+        log "stage=openwrt-sd-fail $(cat /run/rootmount.err 2>/dev/null)"
+    fi
+fi
+
+if [ -n "$rootdir" ]; then
+    if [ "$rootdir" = /disk ]; then
+        mount --move /disk /newroot
+        # An OpenWrt image of its own that was built without the device's
+        # files (openwrt/build-rootfs.sh E5_DEVICE_FILES=0, the one handed to
+        # others) gets them from userdata: the firmware and the Android vendor
+        # subset this device's installer pulled (openwrt/make-flash-bundle.sh).
+        # Before switch_root -- the WCN driver asks for its firmware at about
+        # that moment -- and again whenever the archive changed or an update
+        # brought an image without them.
+        dft=/data/e5linux/device-files.tar
+        # (a card system carries its own, from its install or update)
+        if [ -z "$on_card" ] && [ -z "$on_part" ] && [ -f /newroot/etc/e5/image-form ] && [ -f "$dft" ]; then
+            stamp=$(sha256sum "$dft" | cut -d' ' -f1)
+            if [ ! -f /newroot/lib/firmware/wcnmodem.bin ] ||
+               [ "$(cat /newroot/etc/e5/device-files.stamp 2>/dev/null)" != "$stamp" ]; then
+                if tar -xf "$dft" -C /newroot 2>/run/devfiles.err; then
+                    echo "$stamp" > /newroot/etc/e5/device-files.stamp
+                    log "stage=device-files unpacked"
+                else
+                    log "stage=device-files-fail $(cat /run/devfiles.err)"
+                fi
+            fi
+        fi
+    else
+        mount --bind "$rootdir" /newroot
+        mkdir -p /newroot/mnt/e5-disk && mount --move /disk /newroot/mnt/e5-disk
+        # A system in a directory of the image runs on the Debian root's
+        # hardware files -- the firmware pulled from this device, the Android
+        # vendor subset -- and they are bound in before it starts, not by the
+        # system itself: the WCN driver's first firmware download comes at
+        # about the time of switch_root, from whichever root is current.  It
+        # found OpenWrt's /lib/firmware still empty 1.5 s after switch_root,
+        # before OpenWrt's preinit had bound it, and timed out a minute later.
+        for pair in usr/lib/firmware:lib/firmware opt/e5/android:opt/e5/android; do
+            src=/newroot/mnt/e5-disk/${pair%%:*} dst=/newroot/${pair#*:}
+            [ -d "$src" ] || continue
+            mkdir -p "$dst" && mount --bind "$src" "$dst" && log "stage=bind $dst"
+        done
+    fi
+    # Default-Linux mode leaves LK decremented tries alone; userspace re-arms
+    # slot b once the system is up (e5-boot-ok.service).
+    # a trial image (e5.openwrt=) is never the default boot: its own e5-boot-ok would re-arm slot b
+    [ -n "$e5_trial" ] && mkdir -p /newroot/etc/e5linux && echo android > /newroot/etc/e5linux/default-boot &&
+        log "stage=trial-image default-boot=android"
+    if [ "$(cat /newroot/etc/e5linux/default-boot 2>/dev/null)" = linux ]; then
+        log "stage=default-boot-linux (slot a restore skipped)"
+    else
+        restore_slot_a
+    fi
+    mkdir -p /run/e5linux && cp /etc/misc-bc-slot-a.bin /etc/misc-bc-slot-b-trial.bin /run/e5linux/ 2>/dev/null
+    # what this initramfs can do, for the installers of the running system
+    echo "openwrt-image userdata-boot-os sd-gen part-root" > /run/e5linux/init-features
+    [ -n "$on_card" ] && echo "$SDROOT" > /run/e5linux/sd-root-dev
+    [ -n "$on_part" ] && echo "$PARTROOT" > /run/e5linux/part-root-dev
+    if [ -n "$SDMETA" ]; then
+        mkdir -p /newroot/mnt/e5-boot
+        mount --move /sdboot /newroot/mnt/e5-boot
+        echo "$SDMETA" > /run/e5linux/sd-boot-dev
+        echo "$SDOS" > /run/e5linux/sd-system
+    fi
+    [ -n "$misc" ] && echo "$misc" > /run/e5linux/misc-dev
+    [ -n "$data" ] && echo "$data" > /run/e5linux/data-dev
+    init=/sbin/init
+    [ -x /newroot/lib/systemd/systemd ] && init=/lib/systemd/systemd
+    # ... and into the real root filesystem, so the files survive and every later
+    # boot (this one included -- systemd starts after this) has them in place.
+    # Only into the Debian root, the one at the top of the image: the overlay
+    # is Debian's (systemd units, NetworkManager profiles, udev rules), and a
+    # system in a directory of its own (/openwrt, openwrt/build-rootfs.sh)
+    # brings its own configuration.
+    if [ -d /e5-overlay ] && [ "$rootdir" = /disk ] && [ -f /newroot/etc/debian_version ]; then
+        # Copy file by file: the Debian root has /lib, /bin and /sbin as symlinks
+        # into /usr, and a single cp -a of the whole tree refuses to merge into
+        # those ("target '/newroot/./lib' is not a directory"), which left the
+        # firmware behind.  mkdir -p and cp follow the symlinks happily.
+        applied=0
+        for f in $(find /e5-overlay -type f); do
+            dst="/newroot/${f#/e5-overlay/}"
+            # /var/lib is state the system writes (UFI-TOOLS keeps its login
+            # token and settings there): the overlay only seeds it.  Copied
+            # every boot, a password changed in the web UI came back as the
+            # shipped one after the next reboot.
+            case "$dst" in /newroot/var/lib/*) [ -e "$dst" ] && continue ;; esac
+            mkdir -p "$(dirname "$dst")" 2>/dev/null
+            cp -a "$f" "$dst" 2>/dev/null && applied=$((applied + 1))
+        done
+        log "stage=overlay-applied files=$applied"
+
+        # The overlay carries files for the user's home too (the profile that
+        # starts the session), and cpio records them as root:root with whatever
+        # modes the checkout had -- the packed .bash_profile arrived 0600, so the
+        # login shell could not read it and the session silently never started.
+        if [ -d /newroot/home/e5 ]; then
+            chown -R 1000:1000 /newroot/home/e5 2>/dev/null
+            chmod 0644 /newroot/home/e5/.bash_profile 2>/dev/null
+        fi
+        # The other way round for NetworkManager: it ignores a connection
+        # keyfile that group or others can read ("insecure permissions"), and the
+        # image builder packs every overlay file a+r -- the Hotspot profile would
+        # simply not exist.
+        chmod 0600 /newroot/usr/lib/NetworkManager/system-connections/*.nmconnection 2>/dev/null
+
+        # systemd considers a unit enabled only when a *.wants/ link points at it,
+        # and neither the image builder (boot/build-boot-image.py packs files and
+        # directories, and skips symlinks) nor the loop above can carry a link, so
+        # the ones the overlay would have shipped are made here.
+        # Everything the overlay ships that has to start, listed explicitly: a
+        # fresh rootfs cannot enable these (the overlay is not part of the image
+        # it packs), and a device whose rootfs predates this needs them too.
+        for unit in e5-bt-attach.service ufi-tools.service dnsmasq.service \
+                     e5-vendor.service e5-cp_diskserver.service e5-refnotify.service \
+                     e5-net-bridge.service e5-sipc-wwan.service \
+                     e5-regdb-load.service \
+                     e5-telnetd.service e5-gadget-guard.service \
+                     e5-fixups.service e5-nat.service; do
+            if [ -f "/newroot/etc/systemd/system/$unit" ]; then
+                mkdir -p /newroot/etc/systemd/system/multi-user.target.wants
+                ln -sf "../$unit" \
+                    "/newroot/etc/systemd/system/multi-user.target.wants/$unit"
+            fi
+        done
+
+        # A rootfs built in Docker carried an empty /.dockerenv, which makes
+        # systemd-detect-virt say "docker" and skip every unit with
+        # ConditionVirtualization=!container (ModemManager, systemd-timesyncd,
+        # systemd-pstore, ...).  The build drops it now; this is for a rootfs
+        # that still has it.
+        rm -f /newroot/.dockerenv
+
+        # Retired: the hostapd hotspot (e5-hotspot, its retry timer, its start
+        # script and configs) gave way to NetworkManager's "Hotspot" connection.
+        # The overlay no longer carries them, but a rootfs that predates that
+        # still has the files and the links, and hostapd would fight
+        # NetworkManager for wlan0.
+        rm -f /newroot/etc/systemd/system/e5-hotspot.service \
+              /newroot/etc/systemd/system/e5-hotspot-retry.timer \
+              /newroot/etc/systemd/system/multi-user.target.wants/e5-hotspot.service \
+              /newroot/etc/systemd/system/timers.target.wants/e5-hotspot-retry.timer \
+              /newroot/opt/e5/hotspot-start.sh \
+              /newroot/etc/hostapd/e5.conf /newroot/etc/hostapd/e5-5g.conf
+        # NetworkManager comes from its package, so its unit is in /lib and the
+        # package enabled it; linked here as well for a rootfs where a build
+        # stage once purged it (rootfs/install-packages.sh used to).
+        if [ -f /newroot/lib/systemd/system/NetworkManager.service ]; then
+            mkdir -p /newroot/etc/systemd/system/multi-user.target.wants
+            ln -sf /lib/systemd/system/NetworkManager.service \
+                /newroot/etc/systemd/system/multi-user.target.wants/NetworkManager.service
+            ln -sf /lib/systemd/system/NetworkManager.service \
+                /newroot/etc/systemd/system/dbus-org.freedesktop.NetworkManager.service
+        fi
+
+        # The baseband belongs to ModemManager (its unisoc plugin, on the WWAN
+        # port e5-sipc-wwan loads; docs/FINDINGS.md 37), and NetworkManager's
+        # "Mobile" connection brings the data up.  Retired with that: the
+        # unisoc-cpd daemon and its web face, and the bearer scripts that went
+        # through it (e5-bearer-up and its watch timer).  Their units stay
+        # installed as the fallback -- starting unisoc-cpd stops e5-sipc-wwan
+        # and ModemManager (Conflicts=/BindsTo=) -- but a rootfs that predates
+        # this still has them enabled, and they would take the AT channel
+        # from ModemManager at every boot.
+        rm -f /newroot/etc/systemd/system/multi-user.target.wants/unisoc-cpd.service \
+              /newroot/etc/systemd/system/multi-user.target.wants/unisoc-cpd-web.service \
+              /newroot/etc/systemd/system/multi-user.target.wants/e5-bearer-up.service \
+              /newroot/etc/systemd/system/timers.target.wants/e5-bearer-watch.timer
+        if [ -f /newroot/lib/systemd/system/ModemManager.service ]; then
+            mkdir -p /newroot/etc/systemd/system/multi-user.target.wants
+            ln -sf /lib/systemd/system/ModemManager.service \
+                /newroot/etc/systemd/system/multi-user.target.wants/ModemManager.service
+            ln -sf /lib/systemd/system/ModemManager.service \
+                /newroot/etc/systemd/system/dbus-org.freedesktop.ModemManager1.service
+        fi
+
+        # The serial console has to survive too -- it is the only way in when the
+        # management LAN is down (docs/FINDINGS.md section 26).  A rootfs build
+        # cannot enable a template instance from a chroot ("warn: getty enable
+        # failed"), so the link is made here.
+        if [ -f /newroot/lib/systemd/system/serial-getty@.service ]; then
+            mkdir -p /newroot/etc/systemd/system/getty.target.wants
+            ln -sf /lib/systemd/system/serial-getty@.service \
+                "/newroot/etc/systemd/system/getty.target.wants/serial-getty@ttyGS0.service"
+        fi
+
+        # (systemd-networkd used to be linked here, because it gave usb0 its
+        # address.  The LAN is br0 now, built by e5-net-bridge with ip, and
+        # networkd manages no link at all -- etc/systemd/network/*.network.)
+    fi
+    # The initramfs busybox is a static arm64 binary and doubles as the userspace
+    # busybox for the management LAN (e5-telnetd.service runs telnetd from it), so no
+    # extra package has to exist in the Debian image.
+    if [ -x /bin/busybox ]; then
+        mkdir -p /newroot/usr/local/bin
+        cp /bin/busybox /newroot/usr/local/bin/busybox 2>/dev/null && chmod 0755 /newroot/usr/local/bin/busybox
+        log "stage=busybox-installed $(ls -l /newroot/usr/local/bin/busybox 2>/dev/null | awk '{print $5}')"
+    # Powerdevil controls the panel backlight through sysfs; the default 0600 leaves
+    # it with EACCES ("Error EACCES(-13): Permission denied opening ...") and no
+    # brightness or screen-off action.  This is a phone with exactly one seat, so
+    # opening the attribute up is the pragmatic fix.
+    for bl in /sys/class/backlight/*/brightness /sys/class/backlight/*/bl_power; do
+        [ -e "$bl" ] && chmod 0666 "$bl" 2>/dev/null && log "stage=backlight-perm $bl"
+    done
+    fi
+    early_wcn_ready
+    log "stage=switch-root root=$rootdir init=$init os=$(sed -n 's/^PRETTY_NAME=//p' /newroot/etc/os-release)"
+    persist
+    # Stop the persist loop and the safety timer by pid before handing over: the
+    # system that is about to start must not be rebooted from behind by a timer
+    # that was only meant for the standalone fallback.
+    kill $persist_job $timer_job 2>/dev/null
+    log "stage=switch-root-jobs-killed persist=${persist_job:-?} timer=${timer_job:-?}"
+    for p in /proc/[0-9]*; do [ "${p#/proc/}" = 1 ] || kill -9 "${p#/proc/}" 2>/dev/null; done
+    umount /config 2>/dev/null
+    mkdir -p /newroot/dev /newroot/proc /newroot/sys /newroot/run
+    mount --move /dev /newroot/dev
+    mount --move /proc /newroot/proc
+    mount --move /sys /newroot/sys
+    mount --move /run /newroot/run 2>/dev/null
+    # userdata, where the root images and e5linux/boot-os live, for e5-os and
+    # the installers of the running system (no mountpoint applet here, and
+    # /proc has just moved)
+    if [ -n "$data_mounted" ]; then
+        mkdir -p /newroot/mnt/e5-data && mount --move /data /newroot/mnt/e5-data
+    fi
+    exec switch_root /newroot $init
+fi
+
+# ------------------------------------------------- standalone Linux fallback
+log "stage=rootfs-unavailable err=$(cat /run/rootmount.err 2>/dev/null)"
+restore_slot_a
+ifconfig usb0 192.168.77.1 netmask 255.255.255.0 up
+log "stage=usb0 $(ifconfig usb0 2>&1 | head -1)"
+cat > /etc/udhcpd.conf <<'EOF'
+start 192.168.77.2
+end 192.168.77.9
+interface usb0
+option subnet 255.255.255.0
+option lease 600
+lease_file /run/udhcpd.leases
+pidfile /run/udhcpd.pid
+EOF
+touch /run/udhcpd.leases
+udhcpd /etc/udhcpd.conf 2>/run/udhcpd.err
+telnetd -b 192.168.77.1 -p 23 -l /bin/sh
+mkdir -p /run/www
+echo "E5 standalone Linux: telnet 192.168.77.1 (or the USB serial console)." > /run/www/index.html
+echo "Auto reboot to Android after 600s unless /run/stay exists." >> /run/www/index.html
+httpd -p 192.168.77.1:80 -h /run/www
+mkdir -p /dev/pts
+setsid sh -c 'exec sh </dev/ttyGS0 >/dev/ttyGS0 2>&1' &
+log "stage=ready standalone"
+persist
+while :; do
+    dmesg > /run/www/dmesg.txt 2>/dev/null
+    cat /proc/modules > /run/www/modules.txt 2>/dev/null
+    sleep 5
+done

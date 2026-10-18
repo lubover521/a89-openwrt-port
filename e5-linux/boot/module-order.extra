@@ -1,0 +1,174 @@
+# Modules the e5-linux initramfs must load that Android does NOT load in its
+# first stage.  Android brings these up from its second-stage init, so they are
+# absent from boot/module-order.stock.
+#
+# --- battery / charger -------------------------------------------------------
+# aw32257_charger is the AW322xx charger driver (it registers the power supply
+# literally named "aw322xx_charger" and matches compatible "awinic,aw322xx_chg",
+# see drivers/power/supply/aw32257_charger.c).  The board's DT puts it on i2c2 at
+# address 0x6a, and -- through the "vddvbus" regulator its child node declares --
+# the USB controller node lists it as a devicetree supplier:
+#
+#   $ ls /sys/bus/platform/devices/64a00000.usb/
+#   supplier:i2c:2-006a -> .../i2c:2-006a--platform:64a00000.usb
+#
+# fw_devlink enforces supplier readiness *before* a probe function is entered, so
+# while 2-006a has no driver the USB controller can never probe:
+#
+#   platform 64a00000.usb: DEFERDBG: supplier 2-006a not ready
+#   probe of 64a00000.usb returned -517
+#
+# The only visible symptom is that /sys/class/udc stays empty, i.e. no USB
+# network and no serial console.  It is the charger driver that unblocks USB.
+#
+# --- display -----------------------------------------------------------------
+# Same story as the charger: sprd_vpu_pw_domain.ko is the genpd provider for the
+# VPU/display power domain, and while it is absent the DPU, DSI and GSP platform
+# devices never probe -- there is no /dev/dri at all, only /sys/class/drm/version.
+# artifacts_e5/diagnostics_2026-09-10.md section 2 works through this on the
+# Android port: the four devices that never recover are
+# 30130000.sprd-gsp, 31000000.dpu, 31300000.dsi, 31300000.dphy, and installing
+# the provider turns all four green.  The DPU and DSI drivers themselves are
+# built in (CONFIG_DRM_SPRD_DPU0=y, CONFIG_DRM_SPRD_DSI=y), so the power domain
+# has to be loaded first, before the DRM core and GSP modules that depend on it.
+#
+# --- USB ---------------------------------------------------------------------
+# Order follows the probe chain the kernel port documents:
+# extcon-gpio -> typec -> hsphy -> musb (artifacts_e5/driver_gap_2026-09-12.md).
+# gen-module-order.py additionally pulls in each module's own dependencies.
+sprd_vpu_pw_domain.ko
+sprd-drm.ko
+sprd-gsp.ko
+sprd_battery_info.ko
+ump96xx_fuel_gauge.ko
+aw32257_charger.ko
+sprd-charger-manager.ko
+extcon-usb-gpio.ko
+sc27xx_typec.ko
+sprd_tcpm.ko
+sprd-bc1p2.ko
+phy-sprd-qogirn6lite.ko
+musb_hdrc.ko
+musb_sprd.ko
+sprd_usbm.ko
+sprd_usbpinmux.ko
+
+# --- Wi-Fi / WCN --------------------------------------------------------------
+# sprd_wlan_combo.ko is the fullmac cfg80211 driver for the Unisoc WCN combo chip
+# (sc2332/sc2355; the board's own DT wires sc2355 over SDIO as
+# "sprd,sc2355-sdio-wifi"), and wcn_bsp.ko is the sprdwcn bus + SDIO glue it sits
+# on.  Both are built by the E5 defconfig this project builds from --
+# CONFIG_UNISOC_WCN_BSP=m and CONFIG_UNISOC_WLAN_COMBO=m in
+# arch/arm64/configs/e5_rongyue_defconfig, and their Kconfig is reachable
+# (drivers/unisoc_platform/Kconfig sources sprdwcn/Kconfig and
+# sprd_wlan_combo/Kconfig) -- but both are absent from module-order.stock for
+# exactly the reason the charger and the display power domain were: Android loads
+# Wi-Fi from its *second* stage, and the stock list is only the first stage.
+# Nothing in the initramfs or in the Debian root filesystem ever insmods them, so
+# no WCN device is probed and Linux has no Wi-Fi.  The failure is silent, like the
+# other two: loading the driver is what makes it visible.
+#
+# gen-module-order.py resolves the closure, so the top-level driver is enough:
+# cfg80211 comes in with it (CONFIG_CFG80211=m), while the SDIO/MMC core the bus
+# needs is built in (CONFIG_MMC=y, CONFIG_MMC_SDHCI=y).
+#
+# Loading the modules is necessary but not sufficient.  wcn_bsp.ko's boot code
+# request_firmware()s wcnmodem.bin and a per-board set of .ini files
+# (wifi_board_config*.ini, connectivity_configure*.ini,
+# connectivity_calibration*.ini, tsx_data), and reads the factory MAC from
+# /mnt/vendor/wifimac.txt.  Those live on the Android vendor side; they have to be
+# copied into the root filesystem (see docs/FINDINGS.md section 8) or the driver
+# probes and then fails to boot the chip.
+wcn_bsp.ko
+sprd_wlan_combo.ko
+
+# --- PMIC watchdog -------------------------------------------------------------
+# The other half of the watchdog: on Android, sprd-pmic-wdt is bound to the PMIC's
+# watchdog child (64400000.spi:pmic@0:watchdog@40), and LK arms that one too ("dswdt
+# was enabled by miscdata", androidboot.dswdten=enabled).  It was never staged here,
+# so nothing on the Linux side ever touched it.  It also gives systemd a watchdog
+# device to hold and ping (see rootfs/overlay/etc/systemd/system.conf.d).
+sprd_pmic_wdt.ko
+
+# --- vibrator --------------------------------------------------------------------
+# The PMIC's vibrator child (pmic@0:vibrator@2390, "sprd,ump9620-vibrator"), as
+# Android loads it ("input: sc27xx:vibrator").  A force-feedback input device:
+# feedbackd on Debian (SMS, calls) and anything with EVIOCSFF/EV_FF on OpenWrt.
+# The driver takes the strength from rumble.weak_magnitude, not strong.
+sc27xx-vibra.ko
+
+# --- physical keys -------------------------------------------------------------
+# The board is a 5G feature phone, so most of its input is a 9-key pad, not touch.
+# The pad is a plain matrix keypad on the SoC's AON keypad controller:
+#
+#   /proc/device-tree/soc/aon/keypad@641B0000  compatible "sprd,sc9860-keypad"
+#   status "okay", keypad,num-rows/num-columns, debounce-interval, linux,keymap
+#
+# and it is present in the running DT (platform device 641b0000.keypad, with the
+# aon clock gate 64900000.aonapb-gate as its devlink supplier).  It has no driver
+# because CONFIG_KEYBOARD_SPRD is =m, and the module is not in Android's
+# first-stage list -- the same story as the charger, the display power domain and
+# the WCN drivers.  An unbound node is silent: dmesg says nothing at all.  Adding
+# the module turns /proc/bus/input/devices from two devices (gpio-keys,
+# tlsc6x_touch) into three:
+#
+#   N: Name="sprd-keypad"   H: Handlers=kbd event2    B: KEY=...fc (1-9, 0, * #)
+#
+# gpio-keys (input0) is where the power and volume keys already live; see
+# docs/FINDINGS.md section 12.
+sprd_keypad.ko
+matrix-keymap.ko
+
+# --- Bluetooth ----------------------------------------------------------------
+# sprdbt_tty is the Bluetooth half of the same WCN combo chip the WLAN modules
+# drive: HCI over the sprdwcn bus into the marlin core that wcn_bsp boots.  It is
+# built (CONFIG_UNISOC_WCN_BT=m, "SPRDBT_TTY") and, like the WLAN half, it is
+# second-stage on Android, so it was never in the stock first-stage list and
+# nothing loaded it -- there was no hci0 and bluez had no adapter to talk to.
+#
+# It depends on wcn_bsp having taken the chip out of reset, which is the firmware
+# story in docs/FINDINGS.md section 8: the WCN modules cannot do anything until
+# /lib/firmware carries the firmware, and they now load with it in place.
+sprdbt_tty.ko
+
+# --- UMS9620 audio ------------------------------------------------------------
+# The audio card is a vendor UMP9620/VBC stack.  These modules are deliberately
+# NOT loaded here: they are staged into the root filesystem instead
+# (rootfs/configure-rootfs.sh puts them in /usr/lib/modules/<rel>/audio) and
+# /opt/e5/e5-audio-dsp modprobes them as the first step of the DSP bring-up that
+# e5-audio.service runs before the session starts.
+#
+# Why not the initramfs, which is where this list used to live (commented out
+# since 2026-09-19): with the modules loaded at boot the card exists long before
+# anything can boot the DSP -- the AGDSP image is a rootfs/partition read and a
+# sysfs write -- and the session's pipewire then probes a card whose power
+# domain's core has nothing to execute, which is what hard-reset the board twenty
+# seconds into those sessions (docs/STATUS.md).  mu300-linux loads its audio set
+# from the root filesystem for the same reason, and the sequence this port uses
+# (modules -> card registered -> firmware write -> DSP start -> routes) is the
+# one it proved on this driver family.  The list below is kept as the inventory
+# of what the kernel build produces; gen-module-order.py is not involved.
+#agdsp_pd.ko
+#audio_mem.ko
+#audio_sipc.ko
+#mcdt_hw_r2p0.ko
+#sprd_audcp_boot.ko
+#sprd_audcp_dvfs.ko
+#audio-pipe.ko
+#audio-dsp-dump.ko
+#voice_trigger_irq.ko
+#sprd_apipe.ko
+#snd-soc-fsa4480.ko
+#snd-soc-sprd-pa-aw87xxx.ko
+#snd-soc-sprd-card.ko
+#snd-soc-sprd-codec-ump9620.ko
+#snd-soc-sprd-codec-ump9620-power.ko
+#snd-soc-sprd-codec-ump9620-power-dev.ko
+#snd-soc-sprd-dummy-codec.ko
+#snd-soc-sprd-pdm-r2p0.ko
+#snd-soc-sprd-tdm.ko
+#snd-soc-sprd-vbc-v4.ko
+#snd-soc-sprd-vbc-fe.ko
+#sprd-compr-2stage-dma.ko
+#sprd-dmaengine-pcm.ko
+#sprd-platform-pcm-routing.ko

@@ -1,0 +1,5940 @@
+# Findings: booting Linux on the Rongyue E5
+
+Everything here was measured on the device or read out of the stock images; items
+that are still assumptions are marked **UNVERIFIED**. Device: Rongyue E5,
+`ro.product.device=ums9158_1h10`, `ro.board.platform=ums9621`, model `E5`,
+Android 13, stock kernel `5.15.119-android13-8-00018-ga78ea39db117-ab10710420`,
+build `TS305_V03_20260113_2322`.
+
+## 1. Boot chain
+
+The E5 is a normal Android A/B device with an unlocked bootloader
+(`ro.boot.verifiedbootstate=orange`) and the Android 13 GKI split:
+
+| partition | contents | size |
+|---|---|---|
+| `boot_a` / `boot_b` | header v4; kernel (arm64 Image, EFI stub); ramdisk | 64 MiB |
+| `init_boot_a` / `init_boot_b` | header v4, kernel_size 0, generic ramdisk | 8 MiB |
+| `vendor_boot_a` / `vendor_boot_b` | VNDRBOOT v4, DTB in the kernel field, vendor ramdisk (~80 MiB) | 100 MiB |
+| `dtbo_a` / `dtbo_b` | the device tree the bootloader actually passes | 8 MiB |
+| `dtb_a` / `dtb_b` | all zero | 8 MiB |
+| `misc` | `bootloader_control` at offset 0x800 | 1 MiB |
+| `super` | logical partitions (system, vendor, product, …, vendor_dlkm) | 5.47 GiB |
+| `userdata` | f2fs, mounted directly (no metadata encryption) | 21.86 GiB |
+
+### Which ramdisk does LK use? boot.img wins
+
+This decided the whole design, and the stock bootloader log (`uboot_log`
+partition, 16 MiB) answers it directly:
+
+    bootimage: generic ramdisk size is 360840
+    bootimage: generic ramdisk offset is 0x2c98000
+    ...
+    bootimage: generic ramdisk size is zero, maybe ramdisk in init_boot image side!
+    init_bootimage: generic ramdisk size is 1907183
+
+LK takes the **generic ramdisk from boot.img**, and only falls back to
+`init_boot` when boot.img's `ramdisk_size` is zero (which is the stock state:
+stock `boot_a`/`boot_b` carry kernel only). The same log shows the two ramdisks
+being loaded to separate addresses, so they are not simply concatenated either:
+
+    vendor_boot_a ramdisk read OK, size = 80668385, locate to 0xc0000000!
+    boot_a ramdisk read OK, size = 360840, locate to 0xc4cee6e1!
+
+**Consequence:** the Linux kernel *and* the Linux initramfs both go into slot b's
+`boot` image. `init_boot_b` and `vendor_boot_b` stay stock — which also
+matters because LK AVB-verifies `init_boot` (`verify boot check init_boot`,
+`partion init_boot, verify_ret:0x0`).
+
+### Ramdisk compression must be LZ4 *legacy*
+
+The stock and Magisk ramdisks both start with `02 21 4c 18` (LZ4 legacy frame,
+not the modern `04 22 4d 18`). `boot/build-boot-image.py` compresses with
+`lz4 -l` accordingly.
+
+### AVB is not enforced
+
+`ro.boot.verifiedbootstate=orange`, and the device currently boots a
+Magisk-patched `boot_a` (`ramdisk_size=360840` where stock is 0) whose digest
+cannot match the stock descriptor. The boot image builder therefore keeps the
+stock header, the stock vbmeta blob and the stock `AVBf` footer byte for byte
+and only repoints `original_image_size`/`vbmeta_offset` — the safe path, since
+regenerated descriptors have produced `invalid vbmeta header` /
+`ERROR_INVALID_METADATA` failures on this device before.
+
+### Slots and `misc`
+
+Live `misc` at offset 0x800 (32 bytes, CRC-valid):
+
+    5f 61 00 00 42 43 41 42 01 02 00 00 9f 00 1e 00 ...
+    "_a\0\0"  "BCAB"     v1 n2        a     b
+
+This is the same AOSP `bootloader_control` structure mu300-linux documents for
+the UMS9620: `slot_suffix[4]`, magic `BCAB`, version, `nb_slot`,
+`recovery_tries`, `merge_status`, `slot_info[4]`, then a CRC32 over the first
+28 bytes. `slot_info` bits are priority (4) | tries_remaining (3) |
+successful_boot (1):
+
+* slot a = `0x9f` → priority 15, tries 1, successful
+* slot b = `0x1e` → priority 14, tries 1, **not** successful
+
+`flash-trial.sh` writes a slot-b trial block derived from these live values:
+slot a keeps a slightly lower priority and stays successful, slot b gets priority
+15 with tries=2. LK decrements to 1 on the next boot, and — exactly as
+mu300-linux found for this bootloader family — treats `tries==1 && !successful`
+as an already-failed boot, so a Linux attempt that never completes rolls back to
+Android. **UNVERIFIED on this device**: that the E5's LK implements the identical
+decrement/rollback rule. The trial path is one-shot by construction, and
+`boot/init` also restores the slot-a block explicitly before it reboots.
+
+## 2. There is no free eMMC space — the rootfs lives in `/data`
+
+mu300-linux puts its root filesystem in the unallocated region after `userdata`.
+On the E5 there is no such region: `userdata` (partition 70) ends at LBA
+61075455, exactly the GPT's `last_usable_lba` — **zero bytes free**.
+
+    p70  first=15241216  last=61075455  size=21.86 GiB  userdata
+    gpt  last_usable_lba=61075455  ->  free after last partition: 0 bytes
+
+Rather than rewrite the partition table, e5-linux keeps mu300-linux's "do not
+touch the GPT" property and stores the root filesystem as a file inside Android's
+`/data`: **`/data/e5linux/rootfs.ext4`**. `/data` is f2fs mounted straight
+from `mmcblk0p70` (no `dm-default-key` metadata encryption), so the Linux
+kernel mounts it with the in-tree f2fs driver and attaches the file to a loop
+device. Android's per-file encryption means the file itself is stored in the
+clear — which is fine, it is expected to be readable by root only.
+
+Trade-offs worth knowing: a factory reset or `fastboot -w` erases it, and
+mounting f2fs read-write from Linux is only as safe as the last Android
+shutdown. Both are acceptable for a bring-up that must not touch the partition
+table; a later revision can shrink `userdata` and carve a real partition.
+
+## 3. Module load order is not alphabetical
+
+The stock Android first-stage list in `vendor_boot` is a hand-tuned 83-entry
+subset of the kernel's modules, with ADI/PMIC/clock layers first and
+`ump9620-regulator.ko` at position 18. Loading an alphabetical list puts
+`ump9620-regulator.ko` first, where `dev_get_regmap()` returns NULL and the
+driver dereferences it — first-stage init dies with no log at all. e5-linux ships
+that exact order in `boot/module-order.stock` and `boot/stage-modules.sh`
+filters it down to the modules this kernel actually built, so the initramfs
+`insmod` order always matches the order the stock first-stage init used.
+
+`sprd_wdt_fiq.ko` is at position 10 of that list and matters more than the rest:
+it is the SoC watchdog, it feeds itself from its FIQ handler, and the bootloader
+hands over with the watchdog armed (`sprdboot.wdten=e551`,
+`androidboot.dswdten=enabled`). This model exposes **no `/dev/watchdog`** even
+on stock, so there is no userspace way to pet it.
+
+## 4. Log capture
+
+A Linux boot attempt that fails gives no adb, no network and no ylog (Android
+only archives ylog after a *successful* boot). Three channels are used:
+
+1. **`boot/init` writes every stage to `/dev/kmsg` and `/dev/pmsg0`**, which
+   land in `/sys/fs/pstore/console-ramoops-0` / `pmsg-ramoops-0`. The boot
+   command line also registers ramoops early
+   (`ramoops.mem_address=0xfff80000 ramoops.mem_size=0x40000 …`, the region the
+   stock DT reserves at `ramoops@fff80000`), so output from a boot that dies
+   before the DT-based initcall is not lost. This mirrors the mitigation recorded
+   in `artifacts_e5/diagnostics_2026-09-09.md`.
+2. **A 4 MiB persistent log at 56 MiB inside `boot_b`**, written by `boot/init`.
+   Unlike pstore this survives a cold power cycle and is not overwritten by the
+   next successful Android boot. `boot/build-boot-image.py` refuses to build an
+   image that would overlap it.
+3. **The bootloader log** in `uboot_log`, which is the only place that shows
+   slot selection, ramdisk sizes and AVB results.
+
+`tools/collect-logs.sh` pulls all three after the device is back in Android.
+
+**In the switch_root path the block deliberately ends at `stage=switch-root`, and
+that is not a bug.** The writer is the initramfs `init`; `switch_root` replaces
+PID 1 and the initramfs goes away with it, so there is nothing left to write the
+block. A block whose last stage is `stage=switch-root` therefore says the session got
+all the way into the real root filesystem — which is exactly what the last run
+recorded (`uptime=14.74`, `loaded=60 failed=0`, `default-boot-linux (slot a restore
+skipped)`, `switch-root root=/disk init=/lib/systemd/systemd`). The last line
+`boot/init` writes before handing over, `stage=switch-root-jobs-killed`, is only in
+`/run/stages` inside the running system (`cat /run/stages`), never in this block.
+Anything that happens after switch_root has to be logged from userspace: the block
+cannot see it, so it cannot diagnose a session that dies later (see §9).
+
+**In the standalone path — no root filesystem, `init` keeps running — the block used
+to stop after its first successful write.** `persist()` takes a `/run/persist.lock`
+directory so the periodic loop cannot race the caller, and it recorded the timestamp
+*inside* that directory (`/run/persist.lock/stamp`) and released it with
+`rmdir /run/persist.lock`. `rmdir` cannot remove a directory that holds a file, so
+the release always failed; from then on every call either returned because the lock
+looked younger than the two-minute staleness limit or, past that limit, failed to
+re-create it. The lock-expiry logic could not save it either — the age test reads the
+lock *path* itself (`cat /run/persist.lock`, a directory, always empty), and the
+expiry's `rmdir` fails for the same reason. `boot/init` now keeps the stamp beside the
+lock (`/run/persist.stamp`) and releases both with `rm -rf`. Note the contrast with
+the campaign's run 1, which used an older `init` with no locking at all and did keep
+writing every fifteen seconds right up to `uptime=276.28`.
+
+## 5. Device-alive risks specific to this hardware
+
+* ~~**Charging has no driver path.**~~ **Superseded — see §7.2.** The E5 charges
+  through `aw322xx_chg` on i2c2 address 0x6a. There is no file called
+  `aw322xx_charger.c` in any of the trees used for this port, which is where
+  this section originally stopped, but `drivers/power/supply/aw32257_charger.c`
+  *is* that driver: it matches `compatible = "awinic,aw322xx_chg"` and registers
+  the power supply literally named `aw322xx_charger`. It was never loaded.
+  With it loaded the kernel reports `battery/status = Charging`. A Linux session
+  still should not be left unattended, because of the two risks below.
+* **No `/dev/watchdog`.** See §3.
+* **The modem and PM co-processor are not brought up.** mu300-linux needs
+  Android's `modem_control` in a chroot to disarm the PM watchdog; nothing
+  equivalent has been attempted here. Anything that depends on the modem (mobile
+  data, and on some Unisoc parts the PM watchdog) is out of scope for now.
+
+## 6. USB gadget
+
+Stock exposes a single UDC, `musb-hdrc.1.auto`, with an Android-shaped gadget
+(`ffs.adb`, `sprdgser.gs0/1/2`, `idVendor=0x18d1 idProduct=0x4ee8`).
+e5-linux builds its own gadget through configfs from the initramfs: ECM
+(`usb0`, the `192.168.77.0/24` management LAN) plus a CDC-ACM console on
+`ttyGS0`. `CONFIG_USB_F_ACM`/`CONFIG_USB_F_ECM` and the two `USB_CONFIGFS_*`
+options are built in rather than modular so the console does not depend on module
+load order; musb itself stays a module and is loaded at its stock position.
+
+Known open issue inherited from the kernel port: the gadget bind-to-enable path
+was a few seconds slower than stock, and the four `musb_sprd` fixes
+(DMA channel programming, `dr_mode`, the PHY platform-name race, the
+`hops.host_start` NULL deref) were compile-verified only.
+
+**VERIFIED** (§7): `/sys/class/udc/musb-hdrc.1.auto/state` reads `configured`,
+the host enumerates `0525:a4a1 Linux-USB Ethernet Gadget`, the initramfs udhcpd
+hands out `192.168.77.4/24`, and telnet to `192.168.77.1` gives a root shell.
+
+### 6.1 NCM instead of ECM, and a DHCP server that actually runs
+
+The gadget originally spoke CDC-ECM.  macOS does bind it (it shows up as an
+Ethernet interface), but nothing served DHCP on a normal boot: the initramfs udhcpd
+only runs on the standalone path, and on the switch_root path init just does
+ifconfig usb0 up, so the host sat on a 169.254 link-local address forever.  Two
+changes:
+
+* the configfs function is now **ncm.usb0** (the kernel already had
+  CONFIG_USB_CONFIGFS_NCM=y and CONFIG_USB_F_NCM=y; only the initramfs script named
+  ecm.usb0), which is also the protocol macOS handles best.  The CDC-ACM console is
+  unchanged, and it is still the channel this work is driven over.
+* usb0 is configured by systemd-networkd -- Address=192.168.77.1/24 plus
+  DHCPServer=yes, in /etc/systemd/network/10-e5-usb0.network, with NetworkManager
+  told to leave the interface alone.  networkd is pulled in by a drop-in on
+  NetworkManager.service rather than by enabling it, because the overlay travels
+  into the initramfs as plain files and cannot carry symlinks.
+
+Result on hardware: the device reports usb0 UP 192.168.77.1/24 with networkd active
+and State: routable (configured), the Mac gets 192.168.77.92 by DHCP, and
+ping 192.168.77.1 is 0% loss.  (There is no sshd in the image, so the LAN is ICMP/HTTP
+for now; the serial console is still the shell.)
+
+### 6.2 The power key used to power the device off
+
+Symptom: the screen goes dark and pressing power does not bring it back -- and the
+device disappears from USB entirely.  Cause: systemd-logind's default
+HandlePowerKey=poweroff.  Plasma Mobile drives the key itself, but logind saw it
+first, so "wake the screen" was executed as "power off".
+
+/etc/systemd/logind.conf.d/10-e5-power.conf now sets HandlePowerKey,
+HandlePowerKeyLongPress, HandleSuspendKey, HandleHibernateKey, HandleLidSwitch and
+IdleAction all to ignore -- this port has no usable suspend/resume either, so nothing
+should try.  Verified with busctl get-property: HandlePowerKey = "ignore",
+IdleAction = "ignore".
+
+### 6.3 Session, keys, and which kernel Image to flash
+
+Three symptoms turned out to be one cause, and one of them was self-inflicted:
+
+* The panel showed the SDDM **greeter** (its theme is what looks like a boot logo)
+  instead of Plasma Mobile, and the **power and volume keys did nothing**.  Both are
+  the same failure: when the autologin session fails, SDDM falls back to the greeter,
+  and in an X11 greeter the keys go nowhere -- they are wired to gpio-keys, not to the
+  console.  The kernel does deliver them: /proc/bus/input/devices shows gpio-keys with
+  KEY_VOLUMEDOWN (114), KEY_VOLUMEUP (115) and KEY_POWER (116).
+* The autologin session was failing because **KWin could not keep /dev/dri/card0**.
+  With the Image this work had rebuilt (Homebrew clang 23, plus CONFIG_DEVMEM for a
+  watchdog experiment that turned out to be a dead end) the log reads
+  "kwin_wayland_drm: failed to open drm device at /dev/dri/card0 / No suitable DRM
+  devices have been found", and KWin's clients then abort with
+  "no Qt platform plugin could be initialized".
+
+So the boot image now carries the **original Image** again (work/Image, sha256
+c1ab1905...) with the new ramdisk: 64 modules, the NCM gadget, and the overlay.  The
+same three checks then pass: kwin_wayland + plasmashell run, /sys/kernel/debug/dri/0/state
+says allocated by = kwin_wayland, and the keys have a compositor to talk to.
+CONFIG_DEVMEM stays in the fragment only because boot/init logs the SoC watchdog
+registers; without it that log line is just skipped.
+
+### 6.4 Telnet on the management LAN
+
+The full system had no remote shell (the initramfs telnetd only exists on the
+standalone path, and there is no sshd in the image).  The initramfs now copies its
+static arm64 busybox into the real root as /usr/local/bin/busybox, and
+e5-telnetd.service runs busybox telnetd -p 23 -l /bin/login from it -- no package has
+to exist in the Debian image.  The unit is pulled in by the same NetworkManager
+drop-in as systemd-networkd (the overlay cannot carry enable symlinks).  Verified from
+the host: 192.168.77.1:23 answers with a telnet banner and the host holds a DHCP lease
+on 192.168.77.92.
+
+## 7. What actually happened: the boot campaign
+
+Five trial boots on 2026-09-17. Each one flashes `boot_b` plus the 32-byte
+`bootloader_control` in `misc`, reboots, and reads the results back either from
+Android afterwards or, once the gadget worked, from the running Linux itself.
+
+### 7.1 The kernel boots and the slot mechanism works
+
+Run 1 (slot b, 42 modules) settled it. `uboot_log` shows LK honouring the armed
+slot — `boot_b ramdisk read OK, size = 1800450` followed by
+`fixup androidboot.slot_suffix=_b` — and the persistent block inside `boot_b`
+records our kernel running our init for 276 s:
+
+```
+E5-PERSIST-BEGIN uptime=276.28 release=5.15.211-g94401422a7df
+1.74 stage=devfs-ready
+5.08 stage=modules-done loaded=31 failed=11
+5.32 stage=partitions misc=/dev/mmcblk0p3 boot_b=/dev/mmcblk0p37
+45.32 stage=udc udc=none available=
+45.72 stage=misc-restored-slot-a dev=/dev/mmcblk0p3
+45.87 stage=ready standalone
+```
+
+The device then rebooted itself back into Android, which means the rollback rule
+this project depends on holds on this device: a slot-b boot that never reaches
+userspace ends up on slot a.
+
+### 7.2 Two drivers existed but were never loaded
+
+Both failures had the same shape, and neither is visible in the source tree.
+
+**The charger blocked USB.** The first run had no UDC at all, and `dmesg` said
+why once the deferral was traced:
+
+```
+platform 64a00000.usb: DEFERDBG: supplier 2-006a not ready
+probe of 64a00000.usb returned -517
+```
+
+`2-006a` is the AW322xx charger. On the live device the USB controller lists it
+as a devicetree supplier, because the charger node declares the `vddvbus`
+regulator that `musb_sprd` requests when it switches to host mode:
+
+```
+$ ls /sys/bus/platform/devices/64a00000.usb/ | grep supplier
+supplier:i2c:2-006a -> .../i2c:2-006a--platform:64a00000.usb
+```
+
+`fw_devlink` checks suppliers *before* entering a probe function, so while
+`2-006a` has no driver the USB controller can never probe — and the only
+symptom is an empty `/sys/class/udc`. Loading `aw32257_charger.ko` fixes it
+properly. `fw_devlink=permissive` also unblocks it, but it was tried and
+rejected: with every driver free to probe out of order the kernel died before
+the initramfs wrote its first log line.
+
+**The display was missing its power domain.** `/dev/dri` did not exist and
+`/sys/class/drm` contained only `version`, because `sprd_vpu_pw_domain.ko` —
+the genpd provider for the VPU/display domain — was never loaded, so
+`31000000.dpu`, `31300000.dsi` and `30130000.sprd-gsp` never probed. This is
+the same gap `artifacts_e5/diagnostics_2026-09-10.md` works through on the
+Android port. Loading it, plus `sprd-gsp.ko` and `sprd-drm.ko`, gives
+`/dev/dri/card0` and a `card0-DSI-1` connector.
+
+The lesson generalises: Android's first-stage `modules.load` is not a
+description of what the hardware needs, it is a description of what Android's
+*second* stage has not loaded yet. Anything the initramfs needs and Android
+defers is missing from it, and the failure mode is silent.
+
+### 7.3 The final state
+
+```
+Linux e5-linux 5.15.211-g94401422a7df aarch64
+1.76 stage=devfs-ready
+11.57 stage=modules-done loaded=56 failed=0
+11.86 stage=partitions misc=/dev/mmcblk0p3 boot_b=/dev/mmcblk0p37
+12.00 stage=udc udc=musb-hdrc.1.auto available=musb-hdrc.1.auto,
+12.13 stage=usb-bind-done rc=0
+12.58 stage=data-mounted
+13.41 stage=rootfs-unavailable err=
+13.44 stage=misc-restored-slot-a dev=/dev/mmcblk0p3
+13.47 stage=ready standalone
+```
+
+All 56 modules load, `/sys/kernel/debug/devices_deferred` is empty (nothing is
+waiting on anything), the UDC is `configured`, the device tree is a working
+network, and:
+
+```
+/ # cat /sys/class/power_supply/battery/status
+Charging
+/ # cat /sys/class/power_supply/battery/capacity
+50
+/ # ls /dev/dri
+card0
+```
+
+Also worth recording because it cost a boot: the initramfs used to locate
+`misc`/`boot_b` *after* the module pass. Moving that earlier, so an early crash
+still leaves a log, does not work on this platform — the eMMC partitions are not
+in `/sys/class/block` yet and the discovery came up empty for twenty seconds.
+The authoritative attempt stays after the module pass; the early one is best
+effort. `boot/init` now does both.
+
+## 8. Wi-Fi: the driver is in the tree and builds, but nothing ships it
+
+`lsmod` under Linux has no Wi-Fi module and there is no `wlan0` — not because the
+hardware has no driver, but because the driver was never put into the initramfs.
+
+The hardware is a Unisoc WCN combo chip (sc2332/sc2355 family); the board's own DT
+wires it up over SDIO as `sprd,sc2355-sdio-wifi`. Both halves of the driver are in
+the kernel tree e5-linux builds from:
+
+| module | source | config in `e5_rongyue_defconfig` |
+|---|---|---|
+| `wcn_bsp.ko` | `drivers/unisoc_platform/sprdwcn/` — sprdwcn bus plus the `sdio/sdiohal_*` glue | `CONFIG_UNISOC_WCN_BSP=m` (line 758) |
+| `sprd_wlan_combo.ko` | `drivers/unisoc_platform/sprd_wlan_combo/` — fullmac cfg80211 WLAN driver | `CONFIG_UNISOC_WLAN_COMBO=m` (line 762) |
+
+The Kconfig is reachable — `drivers/unisoc_platform/Kconfig` sources both
+sub-Kconfigs and `drivers/Kconfig` sources that file — so `make Image modules dtbs`
+really does build both `.ko` files, and `CONFIG_CFG80211=m` is present for the
+fullmac glue. The `.ko` files are in the kernel build output; they are simply not in
+`boot/module-order.txt`, which is the only list `boot/stage-modules.sh` packs into
+the initramfs.
+
+That they are second-stage on Android is visible on the running device:
+
+    # ls /vendor/lib/modules | grep -iE "wcn|wlan|cfg80211"
+    cfg80211.ko
+    sprd_wlan_combo.ko
+    wcn_bsp.ko
+
+and a first-stage device check says the rest of the path is intact: the SDIO
+controllers inside the SoC (`22200000.sdio`, `22210000.sdio`) *do* defer early on
+their PMIC power domain -- `probe of 22210000.sdio returned -517` at 1.33 s, before
+any module is loaded -- but by `uptime=14.74`, when the initramfs writes its last log
+block, `/sys/kernel/debug/devices_deferred` is empty, so the PMIC driver from the
+module pass is what unblocks them. Wi-Fi is missing its driver, not its bus.
+
+**Why they were missing is the same story as section 7.2.** `module-order.stock` is
+Android's *first-stage* `modules.load`. Android brings Wi-Fi up from its second stage
+(`modprobe`, out of `/vendor/lib/modules`), so the WCN modules are not in that
+83-entry list — and because the initramfs uses `insmod` with a fixed order, there is
+no modprobe afterwards to pull them in either. The result is a silent gap: the
+modules are built, nothing loads them, and the only symptom is that Wi-Fi does not
+exist. The charger (`aw32257_charger.ko`, section 7.2) and the display power domain
+(`sprd_vpu_pw_domain.ko`) were the same shape of bug.
+
+The fix is two lines in `boot/module-order.extra`:
+
+    wcn_bsp.ko
+    sprd_wlan_combo.ko
+
+`boot/gen-module-order.py` resolves the closure, so `cfg80211.ko` is pulled in
+automatically and the SDIO/MMC core the bus needs is built in (`CONFIG_MMC=y`,
+`CONFIG_MMC_SDHCI=y`). The kernel modules then have to be rebuilt and restaged
+(`kernel/build-linux.sh`, `boot/stage-modules.sh`, then the boot image). No `.ko`
+files were on the macOS host used for this session, so the entries are in place but
+**UNVERIFIED on hardware**.
+
+### 8.1 Loading the modules is necessary, not sufficient
+
+`drivers/unisoc_platform/sprdwcn/boot/wcn_boot.c` and `wcn_integrate_boot.c` take the
+WCN core out of reset with `request_firmware()`, so the chip only boots if these are
+where the Linux firmware loader looks (`/lib/firmware` in the root filesystem):
+
+    wcnmodem.bin
+    gnssmodem.bin
+    wifi_board_config*.ini
+    connectivity_configure*.ini
+    connectivity_calibration*.ini
+    tsx_data
+
+and the driver additionally reads factory data from Android paths that have no
+Debian equivalent:
+
+    /mnt/vendor/wifimac.txt                              (factory MAC)
+    /mnt/vendor/wcn/connectivity_calibration_bak.ini
+    /productinfo/wcn/tsx_bt_data.txt
+    /data/vendor/wifi/wifimac_temp.txt
+
+Read out of the running Android, these are the files that actually exist on this
+device and where they live:
+
+| file | location on Android | note |
+|---|---|---|
+| `wcnmodem.bin` | `/odm/firmware/wcnmodem.bin` | 947 KiB, the WCN firmware |
+| `gnssmodem.bin` | `/odm/firmware/gnssmodem.bin` | 596 KiB, requested during WCN boot too |
+| `wifi_board_config*.ini` | `/odm/firmware/` and `/odm/etc/` | `.ini`, `.xpe.ini`, `_aa.ini`, `_aa.xpe.ini` — the board variants all ship |
+| `tsx_data` | `/vendor/firmware/tsx_data` | the only `tsx`-ish file on the vendor image |
+| factory MAC | `/mnt/vendor/wifimac.txt` | `fc:b5:85:d0:9d:47` on this unit |
+| calibration dir | `/mnt/vendor/wcn/` | empty on Android too; the driver *writes* `connectivity_calibration_bak.ini` there, so it has to exist and be writable |
+
+`/odm` is an `erofs` logical partition inside `super` (`/dev/block/dm-0`) and
+`/vendor` likewise, so the blobs cannot just be mounted from Linux the way
+`userdata` can. They have to be pulled off the device from Android and shipped inside
+the `rootfs.ext4` (put them in `/lib/firmware`) — the same reasoning as section 2,
+just for firmware rather than the root filesystem. `/mnt/vendor` is different: that is
+plain **`/dev/block/mmcblk0p1`, ext4, 5.3 MiB**, so a Linux boot can mount it
+read-only at `/mnt/vendor` directly and get `wifimac.txt` (and `btmac.txt`) from the
+real partition instead of a copy. The `calinv` partition (`mmcblk0p69`) mounts too,
+but it is empty — it is not where the calibration lives.
+
+One thing works in our favour: the same code waits for a filesystem to appear before
+giving up ("request_firmware keep waiting for file system ready, the max waiting time
+is 80s"), which is why loading the WCN modules from the initramfs — where
+`/lib/firmware` does not exist yet — is still workable: the driver retries until the
+Debian root filesystem is mounted.
+
+`rootfs/pull-wcn-firmware.sh` does the copy: it stages `/odm/firmware`'s WCN set,
+`/vendor/firmware/tsx_data` and the `/mnt/vendor` factory files into
+`rootfs/overlay/lib/firmware/` and `rootfs/overlay/mnt/vendor/` (which
+`device-finalize.sh` then applies like any other overlay file), skipping paths that
+do not exist. They are vendor blobs and stay out of the repository. On this unit
+`tsx_data` is skipped: `/vendor/firmware/tsx_data` is a symlink to
+`/mnt/vendor/productinfo/wcn/tsx_bt_data.txt` and that target is a dangling link even
+under Android, whose Wi-Fi works regardless -- so it is not fatal, but it also cannot
+be copied.
+
+### 8.2 Verified on the device
+
+The packaging fix works.  Built from the tree and listed in
+boot/module-order.extra, the WCN stack loads on a real boot:
+
+    stage=modules-done loaded=63 failed=0
+    sprd_wlan_combo      2510848  0
+    cfg80211              888832  1 sprd_wlan_combo
+    wcn_bsp               430080  1 sprd_wlan_combo
+
+and the driver probes the chip: marlin_probe: device node name: sprd-marlin3, the DT
+supplies (avdd12, avdd33, dcxo18) resolve, and the WCN bus channels come up.  The
+firmware is reachable because the initramfs now carries the rootfs overlay and
+materialises it *before* the module pass
+(stage=overlay-early files=21 firmware=6), so request_firmware() finds wcnmodem.bin
+without waiting for the real root filesystem.
+
+### 8.3 The next blocker: the driver reads its firmware from a partition
+
+The chip still does not come up, and this is why.  The WCN base driver takes the
+BT/Wi-Fi firmware from a path in the device tree, not from the firmware loader:
+
+    /proc/device-tree/sprd-marlin3/sprd,btwf-file-name  = /dev/block/by-name/wcnmodem
+    /proc/device-tree/sprd-marlin3/sprd,gnss-file-name  = /vendor/firmware/gnssmodem.bin
+
+and this device has **no partition named wcnmodem** -- the GPT has no wcn* name at
+all.  wcn_boot.c opens that path with filp_open() and reads the firmware out of it,
+so the boot ends with the chip being powered back down
+
+    WCN BASEwifipa 3v3 0 ... avdd12 power disable ... marlin chip en pull down
+    sprd-wlan: failed to power on WCN!
+    probe of sprd-marlin3:wlan returned 19 after 60553796 usecs
+
+i.e. -ENODEV after the driver's 80-second retry window.  (supply dvdd12 not found,
+using dummy regulator is benign; the other three supplies resolve.)
+
+The path is what has to be satisfied, and it can be satisfied from userspace: point
+/dev/block/by-name/wcnmodem at a loop device backed by the wcnmodem.bin this image
+already carries, and provide /vendor/firmware/gnssmodem.bin.  Both belong in the
+overlay, which boot/init already knows how to apply.
+
+**Correction (2026-09-18): the partition path is a fallback, and it is not what was
+wrong.**  `wcn_boot.c` tries the firmware loader first:
+
+```c
+    if (marlin_dev->is_btwf_in_sysfs) {
+        err = marlin_download_from_partition();
+        return err;
+    }
+    pr_info("marlin %s from /system/etc/firmware/ start!\\n", __func__);
+    err = request_firmware(&firmware, "wcnmodem.bin", NULL);
+    if (err < 0) {
+        pr_err("no find wcnmodem.bin errno:(%d)(ignore!!)\\n", err);
+        marlin_dev->is_btwf_in_sysfs = true;
+        err = marlin_download_from_partition();
+        return err;
+    }
+```
+
+`marlin_download_from_partition()` is the `/dev/block/by-name/wcnmodem` path; it only
+runs once `request_firmware()` has already failed.  The `from /system/etc/firmware/`
+line is a hardcoded string naming a directory that does not exist in this root
+filesystem at all, which is what made the log look like a partition read.
+
+On the live system `dmesg` shows
+
+    WCN BASEmarlin btwifi_download_firmware from /system/etc/firmware/ start!
+    WCN BASEmarlin btwifi_download_firmware successfully!
+
+with **no** `no find wcnmodem.bin` line anywhere, and
+
+    WCN BASEgnss_download_firmware successfully through request_firmware!
+
+for the GNSS half.  So the real requirement is the one section 8.1 already states --
+`wcnmodem.bin` present in `/lib/firmware` -- and the loop device was never necessary.
+(Worse than unnecessary, as it turned out: a read-write loop over the file makes
+`request_firmware()` fail with `ETXTBSY`; section 29.)
+The chip comes up because the initramfs overlay materialises the firmware before the
+module pass.
+
+### 8.4 What to look at when it is tried
+
+    dmesg | grep -iE "wcn|wlan|sdio"      # probe, firmware load, chip boot
+    lsmod | grep -E "wcn_bsp|sprd_wlan_combo"
+    ip link                               # wlan0 should appear
+    cat /sys/class/net/wlan0/address      # factory MAC, or random if unset
+
+### 8.5 The chip boots now -- and the driver kills it 20 s later
+
+Everything above was measured before the kernel could boot the chip's *GNSS* half,
+which is fatal and silent: the WCN core downloads BT/Wi-Fi firmware first, then
+GNSS, and only then comes up.
+
+**The trap: the GNSS half has no filesystem wait.**  `gnss_download_firmware()`
+calls `request_firmware("gnssmodem.bin")` **once** and treats `-ENOENT` as a
+fallback trigger:
+
+```c
+	if (marlin_dev->is_gnss_in_sysfs) {
+		err = gnss_download_from_partition();
+		return err;
+	}
+	err = request_firmware(&firmware, "gnssmodem.bin", NULL);
+	if (err < 0) {
+		pr_err("%s no find gnssmodem.bin err:%d(ignore)\n", __func__, err);
+		marlin_dev->is_gnss_in_sysfs = true;      /* sticky, for the whole boot */
+		err = gnss_download_from_partition();
+```
+
+`gnss_download_from_partition()` reads the DT's `sprd,gnss-file-name`
+(`/vendor/firmware/gnssmodem.bin`), which does not exist in this rootfs, so it
+returns NULL -- and the `is_gnss_in_sysfs` flag stays set, so every later retry
+skips the firmware loader entirely.  Measured (modules loading from the
+initramfs, where `/lib/firmware` does not exist yet):
+
+    [15.621] gnss_download_firmware start from /system/etc/firmware/
+    [15.629] (NULL device *): Direct firmware load for gnssmodem.bin failed with error -2
+    [15.655] gnss_download_from_partition gnss buff is NULL
+    [25.823] GNSS download timeout
+    [38.4  ] marlin chip en pull down ... sprd-wlan: failed to power on WCN!
+    [38.4  ] probe of sprd-marlin3:wlan returned 19 after 12534326 usecs
+
+The BT/Wi-Fi half does not have this problem because
+`marlin_download_from_partition()`/`btwifi_download_firmware()` waits up to 80 s
+for a filesystem ("keep waiting for file system ready"), which is why Wi-Fi used
+to come up in some sessions and GNSS never did.  The fix is the one
+`rootfs/pull-wcn-firmware.sh` was written for: the firmware has to be in the
+initramfs's *early* overlay, not just in the root filesystem, so that
+`/lib/firmware` exists before the module pass (`boot/init` materialises
+`e5-overlay/lib/` first).  With `wcnmodem.bin`, `gnssmodem.bin` and
+`wifi_board_config*.ini` in `rootfs/overlay/lib/firmware/`:
+
+    [1.766] E5-LINUX: stage=overlay-early files=45 firmware=6
+    [13.907] gnss_download_firmware successfully through request_firmware!
+    [16.516] marlin btwifi_download_firmware successfully!
+    [17.214] sprd-wlan: sprd_wlan_probe sprd,sc2355-sdio-wifi 2.
+    [17.343] sprd-wlan: sprd_iface_set_power Power on WCN (0 time)
+
+and `phy0` + `wlan0` + `p2p-dev-wlan0` appear, with both rfkill switches
+unblocked.  Bluetooth gets further too: `sprdbt_tty.ko` (in
+`boot/module-order.extra`, it was never in the stock first-stage list either)
+brings up `/dev/ttyBT0` plus a bt rfkill, and `btattach -B /dev/ttyBT0 -S
+3000000` does create `hci0` (`Bus: UART`) -- bluez is installed and
+`bluetooth.service` is already running.
+
+**The blocker: the driver's own hang detector dumps the card.**  20 seconds
+after the chip comes up, `loopcheck` (an `AT+loopcheck` ping the driver runs to
+detect a stuck WCN core) decides the chip is dead and sets the SDIO card's dump
+flag, after which **every** power-on is refused:
+
+    [28.574] WCN BASE: start_loopcheck
+    [30.6]   rx:loopcheck_ack:ap_send=30591,cp2_bootup=28055,cp2_send=30613   <- chip answers
+    [34.758] WCN SDIO: carddump flag set[1]
+    [38.507] WCN BASEstop_marlin SDIO card dump
+    [38.627] WCN BASEstart_marlin [MARLIN_WIFI] ... start_marlin SDIO card dump
+    [62.661] WCN BASEstart_marlin [MARLIN_BLUETOOTH] ... start_marlin SDIO card dump
+
+`start_marlin()` (wcn_boot.c) refuses when `get_loopcheck_status() >= 2`, so the
+symptoms downstream are exactly what was reported -- Wi-Fi present but every
+scan `-EIO` with `sc2355_send_cmd_recv_rsp CP2 assert` (`hif->cp_asserted` is set
+by the reset notifier the dump triggers), and Bluetooth's `mtty_open power on
+state ret = -1!` / `sprdwcn_bus_push_list failed: -19`:
+
+    $ sudo iw dev wlan0 scan
+    command failed: Input/output error (-5)
+    $ sudo hciconfig -a
+    hci0: Type: Primary  Bus: UART   BD Address: 00:00:00:00:00:00   DOWN INIT RUNNING
+
+That is the state to pick up from: the chip is alive and both transports exist,
+so what is left is either to work out why `loopcheck` trips (its first round
+succeeds, the later ones apparently do not -- `loopcheck.o` in `wcn_bsp`, and
+`get_loopcheck_status()` at `boot/wcn_integrate_boot.c:3596`) or to stop it from
+condemning a working card (`sdiohal_main.c:762`,
+`sdiohal_set_carddump_status()`).
+
+Two smaller facts worth keeping: the vendor's board-level WCN set for this exact
+board (UM9621_1h10) is in `connconfig/marlin3_lite/ums9621_1h10/` -- and it
+contains `bt_configure_pskey*.ini`, `bt_configure_rf*.ini` and
+`fm_board_config*.ini`, which the *device* does not carry (the earlier pull only
+took `wifi_board_config*.ini` and the two MACs; nothing in the kernel reads the
+`bt_configure_*` files, so they are for a userspace BT HAL rather than for
+`btattach`).  And `wcn_wifi_driver.conf`, whose absence fills a line in dmesg,
+is optional tuning: `sprd_parse_wifi_driver_config()` returns silently when the
+file is missing.
+
+### 8.6 Solved: the driver was built as the "userdebug" variant
+
+The card dump in 8.5 is not a hang.  It is a compile-time policy, and this
+repository was building the wrong one.
+
+Android's Kbuild picks part of this driver's behaviour from its build variant:
+
+    ifeq ($(TARGET_BUILD_VARIANT),user)
+    ccflags-y += -DFLAG_WCN_USER
+    endif
+
+and a hand-run `make` sets no `TARGET_BUILD_VARIANT`, so `FLAG_WCN_USER` was
+never defined and the driver took every `#else` branch.  One of them is the
+assert policy:
+
+```c
+#ifdef FLAG_WCN_USER
+	atomic_set(&sysfs_info.is_reset, 0x1);      /* WCN_ASSERT_ONLY_RESET */
+#else
+	atomic_set(&sysfs_info.is_reset, 0x0);      /* WCN_ASSERT_ONLY_DUMP  */
+#endif
+```
+
+`__wcn_assert_interface()` reads that value and then either dumps the chip's
+memory and leaves the SDIO card dead, or resets the chip and carries on.  Since
+the loopcheck treats one missed `at+loopcheck` round (4 s to answer) as an
+assert, the userdebug default turns a single late answer into a radio that is
+dead for the rest of the boot.  The same `#ifdef` also adds a reset-pad priority
+write for qogirl6 in `btwf_sys_poweron()` -- the user variant is not just the
+policy.
+
+It is settable at runtime, which is how it was pinned down: the whole
+difference is one sysfs write.
+
+    $ cat /sys/class/misc/wcn/devices/reset_dump          # dump   (before)
+    $ echo reset > /sys/class/misc/wcn/devices/reset_dump # switch to the user policy
+    $ echo manual_dump > /sys/class/misc/wcn/devices/reset_dump   # force an assert
+    WCN SDIO: carddump flag set[0]            <- cleared
+    WCN BASE: wcn_reset_process reset end     <- chip reset, no dump
+    $ sudo iw dev wlan0 scan | grep -c SSID:
+    18
+
+so the radio came back inside an already-booted device, and `reset_dump`'s
+three accepted values (`dump`, `reset`, `reset_dump`) are exactly the three
+policies of the `if`/`else` chain above.
+
+The fix is the vendor's own production switch, brought out as a Kconfig symbol so
+that the choice is visible and lives in `kernel/e5-linux.fragment` rather than in
+a Makefile:
+
+    CONFIG_UNISOC_WCN_BSP_USER_VARIANT=y
+
+Verified on a freshly flashed boot with no sysfs writes of any kind:
+`reset_dump` reports `reset`, the loopcheck answers every round, no
+`carddump flag set` line appears at all, and Wi-Fi scans 18 APs on both bands on
+its own.  Bluetooth gets one step further with it too -- the chip answers the
+whole HCI init sequence and `hci0` comes up with a real BD address
+(`27:93:31:14:22:11`) and sane ACL/SCO MTUs, where before the policy change its
+power-on returned -1.
+
+**What that leaves is a second, unrelated failure**, which the carddump flag had
+been hiding the whole time: 8.7.
+
+
+### 8.7 Bluetooth: one rejected HCI command was all of it
+
+With the carddump trap out of the way the controller initialized completely and
+then refused to be powered on, and btmon says why:
+
+    < HCI Command: Write Default Link Policy Settings (0x02|0x000f) plen 2
+            Link policy: 0x000f   (Role Switch + Hold + Sniff + Park)
+    > HCI Event: Command Complete
+          Status: Invalid HCI Command Parameters (0x12)
+    Can't init device hci0: Invalid argument (22)
+
+45 commands and their events had crossed `/dev/ttyBT0` before it.  The value comes
+from the LMP features the controller itself reported (`lmp_hold_capable()` and
+friends) and the command is only sent because `hdev->commands[5] & 0x10` claims
+support, so this firmware advertises hold/sniff/park and then refuses to enable
+them.  `hci_req_cmd_complete()` turns that status into a request error -- and the
+request is the one that brings the controller up, so a controller that answers
+`0x12` here can never be powered on, with the controller sitting there fully
+initialized.  (Correction, 2026-09-26: Android sends it too -- the btsnoop log of
+its BT start has `0x080f` answered with status 0x12 -- and Gabeldorsche simply does
+not treat that answer as fatal.)
+
+`kernel/patches/0008` (`3bd2464a8`) makes that one command non-fatal: it warns
+(`Bluetooth: hci0: controller rejected the default link policy (0x12)`) and clears
+the status, which is exactly how `hci_cc_write_def_link_policy()` already treats
+a rejection.  With it, `hciconfig hci0 up` succeeds, bluez reports
+`Controller 27:93:31:14:22:11` with `Powered: yes`, and an inquiry lists nearby
+devices.
+
+`rootfs/overlay/etc/systemd/system/e5-bt-attach.service` keeps it that way.  It
+has to be btattach rather than nothing at all because *opening* `/dev/ttyBT0` is
+what powers MARLIN_BLUETOOTH on (`mtty_open` -> `start_marlin`), and the tty has
+to stay open for the controller to exist.  The unit is deliberately not ordered
+against `bluetooth.service`: bluetoothd hot-plugs the adapter whenever it appears,
+and a wedged BT core must not be able to hold up the boot (section 9 is what that
+costs).  systemd wants a `*.wants/` *link* to consider a unit enabled, and neither
+`boot/build-boot-image.py` nor the overlay staging loop in `boot/init` can carry a
+symlink, so `boot/init` makes that one link while it materialises the overlay.
+
+Two things are still open on Bluetooth, and neither is a blocker:
+
+* the BD address is the chip's own default (`27:93:31:14:22:11`), not the factory
+  one in `/mnt/vendor/btmac.txt`.  Android's BT HAL writes it with a vendor
+  command; bluez 5.82 no longer has `hciconfig hci0 bdaddr` and the kernel's
+  `HCISETBDADDR` ioctl is gone as well, so setting it means a small tool driving
+  the vendor command, or accepting an address that is stable but wrong (a peer
+  that paired with the Android BT stack will not recognise this device).
+* pairing and a data transfer have not been exercised -- an inquiry only proves
+  the radio, the stack and the HCI transport work.  The one attempt so far (the
+  settings app at 14:26, to the peer bluez has in its cache as "Enceka SE",
+  `80:04:5F:76:78:0C`) came back
+  `org.bluez.Error.ConnectionAttemptFailed: Page Timeout`: the page went out and
+  the peer never answered it.  That is what a peer that is off, out of range or
+  refusing connections looks like, and it is not evidence either way about
+  paging itself -- nothing has been connected successfully yet.
+
+## 9. The five-minute reset: the PMIC watchdog, not a panic
+
+**Solved.** A Linux session used to die about five minutes in, silently, and it looked
+like a panic.  It never was one: the bootloader arms the *PMIC* watchdog as well as the
+SoC one, and the driver that feeds it was built but never staged into the initramfs.
+
+Measured on the device with the host doing *nothing at all* -- no serial console
+opened, no adb, no reads -- using only the bootloader log:
+
+    LK hands over to Linux      21:21:27
+    LK runs again (the reset)   21:26:22       295 s
+
+and the reset leaves no console output, no pstore record and is classified by LK as a
+reset (ANA_REG_GLB_POR_OFF_FLAG:0x0).  With nobody reading the serial port a real panic
+would look identical, which is why this stayed a mystery.
+
+The answer is in the PMIC watchdog driver's own probe message, once it is loaded:
+
+    [   13.489569] calling  init_module+0x0/0xfe8 [sprd_pmic_wdt]
+    [   13.490350] sprd pmic wdt:pmic_timeout 300,feed 250
+    [   13.501574] probe of 64400000.spi:pmic@0:watchdog@40 returned 0
+
+pmic_timeout 300 -- a 300 second timeout, matching the ~295 s observed -- and Android
+binds that same driver to that same device
+(64400000.spi:pmic@0:watchdog@40 under /sys/bus/platform/drivers/sprd-pmic-wdt), which
+is why Android survives an armed PMIC watchdog and Linux did not.  Our initramfs had
+sprd_pmic_wdt.ko built (out_linux/drivers/watchdog/sprd_pmic_wdt.ko) but never listed
+in boot/module-order.txt, so nothing ever loaded it and nothing fed the watchdog LK
+had armed.
+
+The fix is that one entry in boot/module-order.extra, and the result is visible
+directly:
+
+    before:  session dead at 295 s, every boot
+    after:   uptime 10 min and still running, Plasma Mobile up (load average ~8)
+
+### 9.1 What it was not
+
+* **Not a panic or an oops.**  Nothing reaches ttyGS0 (a kernel console), pstore stays
+  empty, and LK reports a reset rather than a power-off.
+* **Not the harness or this session's tooling.**  The 295 s figure came from a boot
+  with the host doing nothing; the 300 s cap on a host tool call only kills the shell
+  on the *host*.
+* **Not the initramfs safety timer.**  It sleeps 600 s and is stopped before
+  switch_root (a session records stage=switch-root-jobs-killed persist=189 timer=190);
+  firing would log stage=timer-reboot first.
+* **Not the SoC watchdog driver.**  sprd_wdt_fiq does probe (641e0000.watchdog), but
+  reading its registers through /dev/mem shows CTRL = 0x4 -- the counter-enable bit is
+  clear, so it was never counting -- and disarming it explicitly changed nothing: the
+  session still died at 295 s.  boot/init now only *logs* those registers, as a
+  diagnostic, and CONFIG_DEVMEM=y (kernel/e5-linux.fragment) stays for that.
+* **Not the PMIC monitor register LK prints.**  ANA_REG_GLB_WDG_RST_MONITOR reads 0x0
+  after the reset; that register tracks a different watchdog state than the PMIC
+  watchdog driver's own timeout.
+
+## 10. Building the kernel on macOS with clang
+
+The kernel does build on a macOS arm64 host with Homebrew's LLVM, and the result is
+loadable on the device: the modules built this way carry the same vermagic as the
+ones in the running kernel
+(5.15.211-g94401422a7df SMP preempt mod_unload modversions aarch64) and the same
+module_layout CRC (0x78fb914d), which is what makes "build the modules only, keep the
+flashed kernel" work.
+
+What macOS lacks is the Linux tooling *around* the compiler.  Each gap is a host-side
+workaround; the kernel tree is never modified, so setlocalversion still yields
+5.15.211-g94401422a7df (no -dirty suffix):
+
+| gap | workaround |
+|---|---|
+| /usr/bin/make is GNU 3.81, the build wants 3.82+ | brew install make -> work/bin/make -> gmake 4.4 |
+| BSD sed -i and cp -T in merge_config.sh | brew install gnu-sed coreutils, their gnubin dirs first in PATH |
+| no <elf.h> | glibc's elf.h in work/hostinc/ (this tree's modpost has its own ELF parser and needs only the header) |
+| no <asm/types.h> for host tools (Linux hosts get it from linux-libc-dev) | work/hostinc/asm/* -> symlinks to the kernel's include/uapi/asm-generic/* |
+| Darwin declares uuid_t (sys/unistd.h -> sys/_types/_uuid_t.h, used by gethostuuid.h) which collides with the uuid_t in scripts/mod/file2alias.c | both SDK headers stubbed in work/hostinc/ |
+| no depmod (kmod is Linux-only) | boot/gen-modules-dep.py: depmod's rule, derived from Module.symvers plus each module's undefined symbols; boot/stage-modules.sh uses it when depmod is missing |
+
+The last one reproduces depmod's answer rather than approximating it -- both find
+sprd-drm.ko -> ocp2131.ko, sprd-gsp.ko, and the WCN entry comes out as
+sprd_wlan_combo.ko -> wcn_bsp.ko, sipc-core.ko, cfg80211.ko.  CONFIG_DEBUG_INFO and
+DEBUG_INFO_BTF are already off in kernel/e5-linux.fragment (so no pahole is needed)
+and arm64 needs no objtool.  The exact environment is recorded in work/build6.sh;
+a full Image + modules build takes about twenty minutes on an M-series host with -j8.
+
+
+## 11. What the phone session costs, and what to run instead
+
+Measured on the device (`free -m`, `ps -eo rss,pcpu,comm`), Plasma Mobile 6.3.6 on
+llvmpipe with 36 running user units:
+
+| | total | used | free | buff/cache | available | zram |
+|---|---|---|---|---|---|---|
+| before | 1450 | 1288 | 93 | 387 | 162 | 719 / 767 used |
+| after trimming | 1450 | 926 | 354 | 394 | 524 | 590 / 767 used |
+
+The single largest item was not the shell.  `plasma-settings` -- the phone settings
+app -- was running as an XDG autostart unit
+(`app-org.kde.mobile.plasmasettings@....service`) and held **356 MB**.  Behind it:
+plasmashell 228, maliit-keyboard 93, kwin_wayland 62, kded6 45, xwaylandvideobridge
+40, powerdevil 38, Discover's notifier 36, kdeconnectd 36, xdg-desktop-portal 36, the
+polkit agent 34, kactivitymanagerd 33, gmenudbusmenuproxy 32, xembedsniproxy 32,
+ksmserver 32.  (RSS double-counts shared Qt libraries, but the ranking is what
+matters.)  zram was 94 % full, so the session was also paying compression CPU for
+every page fault -- which is the real symptom: not the number, the thrashing.
+
+What was turned off (live, and therefore already inside the rootfs image, whose
+loop file is the persistent root):
+
+| change | how |
+|---|---|
+| settings app, Discover notifier, KDE Connect | `home/e5/.config/autostart/*.desktop` with `Hidden=true`, carried in the overlay so it survives a re-image |
+| gmenudbusmenuproxy, xembedsniproxy, xwaylandvideobridge, kaccess | `systemctl --user mask` -- X11-only helpers on a Wayland phone; the instance already running was killed by pid |
+
+That is ~360 MB released, and more usefully `available` 162 -> 524 MB.  What is left
+is the shell itself: plasmashell 254 MB and kwin_wayland 87 MB, with plasmashell at
+39 % CPU.  On llvmpipe every Qt Quick frame is rasterised on the CPU, and no Mesa
+driver exists for this GPU; the DRM work in section 8 is unrelated to that (the panel
+is a plain DSI framebuffer driven through DRM planes).
+
+Lighter shells, all present in trixie for arm64 (checked against
+packages.debian.org/trixie/arm64):
+
+| option | shape | note |
+|---|---|---|
+| Phosh (`phosh`, `phoc`, `squeekboard`) | GTK4 shell + wlroots compositor | the phone stack Debian itself ships for mobile; no KDE/Qt daemon fleet, and phoc can run with `WLR_RENDERER=pixman` |
+| Sxmo (`sxmo-utils`) | sway + dmenu-style menus and gestures | smallest sensible phone UX, but a menu-first interaction that has to be learned |
+| sway + `wvkbd` + `waybar` | hand-rolled | ~120-200 MB and full control, at the cost of assembling the UX |
+| cage / labwc / weston | kiosk or bare wlroots | single-app or bare desktop; useful as a cheap renderer test |
+| LXQt (`lxqt-session`) | Qt desktop | lighter than Plasma, but not a touch UI |
+
+The renderer matters more than the shell on this board: every wlroots compositor
+(phoc, sway, labwc, cage) runs without GL under `WLR_RENDERER=pixman`, so a
+GTK4/wlroots stack is the natural next step -- which is why `docs/STATUS.md` keeps
+Plasma Mobile as the fallback rather than the target.
+
+Getting there: the device has no route off itself except the USB LAN, the host does.
+For a handful of packages, fetch the arm64 `.deb`s on the host and `dpkg -i` them on
+the device (it is aarch64, so the unpack and the maintainer scripts are native).  For
+a stack like Phosh (100+ packages) let apt resolve instead: run a small HTTP proxy on
+the host, point the device at it with `Acquire::http::Proxy` in
+`/etc/apt/apt.conf.d/`, and the dependency walk stays on the device where it is
+correct.
+
+zram itself was 768 MB of lzo-rle and 94 % full.  It is now 4 GiB of zstd
+(`E5_ZRAM_SIZE` / `E5_ZRAM_COMP` in `rootfs/overlay/usr/local/sbin/e5-zram`), with
+`vm.swappiness=100` and `vm.page-cluster=0`
+(`rootfs/overlay/etc/sysctl.d/10-e5-zram.conf`): swapping earlier costs less than
+letting the anonymous set grow until the session has to reclaim synchronously, and one
+page at a time is the cheap case for a random-access device.  4 GiB is an overcommit on
+a 1.45 GiB machine and that is fine -- only the *compressed* pages occupy RAM, so what
+matters is the ratio (zstd has lz4/zstd selected as active: `[zstd]` in
+`/sys/block/zram0/comp_algorithm`), not the nominal size.
+
+## 12. The 9-key keypad: a driver that was never staged
+
+The board is a 5G feature phone, so most of its input is a numeric keypad plus a
+back key, not the touch panel.  The keypad is a plain matrix keypad on the SoC's AON
+keypad controller, and it is in the running device tree:
+
+    /proc/device-tree/soc/aon/keypad@641B0000
+      compatible = "sprd,sc9860-keypad", status = "okay"
+      keypad,num-rows / keypad,num-columns / debounce-interval / linux,keymap
+
+and the platform device exists (`641b0000.keypad`).  Nothing was bound to it, and
+nothing said so: no dmesg line, no failed probe, no input device.  `waiting_for_supplier`
+on the device is stale -- the AON clock gate it waits for probed normally
+(`ums9621-clk 64900000.aonapb-gate: clock probe`, and the consumer devlink
+`platform:64900000.aonapb-gate--platform:641b0000.keypad` is there).  The reason is the
+same one that hid the charger, the display power domain and the WCN drivers:
+
+    CONFIG_KEYBOARD_SPRD=m
+
+and `sprd_keypad.ko` is not in Android's first-stage module list, so neither the
+initramfs nor the Debian root filesystem ever loads it.  An unbound platform device is
+invisible; loading the driver is what makes it appear.
+
+The fix is two modules, built from the same tree and configuration as the flashed
+kernel (section 10's `LLVM=1` invocation, `make M=drivers/input/keyboard modules`),
+plus its dependency:
+
+| module | config | why |
+|---|---|---|
+| `sprd_keypad.ko` | `CONFIG_KEYBOARD_SPRD=m` | the matrix keypad driver |
+| `matrix-keymap.ko` | `CONFIG_INPUT_MATRIXKMAP=m` | `depends=matrix-keymap`, parses `linux,keymap` |
+
+`vermagic=5.15.211-g94401422a7df SMP preempt mod_unload modversions aarch64` and the
+module CRCs match the flashed kernel, so no kernel change and no reflash are needed.
+After `insmod` on the running system, /proc/bus/input/devices goes from two devices to
+three:
+
+    N: Name="sprd-keypad"   H: Handlers=kbd event2   B: KEY=...ffc (KEY_1..KEY_9, KEY_0, * #)
+
+The two devices that were already there are worth restating: `gpio-keys` (input0) holds
+**the power and volume keys** -- its KEY bitmap decodes to KEY_VOLUMEDOWN, KEY_VOLUMEUP
+and KEY_POWER -- and `tlsc6x_touch` is input1.  So the physical keys were always
+generating events; what was missing was (a) the keypad driver and (b) anything in the
+session that acts on KEY_POWER, which logind was told to ignore (section 6.2).
+
+Persistence is in two places:
+
+* the running rootfs -- `matrix-keymap.ko` and `sprd_keypad.ko` under
+  `/lib/modules/$(uname -r)/kernel/drivers/input/`, `depmod -a`, and
+  `/etc/modules-load.d/e5-keypad.conf`, so systemd's modules-load stage insmods them
+  early on every boot (verified: both listed in `lsmod` after
+  `systemctl restart systemd-modules-load`);
+* the boot image -- both names are in `boot/module-order.extra`, and
+  `boot/stage-modules.sh` picks up every `.ko` in `out_linux`, so a rebuilt
+  `boot-linux-slotb.img` carries 66 modules instead of 64 and loads them in
+  dependency order (`matrix-keymap.ko` before `sprd_keypad.ko`).
+
+### 12.1 The confirm key is KEY_SELECT: what it broke, and the remap that fixes it
+
+The keypad's devicetree keymap (`/proc/device-tree/soc/aon/keypad@641B0000/linux,keymap`,
+20 entries of `(row << 24) | (col << 16) | keycode`) decodes to:
+
+| row,col | keycode | name |
+|---|---|---|
+| 1,0 | 0x161 (353) | **KEY_SELECT** -- the confirm key |
+| 0,0 | 0x9e (158) | KEY_BACK |
+| 0,4 | 0x20b (523) | KEY_PHONE |
+| 0,5 / 0,6 / 1,1 / 1,2 | 0x6a / 0x67 / 0x69 / 0x6c | RIGHT / UP / LEFT / DOWN |
+| 3,0 / 3,1 | 0x8b / 0xa9 | KEY_MENU / KEY_NEXT |
+| 3,3..3,5, 1,3..1,6, 0,1..0,3 | 2..11 | KEY_1 .. KEY_0 |
+| 3,6 | 0x37 | KEY_KPASTERISK |
+
+Nothing in the session handles KEY_SELECT, so on the phosh lock screen the PIN could be
+typed but never submitted.  What the lock screen does want was measured by injecting
+keys with `tools/key-inject.py`, on a locked session:
+
+    tools/key-inject.py 1 2 3 4 5 6 enter     -> LockedHint stays yes
+    tools/key-inject.py 1 2 3 4 5 6 kpenter   -> LockedHint: no    (unlocked)
+
+phosh's lock screen unlocks on **KP_Enter**, not on Return, and the PIN is checked by
+PAM -- a wrong one leaves `phosh[..]: pam_unix(phosh:auth): authentication failure`
+in the journal (that is how the "123" typed by an earlier test showed up).
+
+The fix is the ordinary one -- a udev/hwdb key remap, applied by udev's `keyboard`
+builtin at device-add time, so it is in the kernel's scancode table and costs no
+latency at all:
+
+The keypad table also exposes the physical # key at matrix scancode 0x04. The image now declares `KEYBOARD_KEY_4=numericpound` explicitly so the dialer receives a stable numeric-pound key instead of relying on the raw numeric code.
+
+    # rootfs/overlay/etc/udev/hwdb.d/61-e5-keypad.hwdb
+    evdev:input:b0000v0000p0000e0000*
+     KEYBOARD_KEY_8=kpenter
+
+The subtlety is the *scancode*: it is the matrix scan code, not the keycode the key
+produces.  The keypad is a 4x7 matrix, so `row_shift = 3` and the confirm key
+(row 1, col 0) is `(1 << 3) | 0 = 8`.  evdev's `EVIOCSKEYCODE` indexes
+`input_dev->keycode[]`, whose size is `rows * cols = 28`; an index of 353 (the
+keycode) is out of range and comes back `EINVAL` -- which is exactly the mistake that
+made an earlier version of this section claim the device "cannot be remapped at all".
+It can, and `tools/keycode-query.py` shows it (`--from`/`--to`-style read and write,
+with `INPUT_KEYMAP_BY_INDEX`):
+
+    tools/keycode-query.py /dev/input/event2 0x0 0x8 0x9
+      0x000 -> 158 (BACK)
+      0x008 -> 353 (SELECT)      <- the confirm key
+      0x009 -> 105 (LEFT)
+    tools/keycode-query.py /dev/input/event2 0x8=96
+      set 0x008 -> 96 (KP_ENTER)
+    # after udevadm hwdb --test / systemd-hwdb update / udevadm trigger:
+      0x008 -> 96 (KP_ENTER)
+
+`systemd-hwdb-update.service` (WantedBy=sysinit.target) recompiles
+`/etc/udev/hwdb.bin` at boot when the file is newer, so this survives without an
+explicit `systemd-hwdb update`.  A userspace uinput re-emitter was the working plan
+before this; it is not needed, and it would have added a process and a second
+keyboard device to the session.
+
+**Why the key had to change at all** is worth looking at, because it is not obvious
+from the phone: phosh 0.46's lock screen has **no unlock key**.  Its on-screen keypad
+is 3x4 with the bottom row `[OSK toggle] [0] [backspace]`, and the lock screen itself
+opens on the clock and has to be swiped (or tapped) before the keypad appears:
+
+    lock screen (355x533 at scale 0.9)          after a swipe
+    "10:35  Friday, September 18"               "Enter Passcode" + dots + 1..9 0 [keypad] [<-]
+
+So for someone typing on the *physical* keypad there was nothing to press: the PIN
+could be typed and never submitted, which is exactly the report ("the confirm key
+cannot confirm, the back key cannot go back, there is no unlock button").  With
+`KP_ENTER` the confirm key submits, and that is confirmed working on the device.
+
+The back key (scan code 0) was briefly remapped to `BackSpace` with hwdb and then
+reverted, because `KEY_BACK` is what the session uses for "back" -- but a keypad-only
+phone also has no delete key, so `kernel/patches/0004` makes the *driver* report
+BackSpace next to KEY_BACK for that one key.  One key, both jobs, and nothing in
+userspace: entries ignore KEY_BACK, navigation ignores BackSpace.  The capability is
+visible in the device's key bitmap once the patched module is loaded:
+
+    /proc/bus/input/devices, sprd-keypad:  BACKSPACE(14) yes  KP_ENTER(96) yes  BACK(158) yes
+
+The hwdb rule therefore still carries only `KEYBOARD_KEY_8=kpenter`.  So the two
+keys of this section are implemented in two different layers: the confirm key is a
+**userspace** udev/hwdb remap of a matrix scan code, the back key is a **kernel**
+change in `drivers/input/keyboard/sprd_keypad.c` (committed as `678d2409`, see
+section 20.2 for the table of kernel commits).
+
+## 13. Baseband internet: Android's modem_control in a chroot
+
+The vendor kernel already carries the whole SIPC/SIPA modem stack: the modules are
+loaded (`sipc_core`, `sipa_core`, `sipa_eth`, `sipa_usb`, `sprd_modem_loader`, `sipx`,
+`spool`, `spipe`, `unisoc_mailbox`, `trusty_log`, ...), the char devices exist --
+`/dev/modem` is char 481 and the AT channels are `/dev/stty_nr0..31`, char 489, as
+`/proc/devices` confirms -- and `/sys/class/` has `sipa`, `sipa_eth`, `sprd-sipc`,
+`sprd-sipx`, `ext_modem`.  Every one of those channels still fails with ENODEV,
+because that is only the *transport*: the CP (baseband) firmware has never been
+started.
+
+### Who has to start it, and why it is Android's job
+
+`sprd_modem_loader` (`drivers/unisoc_platform/modem/modem_loader/sprd_modem_loader.c`)
+is a char device with `MODEM_START`/`MODEM_STOP`/`MODEM_GET_LOAD_INFO`/... ioctls, and
+its ioctl path compares the *calling task's name*:
+
+    if (strcmp(current->comm, modem->rd_lock_name) != 0) { ... return -EPERM; }
+
+so the loader only serves a task literally called `modem_control`.  That is Android's
+`/vendor/bin/modem_control`, and it needs more than the binary: bionic (it is an
+Android ELF), the property area (it reads `ro.vendor.radio.modemtype` to learn the
+modem configuration) and `libkernelbootcp.trusty.so` (it reloads `pm_sys` and the
+modem through the Trusty `kernelbootcp` TA).  The E5 therefore gets the same
+treatment as the MU300 port: extract the Android vendor subset and run
+`modem_control` in a chroot.
+
+### Getting the subset out of a production Android
+
+`rootfs/extract-android-vendor.sh` does it, and the trick is that the E5's Android is
+a *production* build: `ro.build.type=user`, `ro.debuggable=0`, no `su` anywhere in
+PATH and `adb root` answers "adbd cannot run as root in production builds".  What
+saves it is Magisk -- `/debug_ramdisk/su -c id` returns `uid=0(root)` -- which is
+what the flashing scripts have been using all along.
+
+49 MiB comes out: `/apex/com.android.runtime` (linker64 + bionic), `/system/lib64`,
+`/vendor/bin/{modem_control,cp_diskserver,refnotify}` with their vendor libs, the
+`/vendor/etc/modem_*.xml` files `modem_control` parses, `vendor/etc/ueventd.rc`, and
+the one thing no partition has: the *live* `/dev/__properties__` area (1.4 MiB of
+tmpfs that Android's init builds at boot).
+
+### Four requirements, each discovered by failure
+
+| symptom | cause | fix |
+|---|---|---|
+| `modem_ctrl_int_modem_type: ro.vendor.radio.modemtype not_find`, then `can't get modem type!`, and nothing else happens | the subset was unpacked from a tarball built on macOS, so `property_info` was owned by uid 501.  bionic's `PropertyInfoAreaFile::LoadPath()` returns false unless `st_uid == 0 && st_gid == 0`, and one false there leaves the *entire* property system uninitialised -- `getprop` then prints nothing at all | `chown -R root:root` in `vendor-start.sh` |
+| `modem_control` sleeps in a nanosleep loop and never opens a device | liblog retries `connect(/dev/socket/logdw)` forever; there is no logd on Linux | `logdw.py`: a 40-line Python `SOCK_DGRAM` sink bound at `/dev/socket/logdw` |
+| the modem loader still refuses | `modem_control` drops to uid `system` (1000), while devtmpfs hands every node over as `root:root` 0660, and `/dev/block/by-name` does not exist at all | `node-perms.sh` applies Android's own `/vendor/etc/ueventd.rc` (path, mode, user, group) to the nodes that exist, and the by-name links are rebuilt from each partition's `PARTNAME` |
+| nothing boots even so | the driver checks the task name | `exec chroot .../android /vendor/bin/modem_control` -- directly, never through `linker64` -- with a bind-mounted copy of `/proc/cmdline` whose `androidboot.slot_suffix` is forced to `_a` (LK passes `_b` for the trial slot, and the `_a` images are the ones Android itself uses) |
+
+With those in place the modem log (through the logdw sink) goes `Modem Alive` /
+`CH Alive`, dmesg prints `modem modem@0: modem_control modem run = 1!`, and
+`/dev/stty_nr1` stops returning ENODEV and starts blocking on read, which is what an
+AT channel is supposed to do.
+
+### The data path: AT on /dev/stty_nr1, data on sipa_eth0
+
+`rootfs/overlay/opt/e5/mobile-data` implements up/down/status/watch/sim-reset with
+nothing but shell and the AT channel:
+
+    AT+SFUN=2                        SIM on
+    AT+SFUN=4                        protocol stack on;  +CFUN: 0 becomes +CFUN: 1
+    AT+CEREG?                        +CEREG: 2,1,"5104","059FA02D",7   (LTE registered)
+    AT+COPS?                         46001 (China Unicom), CSQ 52
+    AT+CGDCONT=1,"IPV4V6","3gnet"   APN from /etc/e5/mobile-data.conf
+    AT+CGACT=1,1                     activate the default bearer
+    AT+CGCONTRDP=1                   3gnet.MNC006.MCC460.GPRS,
+                                     10.105.136.142/255.0.0.0,
+                                     DNS 58.240.57.33 and 221.6.4.66
+    AT+CGDATA="M-ETHER",1            -> CONNECT: the bearer lands on sipa_eth0
+
+then `ip link set sipa_eth0 up`, `ip addr add <address>/<prefix from the mask>`
+(`sipa_eth0` is raw IP and NOARP), `ip route replace default dev sipa_eth0`, and
+`/etc/resolv.conf` gets the two DNS servers (`resolvectl` is not installed on this
+image).
+
+Verified on the device: `busybox wget http://deb.debian.org/debian/dists/trixie/Release`
+returns the real index (`Origin: Debian`, `Suite: stable`, `Version: 13.7`) with the
+USB LAN having no route to the internet -- the traffic left through the baseband.  The
+carrier also assigns a `2408:893a:...` IPv6 address; there is no IPv6 default route
+configured yet.
+
+Three units carry it: `e5-vendor.service` (`Before=sysinit.target`, runs
+`vendor-start.sh`, and `ConditionPathExists=/opt/e5/android/vendor/bin/modem_control`
+so a fresh image without the proprietary subset still boots), `e5-mobile-data.service`
+(oneshot, `mobile-data up`) and `e5-mobile-data-watch.service` (`mobile-data watch`,
+which rebuilds the bearer when a modem reset drops it).  Checked across a reboot:
+all three `active`, `sipa_eth0` UP with a fresh address, wget works.
+
+The subset is proprietary and is not in this repository (`work/` is gitignored);
+`rootfs/extract-android-vendor.sh` reproduces it from the device, and the overlay
+carries everything else.
+
+## 14. 5G NR: what the device does, and what the network is not offering
+
+The modem is the NR variant, and that is visible in three independent places:
+`modem_control` logs `modem type is nr` and loads `nr_modem`/`nr_phy`/`nr_fixnv`/
+`nr_runtimenv`; Android's property area (which we copy) carries
+`ro.vendor.radio.modemtype=nr`; and `AT+SPRAT?` answers `+SPRAT: LTE 16` -- the
+camped RAT, not the capability.  That command is read-only on every AT channel this
+image exposes (`AT+SPRAT=<n>` is always `+CME ERROR: 4`), and
+`NSACFG`/`SNRCFG`/`SBAND`/`MODE`/`SYSMODE`/`E5GOPT`/`WS46` do not exist at all, so
+nothing user-space can flip the RAT over AT.
+
+> **The conclusion in the sentence above is wrong**, and so is the "no AT-side
+> switch" half of the paragraph that closes this section: the switch is
+> `AT+SPLBAND`, a command that search never tried.  Corrected in 14.1 below.
+
+The same SIM in the same spot on Android (fully booted, China Unicom 46001, LTE band 1,
+RSRP -90):
+
+    gsm.network.type=LTE,Unknown
+    getRilDataRadioTechnology=14(LTE)
+    mCellInfo=[CellInfoLte{... mEarfcn=100 mBands=[1] ...}, CellInfoLte{...}, CellInfoLte{...}]
+    CellSignalStrengthLte ... CellConfigLte :{ isEndcAvailable = false }
+
+No `CellInfoNr` anywhere, and `isEndcAvailable=false`: at that location the network
+offers neither NR SA nor EN-DC, so there is nothing for the modem to camp on.  Android's
+own configuration is 5G-ready (`ro.telephony.default_network=26`, i.e.
+NR_LTE_TDSCDMA_GSM, and `persist.radio.is_vonr_enabled_0=true`), which is the point: the
+Linux side is not missing a switch that would light up 5G here.
+
+What *was* wrong on the Linux side is which slot's modem images get loaded.
+`modem_control` takes the slot from the bootloader's slot suffix, and LK spells it
+`sprdboot.slot_suffix=_b` -- not `androidboot.slot_suffix`, which is what the MU300
+recipe rewrites.  A slot-b Linux trial therefore booted slot b's firmware and NV
+(`nr_phy_b`, `nr_fixnv1_b`, `nr_deltanv_b`).  Android runs from slot a, and slot a is
+where its RIL configured the modem, so `vendor-start.sh` now rewrites the suffix to `_a`
+and, belt and braces, points the `_b` device names at the `_a` partitions.
+`/etc/e5/modem-slot` containing `current` opts out.  Whatever Android achieves with NR
+(its RIL writes modem NV through `cp_diskserver`) is then the configuration Linux boots
+with.
+
+To re-check after the network or the SIM changes, on either system:
+
+* Linux: `mobile-data status` prints `+CEREG: ...` with the AcT decoded --
+  `LTE`, `NR (5G SA)` (11) or `LTE+NR (EN-DC/NSA)` (13) -- plus the raw `+SPRAT?`.
+* Android: `getprop gsm.network.type` and
+  `dumpsys telephony.registry | grep -E 'CellInfoNr|accessNetworkTechnology'`.
+
+### Confirmed: NR SA runs on the Linux side
+
+After the user restarted the baseband from Android and locked it to band n78, Android
+reported:
+
+    gsm.network.type=NR_SA
+    accessNetworkTechnology=NR
+    CellInfoNr ... mRegistered=YES mCellConnectionStatus=1
+                 mNrArfcn=627264 mBands=[78] mNrFrequencyRange=3 ssRsrp=-100
+    gsm.version.baseband=5G_MODEM_V2_23B_W24.16.1_P1|ums9621_modem
+    persist.vendor.modem.nr.enable=1
+
+and after rebooting into Linux the same modem -- booting the slot-a images and NV, per
+the remap above -- camped the same way with no further configuration:
+
+    +CEREG: 2,1,"DE0400","005BE001",11      AcT 11 = NR SA
+    +COPS: 0,2,"46001",11                    China Unicom, NR
+    +SPRAT: LTE 32                            (the numeric field moved 16 -> 32
+                                               together with the camped RAT; the name
+                                               token stays "LTE", so do not trust it)
+    sipa_eth0 UP 10.131.171.189/8             bearer built on the NR link
+    busybox wget http://mirror.nju.edu.cn/... 9.6 MB in 1.5 s (~50 Mbit/s)
+
+So the RAT preference lives in the modem NV, written there by Android's RIL, and the
+Linux port inherits it as long as it boots slot a's modem firmware and NV.  There is no
+AT-side switch to set it (and none is missing): `mobile-data status` now decodes the AcT
+so the camped RAT is visible at a glance -- `LTE`, `NR (5G SA)` or `LTE+NR (EN-DC)`.
+
+### 14.1 The old "no AT-side RAT switch" note, corrected
+
+The last two sentences above are half wrong, and one search is to blame.  The search was
+for `AT+SPRAT=<n>`, `NSACFG`, `SNRCFG`, `SBAND`, `MODE`, `SYSMODE`, `E5GOPT` and `WS46`;
+all of those really do fail (`AT+SPRAT=<n>` is `+CME ERROR: 4`, the rest do not exist),
+and from that the conclusion "nothing user-space can flip the RAT over AT" was drawn.
+The commands that do exist were simply never tried:
+
+    AT+SPLBAND=0                        -> +SPLBAND: <49-64>,<33-48>,<17-32>,<1-16>,<65-80>
+    AT+SPLBAND=1,0,256,0,5,0            -> OK          (LTE: bands 1, 3 and 41)
+    AT+SPLBAND=3                        -> +SPLBAND: <v1>,<0>,<v3>,<super>
+    AT+SPLBAND=2,1,0,256,4              -> OK          (NR: n1, n78, n80)
+    AT+SPLBAND=1,0,0,0,0,0              -> OK          (LTE: no band lock)
+    AT+SPLBAND=2,0,0,0,0                -> OK          (NR: no band lock)
+    AT+SPFORCEFRQ=16,6,627264,5         -> OK          (lock to one NR cell)
+    AT+SPFORCEFRQ=12,3                  -> +SPFORCEFRQ: 12,3,<freq>,<pci>
+
+`AT+SPLBAND` is the band lock: one bit per band inside its 16-band group on LTE, and
+three tables (`value1`, `value3`, and the "super" bands n75/76/80-84/86) on NR.
+`AT+SPFORCEFRQ` is the cell lock, with 12 = LTE and 16 = NR as its RAT selector -- the
+627264 in the example is the n78 ARFCN from the NR SA measurement above.  The same source
+settled the neighbours that were also missing here: 5G SA/NSA is
+`AT+SP5GRAN?`/`AT+SP5GRAN=<0|1>`, 5G registration is `AT+C5GREG?`, VoLTE is `AT+CAVIMS?`,
+and the UE usage setting is `AT+CEUS`/`AT+CEMODE`.
+
+What was right above, and still is: the RAT the modem *camps* on at boot comes from modem
+NV written by Android's RIL, so booting slot a's images is what decides it, and
+`persist.vendor.modem.nr.enable` remains a property, not a switch.  A band lock is an
+additional constraint on top of that, not a replacement for it.
+
+Provenance, stated plainly: these shapes came out of researching the modem's own AT
+surface, not from vendor documentation and not from this handset.  **They have not been
+sent to the handset yet**, so treat them as the shape to try first rather than as measured
+behaviour.  Whoever tries them should read the lock back after writing it, because "the
+modem accepted the command" and "the lock took" are two different claims.
+
+## 15. Sharing the baseband with the USB LAN (NAT), and why apt uses http
+
+`mobile-data up` now also forwards: `net.ipv4.ip_forward=1` plus an nftables table
+(`e5_nat`) with `oifname sipa_eth0 masquerade` and the usual MSS clamp -- this image has
+nftables, not iptables, and it had to be installed.
+
+Installing it is where the mirror came in.  The device reaches the internet only through
+its own bearer now, and the official `deb.debian.org` index is ~15 MB: apt worked but
+crawled, and any **https** fetch hangs (`openssl s_client` to :443 times out at every
+MTU from 1500 down to 1200, while :80 is fine), so the sources are the Nanjing
+University mirror over **http** (`rootfs/overlay/etc/apt/sources.list.d/debian.sources`)
+-- 8 MB/s, which is what made the Phosh install take a minute instead of an hour.
+
+Verification without a second machine: a network namespace with a veth pair
+(`10.99.0.2` -> `10.99.0.1` on the E5) exercises forwarding *and* masquerade, because
+that source address is not local to the E5.  `busybox wget` from inside the namespace
+returns the real Debian `Release` file, so a USB client behind `usb0` gets the same
+treatment.  (`ip netns` + `veth` both work in this kernel.)
+
+## 16. Phosh replaces Plasma Mobile as the session
+
+    apt-get install phosh phoc phosh-osk-stub squeekboard foot
+    # phosh 0.46.0-3+deb13u1, phoc 0.46.0-1, phosh-osk-stub 0.46.0-1
+
+Phosh's compositor is wlroots, so `/etc/environment` gained `WLR_RENDERER=pixman` --
+phoc then never touches GL, which is the point on this board.  SDDM still autologins
+`e5`; the session is now `phosh.desktop` and `plasma-mobile.desktop` is untouched, so
+switching back is one line.
+
+Three traps, all of them silent:
+
+1. SDDM reads `/etc/sddm.conf` and *then* `/etc/sddm.conf.d/*`, but a value present in
+   both is not simply overridden by the drop-in: editing `sddm.conf.d/10-e5.conf` alone
+   kept the old session.  The authoritative place turned out to be the main
+   `/etc/sddm.conf`.
+2. `/var/lib/sddm/state.conf` remembers the *last* session and wins over the
+   configuration for autologin (`Session=/usr/share/wayland-sessions/plasma-mobile.desktop`).
+   Both files have to agree.
+3. Restarting `sddm` does not stop the old session's processes: the Plasma session kept
+   running (kscreenlocker_g 173 MB, plasmashell 108 MB, kwin_wayland, kded6, ...)
+   alongside phoc.  Only a reboot cleared them -- and the reboot is what proved the
+   configuration, so it was the right move anyway.
+
+Measured, same device, same panel, `free -m`:
+
+| session | used | available | notes |
+|---|---|---|---|
+| Plasma Mobile, after the section 11 trim | 926 | 524 | kwin + plasmashell on llvmpipe |
+| Phosh | 723 | 727 | phoc + phosh + phosh-osk-stub, `plasmashell` 0 |
+
+About 200 MB more headroom, and neither session needed the other's daemons: the KDE
+helpers stay masked (they are X11-only), and the 240 MB `plasma-settings` process that
+showed up in `ps` was phosh launching it *on demand* (its scope says "Application
+launched by phosh"), not an autostart leftover -- `systemctl --user unmask` after
+checking, so the on-screen Settings button keeps working.
+
+## 17. Removing KDE, and the trap that made the 4 GiB zram keep coming back
+
+With Phosh working, the KDE/Plasma stack was purged (`~n^plasma`, `^kwin`, `^kde`,
+`^libkf`, `^kf6`, `^kscreen`, `^maliit`, `^breeze`, `^powerdevil`, `^kactivity`,
+`^polkit-kde`, `^ksmserver`, `^systemsettings`, `^kglobalaccel`, `^kio`, then
+`apt-get autoremove --purge`).  `/` went from 4.6 GiB used (962 MiB free) to **4.0 GiB
+used / 1.6 GiB free**, `plasmashell` is gone, and `/usr/share/wayland-sessions/` now
+holds exactly `phosh.desktop`.
+
+Measured on the same rootfs, same panel, `free -m`, three minutes after boot:
+
+| session | used | available | zram used | biggest process |
+|---|---|---|---|---|
+| Plasma Mobile as found | 1288 | 162 | 719 MB | plasma-settings 356 MB |
+| Plasma Mobile, after the section 11 trim | 926 | 524 | 590 MB | plasmashell 254 MB |
+| Plasma Mobile, second measurement (section 16, before the purge) | 1032 | 418 | 120 MB | plasmashell 368 MB / 56 % CPU |
+| Phosh, before the purge | 732 | 718 | 1 MB | phosh 75 MB, phoc 19 % CPU |
+| **Phosh, KDE purged** | **707** | **743** | 6.5 MB | phosh 71 MB, phoc 10.5 % CPU |
+
+So Phosh costs about 325 MB less than the same-rootfs Plasma Mobile, and its
+compositor burns about half the CPU (both are software-rendered: `WLR_RENDERER=pixman`
+for phoc, llvmpipe for kwin).
+
+### The trap: the initramfs overlay is copied over the rootfs on *every* boot
+
+The 4 GiB zram kept reverting to 768 MB after each reboot, and the reason is structural:
+`boot-linux-slotb.img` carries a 25-file overlay that `boot/init` copies into `/newroot`
+on every boot, and `/usr/local/sbin/e5-zram` is one of those files.  Editing the rootfs
+copy therefore lasts exactly until the next boot -- and the same is true of every path
+the overlay mentions (`etc/environment`, `etc/sddm.conf.d/*`, `etc/systemd/system/*`,
+the firmware files, ...).  Two ways out, and both are used here:
+
+* put the setting somewhere the overlay does *not* mention -- the zram size now lives in
+  `/etc/systemd/system/e5-zram.service.d/10-e5-4g.conf` (a drop-in directory, not a file
+  in the overlay), which sets `E5_ZRAM_SIZE=4G` and resets zram0 to zstd before the
+  stock script runs;
+* or reflash the rebuilt image, which is what `boot-linux-slotb.img` (66 modules, 26
+  overlay files including all of the above) is for.
+
+### The power button
+
+Two independent pieces are in play, and only one of them was wrong:
+
+* logind must not touch the key, or the device powers off the moment it is pressed --
+  `HandlePowerKey=ignore` / `HandlePowerKeyLongPress=ignore` were already in place
+  (section 6.2);
+* `gnome-settings-daemon`'s `power-button-action` was `suspend`, and this device has no
+  working suspend, so pressing the key did nothing visible.  It is now `nothing`, which
+  leaves the key to phosh itself (short press locks/unlocks, long press opens the power
+  menu).  Confirming that with a real press is the one open item.
+
+## 18. The power key: the kernel was fine, the session was not
+
+Pressing every key on the device while both `gpio-keys` (event0) and the keypad
+(event2) were being logged shows the whole input path works:
+
+| evidence | value |
+|---|---|
+| `gpio-49` ("Power Key") level samples | 9 of 380 at `lo` -- i.e. it really changes |
+| `gpio-52` ("Volume Up Key") | 3 samples at `hi` (idle `lo`) |
+| `gpio-191` ("Volume Down Key") | 4 samples at `lo` |
+| events on event0 | `KEY_POWER` (116) 12x, `KEY_VOLUMEDOWN` (114) 6x, `KEY_VOLUMEUP` (115) 8x, `KEY_F1` (59) 6x |
+
+and `/sys/kernel/debug/gpio` shows the lines claimed by the driver with interrupts
+(`gpio-49 | Power Key | in hi IRQ ACTIVE LOW`, `gpio-52 | Volume Up Key | in lo IRQ`,
+`gpio-191 | Volume Down Key | in hi IRQ ACTIVE LOW`), all four marked `wakeup-source` in
+the DT.
+
+### Why nothing happened anyway
+
+1. logind must ignore the key, or a press powers the device off -- `HandlePowerKey=ignore`
+   (section 6.2).
+2. phosh does not act on `KEY_POWER` itself.
+3. `gnome-settings-daemon`'s `power-button-action` was `suspend`, and **suspend does not
+   work on this board**: `rtcwake -m mem -s 15` returns 0, but the kernel log shows
+   `sipa 25220000.sipa: thread prepare suspend err` on every attempt -- the modem's data
+   path refuses to suspend, so the PM core aborts and resumes immediately.
+4. With gsd set to `nothing` instead (to stop the failing suspends) *nobody* handled the
+   key -- which is the state the user found: gsd's 300 s idle blank had turned the panel
+   off (`bl_power=4`) and no key could turn it back on.
+
+### What runs now: logind alone, no userspace daemon
+
+`/opt/e5/powerkey.py` is gone (2026-09-18).  It listened on `/dev/input/event0`, forced
+`idle-delay` to 0 so that its own `bl_power` toggle stayed coherent, and opened the
+Power Off dialog on a 1.5 s hold.  All of that was either redundant or actively fighting
+the compositor:
+
+* waking from a blanked panel never needed help.  phoc uses wlroots' idle protocol and
+  owns DPMS through the DRM connector: once it blanked, `bl_power` alone could not
+  bring the CRTC back, and any input event -- key or touch -- unblanks it.  The script
+  was writing `bl_power` underneath a compositor that was already doing it;
+* `idle-delay=0` was the price of that arrangement, and it is a bad price on a phone:
+  it means the panel *never* blanks on its own;
+* logind implements the long press in the kernel-facing path already
+  (`HandlePowerKeyLongPress`, whose default is `ignore` -- that default, not a missing
+  handler, is what made a held key do nothing).
+
+So the key is now logind's, via
+`rootfs/overlay/etc/systemd/logind.conf.d/20-e5-pwrkey.conf`:
+
+| press | action | who |
+|---|---|---|
+| short | `lock` -- phosh's lock screen | systemd-logind |
+| long | `poweroff` -- immediate, no dialog | systemd-logind's own long-press timer |
+| (panel dark) | any key or touch wakes it | phoc (wlroots idle) |
+
+`HandlePowerKey=suspend` is not an option on this board and neither is gsd's
+`power-button-action=suspend` (bullet 3 above); `lock` is what is left that is both
+instant and safe.
+
+### Verification (measured on the device)
+
+**A real short press locks, and phosh then blanks the panel itself** -- the press does
+*not* just sit there waiting for the idle timer.  One press, logged at 1 Hz (the panel
+had been blanked by idle beforehand):
+
+| t | `LockedHint` (logind) | `card0-DSI-1/dpms` | `sprd_backlight/bl_power` | what happened |
+|---|---|---|---|---|
+| 11:22:26 | no | Off | 4 | idle blank: panel off, session *not* locked |
+| 11:22:27 | no | **On** | 4 -> 0 | press wakes the panel |
+| 11:22:31 | **yes** | **Off** | **4** | logind locks; the lock screen blanks the panel |
+| 11:22:34 | yes | **On** | 0 | a tap wakes it, straight to the lock screen |
+
+`org.gnome.ScreenSaver.ActiveChanged` fires on the session bus at the same moment as
+`LockedHint` flips, so the dark screen after a press *is* the locked state, not a
+missing one.  `sm.puri.phosh.lockscreen require-unlock=true`, so getting back in needs
+the unlock gesture on the lock screen.
+
+**Idle blanking alone does not lock.**  With `idle-delay` at 15 s and the session left
+alone:
+
+| t | `LockedHint` | `dpms` | `bl_power` |
+|---|---|---|---|
+| 5 s ... 20 s | no | On | 0 |
+| 25 s ... 50 s | **no** | **Off** | **4** |
+| after one injected `KEY_WAKEUP` | no | **On** | **0** |
+
+The compositor's idle blank is a DPMS blank and nothing else: the session stays
+unlocked behind a dark panel, so the only thing that locks this device is the power key.
+`idle-delay` is back at 300 s afterwards.
+
+That is not a phosh default we can flip: `org.gnome.desktop.screensaver` already has
+`lock-enabled=true` (set here while testing), `idle-activation-enabled=true` and
+`lock-delay=0`, and the session still does not lock on idle.  The piece that is missing
+is the idle *activator*: GNOME does that in gsd-screensaver, which this gnome-settings-daemon
+does not ship and the phosh session does not start (the running plugins are a11y-settings,
+color, datetime, housekeeping, keyboard, media-keys, power, print-notifications, rfkill,
+**screensaver-proxy**, sharing, smartcard, sound, usb-protection, wacom, wwan).  Locking
+on idle would therefore need something that reacts to the idle transition -- an autostart
+helper, i.e. the kind of process this section just removed -- or logind's
+`IdleAction=lock`, which needs the session to report an idle hint and phoc does not
+(`IdleHint` stayed `no` through every blank above).
+
+The long press is also no longer the "Power Off" dialog with its countdown and Cancel
+(that came from `gnome-session-quit --power-off`, i.e. from the script).  It powers off
+at once.
+
+The long press is also no longer the "Power Off" dialog with its countdown and Cancel
+(that came from `gnome-session-quit --power-off`, i.e. from the script).  It powers off
+at once.
+
+## 19. Phosh needs GNOME apps -- purging KDE took the only settings app with it
+
+Phosh ships no applications of its own beyond the shell, the OSK and the compositor, so
+after the KDE purge the app grid held little more than a terminal: the only "Settings" on
+the device had been KDE's `plasma-settings`, and it went with the rest of Plasma.
+
+The phone-shaped set that belongs with Phosh was installed with `--no-install-recommends`
+(`/` went to 4.4 GiB used, 1.2 GiB free):
+
+| package | what it is |
+|---|---|
+| `phosh-mobile-settings` | Phosh's own phone settings (`mobi.phosh.MobileSettings`) |
+| `gnome-control-center` | the general GNOME settings app (`org.gnome.Settings`) |
+| `gnome-calculator`, `gnome-clocks`, `gnome-characters` | the usual small GNOME apps |
+| `foot` | terminal (already there) |
+
+Deliberately **not** installed, with reasons worth writing down:
+
+* `gnome-calls` / `chatty` (calls and SMS) need ModemManager and a RIL on top of the
+  modem.  This port drives the modem directly over AT (`docs` sections 13/14); there is
+  no RIL, so a dialer would have nothing to talk to.
+* `epiphany-browser` (WebKit) and `nautilus` are the obvious next apps when there is
+  space and appetite; the baseband gives them a working network, unlike Wi-Fi
+  (section 8, still blocked).
+* anything that plays audio is questionable until the amplifier path is verified -- the
+  MU300 port found its AW883xx silent on I2C, and this board has not been checked.
+
+### Default passwords
+
+`e5` / **123456** and `root` / `root` (`e5` has NOPASSWD sudo).  The user password is
+numeric on purpose: the 9-key keypad is the only keyboard on the device and it types
+digits, so that is what unlocks phosh's lock screen.  The root one is unchanged, and
+`rootfs/device-finalize.sh` -- which creates both accounts when a rootfs is built -- now
+writes 123456 as well, so a rebuilt image matches the running device.  Verified by
+logging in over telnet as `e5`/`123456`.
+
+## 20. GPU: the UMD/kbase handshake, the panel console, and what still blocks a compositor
+
+Everything in this section was measured on the device on 2026-09-18, on the kernel
+this repository builds (`5.15.211-g94401422a7df #4`, 66 modules).
+
+### 20.1 The handshake: ARM's glibc UMD and kbase r41p0 do talk
+
+The kernel side was never in doubt (vendor kbase is built in and reports
+`Kernel DDK version r41p0-01eac0`, `GPU identified as 0x1 arch 9.0.9 r0p1`).
+What was unknown is whether a *userspace* Mali driver exists that this kernel
+accepts.  One does: CoreELEC's `opengl-meson` packages ARM's Linux UMD, and the
+r41p0 arm64 build is `r41p0-fbdev-g57-aarch64-8a6d38656-b5` -- glibc, aarch64,
+Valhall G57, and built against the same kbase major version this kernel reports.
+
+Installed in the rootfs at `/opt/mali` (`libMali.so` plus
+`libEGL.so.1`/`libGLESv2.so.2`/`libGLESv1_CM.so.1` symlinks) and driven by
+`tools/egl-probe.py` -- ctypes only, so the target needs no compiler:
+
+    libEGL   : /opt/mali/libEGL.so.1
+    eglGetDisplay(DEFAULT) -> 0xfe4aa80
+    eglInitialize -> OK, EGL 1.4
+    EGL_VENDOR      : ARM
+    EGL_VERSION     : 1.4 Valhall-"r41p0-fbdev-g57-aarch64-8a6d38656-b5"
+    EGL_CLIENT_APIS : OpenGL_ES
+    eglChooseConfig(pbuffer) -> 5 config(s)
+    eglCreateContext -> 0x100765a0
+    pbuffer surface + current -> OK
+    GL_VENDOR                   : ARM
+    GL_RENDERER                 : Mali-G57
+    GL_VERSION                  : OpenGL ES 3.2 v1.r41p0-fbdev-g57-aarch64-8a6d38656-b5.fc0fdda618d58b1ff293a1730bc57b91
+    GL_SHADING_LANGUAGE_VERSION : OpenGL ES GLSL ES 3.20
+    GL_NUM_EXTENSIONS           : 101
+    glClear + glFinish -> OK
+
+kbase says the same thing from its own side -- the first UMD context makes it
+power the GPU up through its platform hook:
+
+    [  136.577129] mali GPU_set_DVFS_table kbase_platform_set_DVFS_table
+                   gpu_power_state = 1 gpu_clock_state = 1,gpu_temperature = 39840
+
+Two details worth keeping:
+
+* **This does not need `/dev/fb0`.**  The extension list contains
+  `EGL_KHR_surfaceless_context`, and the handshake succeeds on a kernel with no
+  fbdev at all -- the "handshake needs fbdev" assumption was wrong.
+* **The UMD is not installed as the system `libEGL.so.1`.**  It is a *fbdev*
+  build: it has no `EGL_KHR_platform_gbm`/`EGL_MESA_platform_gbm`, so a wlroots
+  compositor (phoc) could not use it, and swapping Mesa's libEGL out for it would
+  cost the session its renderer for nothing.
+
+### 20.2 `/dev/fb0` needed two driver patches, and it was worth it for the console
+
+The vendor KMS driver in `drivers/unisoc_platform/sprd_disp` never called
+`drm_fbdev_generic_setup()`, so `CONFIG_DRM_FBDEV_EMULATION=y` on its own produces
+no framebuffer.  `kernel/patches/0001` adds the call at the end of
+`sprd_drm_bind()`.  That alone is not enough either, and the reason is a probe
+order: the MIPI panel is a *child* device of the DSI host, and it attaches after
+`drm_dev_register()`:
+
+    [   11.836695] [drm] sprd_dsi_connector_detect()          <- before the panel exists
+    [   11.850052] [drm:sprd_panel_probe] create cabc Succeed!
+    [   11.930868] [drm] sprd_dsi_host_attach()
+    ...
+    [   12.428273] WCN BASEcrystal ... (12 s later, boot continues)
+
+`sprd_dsi_connector_detect()` returns connected only when `dsi->panel` is set, so
+the fbdev client probed a "disconnected" connector and gave up.  Patch `0002`
+schedules a `drm_kms_helper_hotplug_event()` from a delayed workqueue in
+`sprd_dsi_host_attach()` -- from a workqueue, not inline, because the hotplug ends
+in a modeset that walks the same panel/DSI paths the probe is still holding.  The
+inline version was tried first and made the boot take minutes (the initramfs loads
+`sprd-drm.ko`), which is how that was learned.
+
+**These patches live in two places on purpose.**  `kernel/patches/*.patch` in this
+repository is the canonical form -- `kernel/build-linux.sh` applies them to a fresh
+clone -- and the same four changes are now also *commits* in the kernel tree itself
+(`kernel_sprd_ums9158`, branch `linux-staging`):
+
+| patch | commit | what it touches |
+|---|---|---|
+| `0001-sprd-drm-fbdev-emulation` | `c7b95f5f` | `sprd_drm.c`: `drm_fbdev_generic_setup()` |
+| `0002-sprd-dsi-hotplug-on-panel-attach` | `4ab5ac3d` | `sprd_dsi.c/.h`: deferred client re-probe |
+| `0003-ion-for-the-fbdev-umd` | `7b42f508` | `staging/android` Kconfig + Makefile |
+| `0004-sprd-keypad-backspace-next-to-back` | `678d2409` | `sprd_keypad.c`: back + BackSpace |
+
+The build script recognises the committed state (`git apply --reverse --check` passes,
+so it prints "already applied") and the working tree is byte-identical before and after
+those commits.  `.scmversion` stays frozen at `-g94401422a7df`, so the release string
+-- and with it `/lib/modules/5.15.211-g94401422a7df` -- does not move when the tree
+gains commits.
+
+With both DRM patches `/dev/fb0` is there on every boot (`0 sprddrmfb`,
+320x480, 32bpp XRGB8888) -- and so is a **console on the panel**.  That second
+part needed one more fix: LK merges the boot image's command line with its own
+bootargs and *its* parameters win on duplicate keys, so the `console=tty0
+loglevel=7` that `build-boot-image.py` has always put in the header never took
+effect.  `/proc/consoles` showed only `ttyS1` and `ramoops-1`, the VT never
+received a printk, and the panel showed an empty console with a blinking cursor.
+The kernel now carries it itself:
+
+    CONFIG_CMDLINE="console=tty0 loglevel=6"
+    CONFIG_CMDLINE_EXTEND=y
+
+which is appended after the bootloader's string, and after that:
+
+    ttyS1                -W- (EC    )  235:1
+    ramoops-1            -W- (E  p a)
+    tty0                 -WU (E  p  )    4:1
+
+The kernel log now scrolls on the panel from the moment fbcon binds.
+
+### 20.3 A window surface still fails, with or without ION
+
+`tools/fbdev-info.py` (new, same ctypes trick) shows what the UMD sees:
+
+    /dev/fb0   smem_start 0x0   smem_len 614400   line_length 1280
+               xres x yres 320 x 480   virtual 320 x 480   32bpp
+               red/green/blue 16:8 / 8:8 / 0:8   capabilities 0x0
+
+`eglCreateWindowSurface()` with ARM's `fbdev_window {u16 width, height}` fails:
+
+    eglCreateWindowSurface(fbdev 320x480) -> EGL_NO_SURFACE
+    FAIL: glCreateWindowSurface failed (EGL_BAD_ALLOC (0x3003))
+
+-- at 320x480 and at 64x64, 160x160, 240x240 and 320x320 (so it is not a size or
+a format mismatch), and both before and after ION was enabled.  The blob's
+strings contain `/dev/ion` and `query ion heap failed ret=%#x`, i.e. it predates
+dma-buf heaps; this kernel has dma-heap but the Android build never enables the
+vendor ION that is still sitting in the tree, so `kernel/patches/0003` wires its
+Kconfig/Makefile back up and the fragment sets `CONFIG_ION`+`CONFIG_ION_SYSTEM_HEAP`
++`CONFIG_ION_CMA_HEAP`.  `/dev/ion` now exists and the window surface still fails,
+so ION was not the (only) blocker and the fbdev path was not pursued further --
+it cannot serve a compositor anyway.
+
+### 20.4 A newer UMD is rejected by this kernel
+
+CoreELEC's newer package (`opengl-meson-r44p0`) has exactly the variant that is
+missing: `valhall/r44p0/wayland/libMali_g57_dmaheap.so`,
+`r44p0-wayland-drm-g57-dmaheap-aarch64`, glibc, linking
+`libwayland-client/server` and using GBM.  Run as the session user with the
+running phoc's socket:
+
+    libEGL   : /opt/mali/libMali-r44p0-wayland.so
+    eglGetDisplay(DEFAULT) -> 0x26da97e0
+    FAIL: eglInitialize failed (EGL_NOT_INITIALIZED (0x3001)) -- the UMD did not accept kbase
+
+So kbase r41p0 refuses an r44p0 UMD.  The version check is not advisory: a UMD
+from a different DDK major version cannot be used against this kernel, which
+rules out "just take CoreELEC's newest blob".
+
+### 20.5 What that leaves
+
+A GPU-composited session needs a **glibc aarch64 GBM (or wayland) UMD built
+against kbase r41p0**.  The alternatives, in order of effort:
+
+1. Find that blob.  The r41p0 arm64 package publishes fbdev only, so this means
+   another vendor's BSP (Amlogic/Unisoc/Rockchip trees that ship a Linux libmali),
+   an ARM DDK build, or a CoreELEC/LibreELEC tree that built the wayland variant
+   for an r41p0 kernel.
+2. Port the kernel side to the DDK version that *is* published (r44p0) -- a
+   kbase replacement plus the vendor platform integration (DVFS, power domains),
+   which is a real kernel port, not a config change.
+3. libhybris around the device's own Android blob (bionic + the graphics
+   allocator/mapper HIDL services) -- how Ubuntu Touch and Sailfish do it.
+4. Panfrost, which turned out to need a driver backport rather than a DT port --
+   done since, see section 20.7.
+
+### 20.6 The compositor runs on the GPU: an *older* GBM UMD, and a 0600 dma-heap
+
+The missing piece in 20.1-20.5 was a glibc GBM/wayland UMD.  It does not have to be
+r41p0: the version check is not what the kernel enforces -- the UMD is the one that
+bails out, and only when the kernel is *older* than it.  Allwinner's A523 (also a
+G57) userspace, taken from TrimUI Smart Pro S firmware, is one blob with the whole
+GBM API in it:
+
+    /opt/mali/libMali-r32p0-sunxi.so
+    49,377,264 B, ELF aarch64, glibc
+    version string: 1.4 Valhall-"r32p0-01eac1"
+    exports gbm_create_device / gbm_bo_create / gbm_surface_create[_with_modifiers]
+    EGL client extensions: EGL_EXT_platform_base EGL_KHR_platform_gbm
+
+Against this kernel it initialises on the *compositor* platform rather than the
+fbdev one:
+
+    gbm_create_device(/dev/dri/card0) -> 0x4dc1490
+    eglGetPlatformDisplayEXT(EGL_PLATFORM_GBM_KHR) -> 0x4f965a0
+    eglInitialize -> OK, EGL 1.4
+    EGL_VERSION : 1.4 Valhall-"r32p0-01eac1"
+    GL_RENDERER : Mali-G57
+    GL_VERSION  : OpenGL ES 3.2 v1.r32p0-01eac1.3634895aa082dda7c3407d9f3e199919
+
+(`tools/egl-probe.py` grew an `EGL_PLATFORM=gbm` mode for this; the platform
+entry point is only reachable through `eglGetProcAddress` -- it is not a dynamic
+symbol in this build.)
+
+`gbm_surface_create(..., SCANOUT|RENDERING)` returns NULL, but the modifier-aware
+entry point works, and that is the one wlroots uses:
+
+    gbm_surface_create_with_modifiers(XR24, LINEAR) -> 0x4d61530
+    eglCreateWindowSurface(gbm surface) -> 0xac62130
+    eglSwapBuffers -> ok (three times)
+    gbm_surface_lock_front_buffer -> 0xac62740   stride=1280 format=0x34325258
+
+Then phoc, with the dynamic loader pointed at the blob **for the compositor only**:
+
+    /lib/ld-linux-aarch64.so.1 --library-path /opt/mali/gbm:/usr/lib/aarch64-linux-gnu \
+        /usr/bin/phoc.orig -v -S -C /etc/phosh/phoc.ini ...
+
+...failed at first, and the reason is worth remembering:
+
+    [render/egl.c:205] Supported EGL client extensions: ... EGL_KHR_platform_gbm
+    [render/egl.c:555] Failed to create GBM device
+    [render/pixman/renderer.c:328] Creating pixman renderer
+    phoc[7208]: open /dev/dma_heap/system failed
+
+**`/dev/dma_heap/*` is created 0600 root:root.**  The session user cannot open it,
+ARM's GBM allocates its buffers from a dma-buf heap, `gbm_create_device()` returns
+NULL, and wlroots quietly falls back to the CPU renderer instead of failing.  One
+udev rule later (`rootfs/overlay/etc/udev/rules.d/60-e5-dma-heap.rules`,
+`SUBSYSTEM=="dma_heap", MODE="0666"`) the same boot reports:
+
+    [render/egl.c:354] Using EGL 1.4
+    [render/egl.c:359] EGL vendor: ARM
+    [render/gles2/renderer.c:538] Creating GLES2 renderer
+    [render/gles2/renderer.c:539] Using OpenGL ES 3.2 v1.r32p0-01eac1...
+    [render/gles2/renderer.c:541] GL renderer: Mali-G57
+
+with the GPU actually busy (`SPRDDEBUG gpu core power on polling SUCCESS`), the
+shell up ("Phosh ready after 0.85s"), and `grim` capturing the composited output.
+
+Two details keep the rest of the session working:
+
+* the blob has **no Wayland platform** in its EGL client extensions, so GTK apps
+  must keep Mesa's software EGL.  That is why phoc gets the blob through an
+  explicit `--library-path` on the loader rather than `LD_LIBRARY_PATH`, which
+  its session child (`gnome-session`) would inherit;
+* `WLR_RENDERER=pixman` from `/etc/environment` is unset for phoc by the same
+  wrapper, so wlroots gets to choose its GLES2 renderer.
+
+All of it is installed by `rootfs/overlay/opt/e5/gpu-mali-setup`: the
+`/opt/mali/gbm/*` symlinks, the `/usr/bin/phoc` wrapper (the real binary stays as
+`/usr/bin/phoc.orig`), and the chmod that makes the current boot work before udev's
+rule is in place.
+
+### 20.7 Panfrost on the device: what it took, and what runs now
+
+Sections 20.1-20.6 are the search for a blob this kernel accepts.  This is the
+other route, and it is the one that works: panfrost drives the Mali-G57, the
+compositor renders on it, and -- for the first time on this device -- so do the
+clients.  Everything below was measured on the device, image `bf347253`,
+kernel `97082a76`.
+
+**The driver was not there.**  The tree's `drivers/gpu/drm/panfrost` is upstream
+v5.15 with a couple of ACK backports and stops at Bifrost -- its model table ends
+at `GPU_MODEL(g31, 0x7003)` and there is no `hw_features_g57` -- so upstream
+6.0's job-manager Valhall series was carried back: `2e87309e0660`,
+`382435709516`, `a17775a1af59`, `0c0af438345e`, `892e7fb7c254`, `5b9afc161ea5`,
+`d8e53d8a4e0a`, `5ba99fca1de0`, `952cd9745092`.  That is the G57 model entry
+(its ARM codename is "Natt", which is also what the vendor DT calls the node),
+its feature and issue sets, three errata bits and the two register writes that go
+with them.
+
+**The platform side was nobody's.**  There is no power domain for this GPU in
+the device tree, and the sequence that switches it on lived only in kbase's
+platform code.  What makes it portable is that the DT already carries every one
+of those registers as an opaque `<&syscon REG MASK>` triple, so a driver needs
+the *order*, not the addresses: `panfrost_sprd.c` is
+`mali_kbase_config_qogirn6l.c`'s `mali_freq_init()` plus
+`mali_power_on()`/`mali_clock_on()` with the DVFS governance dropped.  First
+boot with it:
+
+    panfrost 23140000.gpu: clock rate = 26000000
+    panfrost 23140000.gpu: Unisoc GPU powered on (DVFS index 3)
+    panfrost 23140000.gpu: mali-g57 id 0x9091 major 0x0 minor 0x1 status 0x0
+    panfrost 23140000.gpu: features: 00000000,67c00007, issues: 00000001,80000400
+    panfrost 23140000.gpu: Features: L2:0x07120206 Shader:0x00000000 Tiler:0x00000809 ...
+    panfrost 23140000.gpu: shader_present=0x5 l2_present=0x1
+    [drm] Initialized panfrost 1.2.0 20180908 for 23140000.gpu on minor 0
+
+`0x9091` is the G57 ID (`panfrost_model_cmp()` masks it to `0x9001` to match the
+model table) and `0x5` is two shader cores, non-contiguous -- the same value an
+independent G57 MC2 bring-up reports.
+
+Three details that each cost an hour:
+
+* `dcdc_gpu_pd` points at `&pmu_apb_regs`, but kbase replaces the regmap
+  underneath it with the PMIC's (`sprd,ump962x-syscon`) before using it; the DT
+  comment calls the address fake.  `sprd_pmic_regmap()` does the same and keeps
+  the parsed register/mask pair.
+* the vendor DT names its interrupts `"JOB"`, `"MMU"` and `"GPU"` -- all three on
+  the same GIC line -- and `of_irq_get_byname()` is case sensitive, so a mainline
+  driver finds no interrupts at all.  `panfrost_irq_get()` walks
+  `interrupt-names` case-insensitively as a fallback, quietly: the first version
+  asked with `platform_get_irq_byname()` and printed three "IRQ x not found"
+  lines per boot for lookups that then succeeded.
+* the frequency is set by writing a DVFS *index* into a syscon, and the clocks in
+  the node are shared PLL parents, so `clk_set_rate()` must not be used on them:
+  devfreq is skipped for this board through a new
+  `panfrost_compatible.no_devfreq`.
+
+**Userspace is stock Debian.**  Nothing was installed for this -- Mesa 25.0.7
+already carries panfrost.  The session only had to stop being told not to use
+it (`/etc/environment` forced `llvmpipe`) and wlroots had to be told to look:
+
+    [render/gles2/renderer.c:538] Creating GLES2 renderer
+    [render/gles2/renderer.c:539] Using OpenGL ES 3.1 Mesa 25.0.7-2+deb13u1
+    [render/gles2/renderer.c:541] GL renderer: Mali-G57 (Panfrost)
+
+and a *client* gets hardware too, which is what the blob could never do (20.6):
+`eglinfo` on the Wayland platform now reports
+`OpenGL ES profile renderer: Mali-G57 (Panfrost)` where it used to report
+llvmpipe.  The display is being scanned out from a compositor buffer as well:
+
+    plane[31]: crtc=dispc0  fb=121  format=XR24  size=320x480
+            allocated by = phoc.orig
+            imported=no
+
+**Two traps, both found the hard way.**
+
+* `sprd_gem_dumb_create()` counts every `DRM_IOCTL_MODE_CREATE_DUMB` in a static
+  variable that is never reset, and refuses the 11th request of each boot with
+  `-EINVAL`.  wlroots allocates its primary swapchain through exactly that
+  ioctl -- the KMS state above is the proof: Mesa's kmsro renders on panfrost,
+  but the *display* device allocates the buffer (`imported=no`) -- so a second
+  session in the same boot dies with
+
+      MESA: error: Failed to create scanout resource
+      DRM_IOCTL_MODE_CREATE_DUMB failed: Invalid argument
+      [render/allocator/gbm.c:116] gbm_bo_create failed
+      [render/swapchain.c:110] Failed to allocate buffer
+      [types/output/swapchain.c:109] Swapchain for output 'DSI-1' failed test
+
+  and the panel stays black until the next reboot, because a compositor that
+  cannot build a swapchain does not modeset at all.  The cap is 64 now
+  (kernel patch 0006).
+* splitting the two devices explicitly -- which is the shape this hardware wants
+  -- does not work with libseat/logind here:
+
+      Opening fixed list of KMS devices from WLR_DRM_DEVICES: /dev/dri/card0:/dev/dri/renderD128
+      Unable to open /dev/dri/card0 as KMS device
+      [libseat] Could not take device: No such device
+      Failed to open device: '/dev/dri/renderD128': Resource temporarily unavailable
+      Found 0 GPUs, cannot create backend
+
+  wlroots opens each entry from the list as a KMS device through libseat, logind
+  refuses both, and the session never starts at all.  Worth remembering anyway:
+  panfrost registers first and takes `card0`, so **the display is `card1`** and
+  the GPU is `card0` -- the opposite of the way 20.1-20.6 refer to them, and a
+  `WLR_DRM_DEVICES` list written from those notes would name the wrong device.
+
+**What the blob path leaves behind.**  It is retired, not because it broke but
+because panfrost makes it pointless: `rootfs/overlay/opt/e5/gpu-mali-setup` is
+gone, the session no longer installs a `/usr/bin/phoc` wrapper (an overlay copy
+of it would have to carry a copy of the binary), and the dma-heap udev rule is
+kept only because opening those heaps is not specific to Mali.
+`CONFIG_MALI_MIDGARD=m` with nothing loading the module is what keeps kbase off
+the node (`modprobe mali_kbase` is the way back).
+
+**What it does not get you: PanVK.**  Mesa has no Valhall v9 backend for it, by
+design -- `src/panfrost/vulkan/meson.build` builds `jm_archs = [6, 7]` and its
+arch loop skips 9, because the `jm/` command-buffer code is Bifrost-only.  The
+only v9 Vulkan that exists is a reverse-engineering bring-up with compute and
+offscreen draws working and no WSI/present, i.e. no swapchain and therefore no
+compositor.  So G57 gets OpenGL/GLES 3.1 from panfrost and no Vulkan at all --
+which is enough for the actual problem (the clients stuck on llvmpipe are a
+GL/EGL problem, not a Vulkan one), but Vulkan is off the table either way.
+
+## 21. Display scaling on a 320x480 panel: what fits, and what the resampling costs
+
+The panel is 320x480 at ~166 DPI while phosh lays its UI out for something closer to
+360x720, so `[output:DSI-1] scale` in phoc.ini is a three-way compromise between the
+on-screen keyboard, the lock screen and text size.  All five options were measured on
+the device (grim captures; the "logical" column is exactly the capture size):
+
+| scale | logical | resample | on-screen keyboard | lock screen | text-scaling |
+|---|---|---|---|---|---|
+| 1.0 | 320x480 | 0 % | cut on the right | unlock button off-screen | 0.85 |
+| **0.9** | **355x533** | **10 %** | fits | unlock button half off | **0.85** (set) |
+| 0.85 | 376x565 | 15 % | fits | unlock button just cut | 0.90 |
+| 0.8 | 400x600 | 20 % | fits | fits | 0.85 (text too small) |
+| 0.75 | 426x640 | 25 % | fits | fits | 1.0 (visibly soft) |
+
+* A Wayland output scale below 1 is *fractional*: the compositor renders the output at
+  `mode/scale` (grim reports 426x640 at 0.75 and 355x533 at 0.9) and the display
+  controller scales that down to 320x480.  Both GTK 4.18.6 and wlroots 0.18.2 *do*
+  implement `wp_fractional_scale_v1` (grepping the libraries directly for
+  `wp_fractional_scale[a-z_]*` hits in both; `strings` is not installed on the
+  device, which is what made an earlier check report zero), so the softness is the
+  resampling itself, not a missing protocol.
+* Physical text size is roughly `text-scaling-factor * scale`, and the keyboard
+  constraint caps that product at about 0.8 whatever the split is: the OSK's layout is
+  ~339 logical px wide at ts 0.85, so `320/scale >= 339 * ts/0.85`.
+* The lock screen needs ~575 logical px of height, i.e. `scale <= ~0.84`; above that
+  its unlock button sits half below the screen.  That no longer matters -- the keypad's
+  confirm key submits the PIN (section 12.1) and the arrow keys can move the focus to
+  the button -- so 0.9 was chosen, for the sharpest text whose keyboard still fits and
+  for the in-system text size that was found comfortable.
+* `sm.puri.phoc scale-to-fit = true` makes phoc scale down windows that are larger than
+  the output, which is what keeps apps written for >=360 px usable.
+* **2026-09-26: back to scale 1**, after evaluating scale 0.9: with the text
+  scaled up in Settings (text-scaling-factor 1.25) too many buttons ended up off the
+  screen, and the panel's own resolution is the one without resampling.  The output
+  can be changed live (`wlr-randr --output DSI-1 --scale <s>` in the session; phoc
+  implements wlr-output-management), phoc.ini is what a new session starts with.
+
+**The system font size is the user's call, and the toggle is built in.**  Everything
+above is about the *output* scale; the *font* is
+`org.gnome.desktop.interface text-scaling-factor`, which phosh exposes as
+Settings -> Accessibility -> "Large Text" (and which renders at the chosen size, so it
+stays sharp).  That is the control to reach for -- the panel ends up at 1.25 here,
+which is 47 % larger text than the 0.85 this started with, with nothing but the
+on-screen keyboard and the lock screen caring.
+
+Trying to widen that budget by replacing the OSK did not work: Debian's
+`squeekboard` ships (its layouts are compiled into the binary) and it starts,
+registers as a gnome-session client and connects to Wayland -- and then exits with
+
+    DEBUG: Registered client at '/org/gnome/SessionManager/Client25'
+    WARNING: DBus unavailable, unclear how to continue. Is Squeekboard already running?
+
+even when nothing owns `sm.puri.OSK0` (verified with `GetNameOwner`: NameHasNoOwner),
+through D-Bus activation from a service file as well as by hand.  phosh's
+`phosh-osk-stub --allow-replacement` is what runs, and its layout is a fixed width --
+which is why the keyboard itself is the thing that suffers from a large font.
+
+
+
+## 20. The hotspot needed the regulatory database in the initramfs
+
+`hostapd` installs and `wlan0` does switch to AP mode (`iw dev wlan0 set type __ap`),
+but hostapd refused to start: `Failed to set beacon parameters` on 2.4 GHz, and on 5 GHz
+`Frequency 5180 (primary) not allowed for AP mode, flags: 0x853 NO-IR`.  `iw reg get`
+answered `country 00: DFS-UNSET`, and `iw reg set CN` never changed that: **cfg80211 loads
+`regulatory.db` from firmware when it initialises**, and here it initialises in the
+initramfs -- before the root filesystem, and therefore before `/lib/firmware`, exists.
+The request is one-shot: it waits in the sysfs firmware fallback (the trick MU300's
+`regdb-load` uses) and times out long before a systemd service could feed it.  Without
+the database cfg80211 cannot apply CN's rules, so every channel stays NO-IR and hostapd
+cannot transmit beacons -- which is what "client cannot join" looked like.
+
+Feeding it late cannot work either, and neither can reloading the modules: the running
+rootfs has no `/lib/modules` at all (the vendor modules live only in the initramfs), so
+`sprd_wlan_combo`/`wcn_bsp`/`cfg80211` cannot be unloaded and re-inserted to re-issue the
+request.
+
+The fix is in the image: `regulatory.db` and `regulatory.db.p7s` (from `wireless-regdb`,
+6 KiB together) now sit in `rootfs/overlay/lib/firmware/`, and `boot/init` copies the
+overlay's `lib/` to `/lib` *before* loading the WCN modules (`stage=overlay-early`), so
+cfg80211 finds them the moment it asks.  **The hotspot therefore needs a reflash** of the
+rebuilt image; the device currently runs the previous one.
+
+For reference, the parameters this chip wants (from MU300's `hotspot-start`): 5 GHz
+`hw_mode=a channel=36 ht_capab=[HT40+][SHORT-GI-20][SHORT-GI-40] ieee80211ac=1
+vht_oper_chwidth=1 vht_oper_centr_freq_seg0_idx=42`, or 2.4 GHz `hw_mode=g channel=6
+ht_capab=[SHORT-GI-20]`, with `country_code=CN` and `ieee80211d=1`.
+
+### 20.1 What it took to get `AP-ENABLED`
+
+Four things, in the order they were discovered:
+
+1. **A signed regulatory database, upstream variant.** The kernel's own words were
+   `cfg80211: loaded regulatory.db is malformed or signature is missing/invalid`: Debian's
+   `wireless-regdb` build (`regulatory.db-debian`) is signed with Debian's key, while this
+   vendor kernel only carries the upstream `sforshee`/`wens` certificates.  The
+   `-upstream` pair works, and it has to be in the **initramfs** because cfg80211 asks for
+   it when the WCN modules load (see section 20 for why a late feed cannot work).
+2. **The country has to be set explicitly** even with the database present: cfg80211 starts
+   in the world domain (`country 00`).  With a valid database `iw reg set CN` finally takes
+   effect -- `country CN: DFS-FCC` with real rules -- and before that it silently did
+   nothing, which is why every channel read `NO-IR`.
+3. **The DT's `wcnmodem` partition** was still faked with a loop device over
+   `/lib/firmware/wcnmodem.bin` here.  It was never needed (8.3) and was later found to
+   break the firmware load outright (`ETXTBSY`, section 29); it is gone.  The service
+   gates on the firmware file.
+4. `wlan0` must be free: `wpa_supplicant.service` stopped and masked, and the interface
+   marked unmanaged in NetworkManager.
+
+Verified on the device:
+
+    iw reg get                     -> country CN: DFS-FCC
+    hostapd /etc/hostapd/e5.conf   -> wlan0: interface state COUNTRY_UPDATE->ENABLED
+                                      wlan0: AP-ENABLED
+    iw dev wlan0 info              -> type AP, ssid E5-Linux
+    ip -br addr show wlan0         -> 192.168.78.1/24
+    systemctl is-active e5-hotspot.service -> active
+
+clients get a lease from systemd-networkd's DHCPServer
+(`etc/systemd/network/20-e5-wlan0.network`, 192.168.78.10-29) and are NATed out through
+`sipa_eth0` by the rules `mobile-data up` installs.  SSID `E5-Linux`, password
+`12345678`; a 5 GHz profile is in `etc/hostapd/e5-5g.conf` for when the regulatory domain
+allows channel 36 (this one did not, `NO-IR`, until the database loaded).
+
+### 20.2 Clients got an address but no internet (two traps)
+
+1. **No resolver behind the address.**  systemd-networkd's `DHCPServer=yes` advertises its
+   own address as DNS by default, and this image runs no DNS server at all (no dnsmasq, no
+   systemd-resolved), so a client could ping IPs but resolve nothing.  The interface's
+   `.network` now sets `EmitDNS=no` and `hotspot-start.sh` writes the nameservers
+   `/etc/resolv.conf` actually has into
+   `/etc/systemd/network/20-e5-wlan0.network.d/10-dns.conf`, so the lease carries the
+   carrier's resolvers.
+2. **systemd ignores config files that are not root-owned.**  Files pushed from the host
+   keep the host uid (501) and a 0600 mode; hostapd did not care, but networkd silently
+   skipped the file -- `networkctl status wlan0` showed `Network File: n/a`, `State:
+   unmanaged` and no address, and for a while that looked like the DHCP server had broken.
+   Any config file that lands on the device by hand needs
+   `chown root:root` + a readable mode.
+
+Verified after both fixes:
+
+    Network File: /etc/systemd/network/20-e5-wlan0.network
+                  + .../20-e5-wlan0.network.d/10-dns.conf
+    State: routable (configured)   Address: 192.168.78.1
+    DNS: 223.5.5.5 119.29.29.29 58.240.57.33 221.6.4.66
+    DHCP server listening on 0.0.0.0%wlan0:67
+
+A client that already holds a lease has to reconnect (or let the lease renew) to pick up
+the new DNS option.
+
+### 20.3 dnsmasq does the hotspot's DHCP and DNS
+
+`systemd-networkd`'s DHCPServer cannot answer the DNS queries it advertises, and with
+`EmitDNS=no` plus a static `DNS=` list the lease carried the carrier's resolvers but the
+client still did not resolve (it was the lease renewal that decided it, and a static list
+also breaks whenever the carrier changes servers).  `dnsmasq` does both jobs properly:
+
+    /etc/dnsmasq.d/e5-hotspot.conf
+      interface=wlan0, interface=usb0, bind-interfaces
+      no-dhcp-interface=usb0                 (usb0's leases stay with networkd)
+      dhcp-range=192.168.9.10,192.168.9.61,255.255.255.0,12h
+      dhcp-option=option:router,192.168.9.1
+      dhcp-option=option:dns-server,192.168.9.1
+
+and `wlan0`'s `.network` went back to address-only (`DHCPServer=no`), so nothing competes.
+Verified: `dnsmasq --test` OK, `dnsmasq: active` (enabled), listening on
+`192.168.9.1:53`, `192.168.77.1:53` and `127.0.0.1:53`, and
+`busybox nslookup deb.debian.org 192.168.9.1` resolves -- so a client that renews its
+lease gets `192.168.9.x`, gateway `192.168.9.1` and a resolver that actually answers.
+
+### 20.4 Channel 149 at 80 MHz works -- the stall was the regulatory domain
+
+For a while the tree kept the hotspot at 20 MHz because 40 MHz and 80 MHz both left
+hostapd in `COUNTRY_UPDATE->HT_SCAN` and never at `AP-ENABLED`.  That was not the width;
+it was the same missing country as section 20.  With `country CN: DFS-FCC` the driver's
+own regulatory list reads
+
+    nl80211: 5725-5850 @ 80 MHz 33 mBm
+
+and with `ieee80211ac=1`, `ht_capab=[HT40+]`, `vht_oper_chwidth=1` and
+`vht_oper_centr_freq_seg0_idx=155` hostapd sets
+
+    nl80211: Set freq 5745 (ht_enabled=1, vht_enabled=1, he_enabled=0, bandwidth=80 MHz, cf1=5775 MHz, cf2=0 MHz)
+
+The beacon (parsed from hostapd's own `-dd` hexdump with `work/parse-beacon.py`) carries
+HT Operation primary 149 / secondary offset 1 (HT40+) and **VHT Operation `width=1`
+(80 MHz), seg0=155, seg1=0** -- the 149/153/157/161 block.  Four start attempts (with and
+without a preceding `iw dev wlan0 scan`; with and without a pre-set
+`iw dev wlan0 set channel 149 80MHZ`) all reached `AP-ENABLED`, so
+`opt/e5/hotspot-start.sh` no longer configures the channel and
+`etc/hostapd/e5.conf` is the 80 MHz profile (the old 20 MHz one is in git history).
+
+Two things to keep in mind:
+
+* The 5 GHz band's own capabilities are fine: `iw phy` says `HT20/HT40`, and the wiphy's
+  VHT max width is 80 MHz (`Supported Channel Width: neither 160 nor 80+80`), while the
+  driver's regulatory list allows 80 MHz on 5725-5850.
+* The VHT *Capabilities* IE still advertises `SupportedChannelWidthSet=0` (20/40) even
+  though the operation element says 80 MHz.  That bit is inherited from the driver's
+  `hw vht capab: 0x1b07031`, which has it clear -- the vendor driver claims 20/40 in its
+  capability IE while running 80 MHz.  A client that trusts the operation element gets
+  80 MHz, which is why the acceptance test is a real client's link rate, not the beacon.
+
+### 20.5 The old "HT_SCAN hang" note, corrected
+
+The earlier commits (fdc0494 and a38122d) disagreed about whether pre-setting the channel
+while the interface was down helped.  It did not matter either way: what changed between
+"hangs in HT_SCAN" and the measurements above is the country.  hostapd's 40 MHz
+coexistence scan (`Scan for neighboring BSSes prior to enabling 40 MHz channel`) does run
+and complete in the working case; with every 5 GHz channel NO-IR it had nothing to settle
+on and never left `HT_SCAN`.
+
+
+## 22. The baseband CP assert: the URC channel, the RIL-shaped AT channel, the watchdog
+
+### The symptom, and the empty run
+
+A boot brings the bearer up (`+CPIN: READY`, `+CEREG: 2,1,...,11` = NR SA,
+`AT+CGDATA="M-ETHER",1`, `sipa_eth0` with its address and a `metric 100` default
+route), and at about 9.5 minutes the CP stops answering.  The kernel log then
+carries the CP's own words:
+
+    modem cmd Modem Assert: MN_AL Task PS CP assert in file
+    MS_System/RTOS/source/src_osa/c/threadx_os_iram.c line 1115
+    exp=ASSERT: Error 0xb, The queue was full info=[], [dfs=5]
+
+Trusty restarts the CP (`enter SEC_KBC_START_CP` -> `kbc_start_cp() enter
+MODEM_IMG`) and the AT channel does not come back; only a reboot recovers it.  The
+empty run settled the trigger: with `e5-mobile-data` and its watcher stopped and
+no AT at all, **uptime 17 minutes passed with zero `CP assert` hits**, while a
+session that polls AT died at ~9.5 minutes.
+
+### The two channels
+
+Measured on 2026-09-18 with the watcher stopped and nobody holding a channel:
+
+* `/dev/stty_nr0` is the **URC channel**.  Opening it dumps the queue that piled
+  up since the last reader: `+SIND: 1`, `+SIND: 10,"SM",1,"FD",1,...`,
+  `+ECIND: 3,0,0,1`, `+ECIND: 3,6,1`, `+CMGW: ME is full`, `+PRENWINFU:"46001"`,
+  `+CREG: 2`, `+CEREG: 2`, then a periodic `+CSQ: 255,99` / `+CESQ:
+  99,99,255,255,255,255,75,67,73` pair (signal fields invalid, ME storage full),
+  and later the bearer events `+CGEV: ME PDN ACT 1` / `+SPPCODATA: 1`.  A 45 s
+  read produced tens of lines, a later 8 s read 63 lines (~6 lines/s).
+* `/dev/stty_nr1` is a **clean command channel**: it stays silent while idle and
+  answers `AT`, `AT+CEREG?`, `AT+COPS?` normally.  MU300-linux saw the same
+  `nr0`=URC / `nr1`=command split on the same modem family.
+
+Our code never read `nr0` at all, and `mobile-data`'s `at()` opened
+`/dev/stty_nr1`, drained 0.2 s of backlog, wrote one command, read to `OK` and
+closed the port again -- for every command, every 30 s, from the bearer watcher.
+Android's RIL does the opposite: it holds the channel open for the lifetime of
+the boot and reads the URC stream continuously (`urild` is the process that does
+it on this device).
+
+### A second, different death: AT dies without an assert
+
+On 2026-09-18 22:03-22:09 the AT server was observed dying on its own, with the
+watcher stopped and nobody holding either channel:
+
+* 22:03:14 (`uptime 1765`) a bare `AT` on `nr1` answered `OK`, and an `nr0` read
+  dumped the URC backlog above;
+* by 22:07 both channels returned nothing at all, and at 22:09 a bare `AT`
+  produced no `OK`, no `ERROR` and no URC -- no process had the channel open;
+* `dmesg` `CP assert` hits = 0, there was no `kbc_start_cp` after boot, and
+  `busybox wget` through `sipa_eth0` still worked (the address stayed up).
+
+So "the AT channel is dead" and "the CP has asserted" are not the same event, and
+the bearer can keep passing traffic after AT is gone.  A watchdog has to key on
+AT's silence, not on the CP assert appearing in dmesg.
+
+### The fix: a persistent, RIL-shaped AT channel
+
+`rootfs/overlay/opt/e5/atd.py` (`e5-atd.service`) is a small daemon that opens
+`nr0` and `nr1` **once** and keeps them open for the whole boot:
+
+* it drains `nr0` continuously into `/var/log/e5-atd.urc` (rotated at 256 KiB)
+  and never closes the port;
+* commands from `mobile-data` arrive on the `/run/e5-atd.sock` unix socket and are
+  serialised with a 0.3 s minimum gap, one in flight at a time, with an 8 s
+  timeout, so no caller can flood the CP;
+* URCs are interleaved with the command's own response rather than being lost;
+* when idle for 60 s it sends a bare `AT` and records the answer as the liveness
+  signal, and it publishes `/run/e5-atd.state` (JSON: `last_ok`, `last_rx`,
+  `urc_lines`, `commands`, `fails`, channel flags) for the watchdog;
+* the channels are reopened with backoff if they disappear, so a CP restart no
+  longer leaves a dead port behind.
+
+`mobile-data` asks for its AT through the daemon (`at()` falls back to the old
+direct path only if `/opt/e5/atd.py` is not installed), and its watcher now
+checks the interface every 30 s but asks the modem about `+CEREG?`/`+CGACT?` only
+once every five minutes instead of every 30 s.
+
+Measured after deploying it (2026-09-18, uptime 31 min, watcher up for 17 min):
+`CP assert` hits = 0, `AT+COPS?` -> `+COPS: 0,2,"46001",11`, `sipa_eth0` still up
+and `busybox wget http://mirror.nju.edu.cn/...` fine -- where the previous
+regime asserted at ~9.5 minutes.  (Correlation, not proof: the watcher's AT
+volume is now ~1.4 commands/min against ~4/min before, so either the persistent
+channel or the lower rate may be what helps.  The daemon does both, which is what
+the RIL does.)
+
+### The watchdog
+
+There is no userspace modem reset on this board: `/sys/class/misc` has no modem
+node and restarting `e5-vendor.service` sends `cmd 0x43c84e06`, which only
+re-triggers the same assert 19 s later.  So the honest recovery for a silent AT
+channel is a reboot, done by `rootfs/overlay/opt/e5/cp-watchdog`
+(`e5-cp-watchdog.service`, `/etc/e5/cp-watchdog.conf`):
+
+* dead = the daemon's `last_ok` is older than `DEAD_AFTER` (default 120 s);
+* on death it appends the evidence to `/var/log/e5-cp-watchdog.log` -- uptime,
+  the atd state, the last URCs, the `modem`/`CP assert`/`kbc_*` lines from dmesg
+  and `ip -s link show sipa_eth0` -- then re-arms the boot slot
+  (`/usr/local/sbin/e5-boot-ok`, which matters because `e5-boot-ok.service` is
+  disabled on the device right now and a plain reboot would otherwise fall back
+  to Android) and runs `systemctl reboot`;
+* `GUARD` (900 s) refuses a second watchdog reboot inside the window and only
+  logs it, so a CP that dies again immediately cannot turn into a boot loop;
+* `ACTION=log` observes without rebooting, and `--simulate` was used to test the
+  decision: with a fake state whose `last_ok` was 400 s old, the watchdog
+  reported "AT channel has not answered for 415 s" with the evidence block at the
+  first check and refused to reboot under `ACTION=log`.
+
+## 23. The two open documentation debts, paid
+
+* **Identity strings.**  `rootfs/overlay/etc/machine-info` sets `PRETTY_HOSTNAME=
+  Rongyue E5` (the static hostname cannot contain a space, so the login prompt
+  keeps `e5-linux`).  `HARDWARE_VENDOR`/`HARDWARE_MODEL` are deliberately unset --
+  they fill the "Hardware Model" row, while the part name belongs in "Processor",
+  which is built from `/proc/cpuinfo` and is therefore set in the kernel
+  (`kernel/patches/0009` prints `Processor: Unisoc T158`).
+* **The 32 s shutdown.**  Measured 2026-09-18: everything stops inside 1.3 s
+  (`bluetooth.service` in 0.25 s) and the journal is then silent from
+  NetworkManager's `modem-manager: ModemManager no longer available` at
+  14:57:01.108 until NM's own `exiting (success)` at 14:57:33.001 -- NM waits on
+  device teardown that does not complete here (the WLAN firmware does not answer
+  a disconnect promptly).  `NetworkManager.service.d/20-e5-shutdown-timeout.conf`
+  (`TimeoutStopSec=5`) did not shorten the total in the one test after it: NM's
+  stop is issued late in the sequence, so the time is spent before it is reached.
+  Re-measure on a booted image before believing anything else here.
+
+
+## 24. Audio: the AP path streams, ALSA never sees a period, and the AGDSP is the missing piece
+
+The vendor sound stack does come up on this port -- card `sprdphone-sc2730`, codec
+`ump9620`, the AW87xxx smart PA on i2c 6-0058 parsing its profile out of
+`aw87xxx_acf.bin` -- but two things must also be true before a PCM can even be
+opened, and a third before an ALSA client can finish a buffer.
+
+### 24.1 What the stack needs to load
+
+* The audio modules (`sound/soc/sprd/unisoc/*` + `drivers/unisoc_platform/sprd_audio/*`,
+  24 modules) are loaded from the initramfs by a name list, so their *order* is ours.
+  `sprd_dmaengine_pcm` failed with `Unknown symbol get_sp_audio_debug_flag /
+  sprd_tdm_dai_to_config / sprd_mmap_fd_set (err -2)` because two of those three are
+  exported by `snd_soc_sprd_card.ko`, which was listed *after* it; deriving the order
+  from real symbol dependencies (`nm -g --defined-only` / `-u`) fixed that, and
+  `stage=modules-done loaded=91 failed=0` is the check that it stayed fixed.
+* The ASoC card also wants the AGDSP power domain.  With `agdsp_pd.ko` absent or
+  neutralised, `asoc_sprd_card_parse_of: Parsing dai link 0 failed(-517)` loops
+  forever, because the codec and the VBC DAI name that domain as their
+  `power-domains` provider.  The three variants that were tried are in the STATUS
+  narrative; the tree carries the hybrid one now (no legacy `smsg` kthread, PMU state
+  read before the mailbox wake, no vendor power-off sequence).
+
+### 24.2 The AP path itself works
+
+Two controls turn "the DMA runs one burst and stops" into "the VBC FIFO drains":
+
+* `agdsp_access_en` = 1, which is `REG_AON_APB_AUDCP_CTRL` (0x6490014c) bit 5,
+  `MASK_AON_APB_AP_2_AUD_ACCESS_EN`.  It opens AP access to the AGCP domain, and with
+  it the `audcp-{vbc,aud,dma-ap,mcdt,icu,tmr-26m,dvfs-aspb,intc}-eb` clocks match
+  Android's.  Measured: 0x6490014c reads 0x20 with it, and the DMA pointer then
+  advances and wraps instead of stalling after a single 640-byte burst.
+* `VBC DAC0 DG Set` must be non-zero (Android runs it at 39,39).  Linux leaves it at
+  0, which is digital silence however well the route is wired.
+
+The full list is `/root/e5-spk-recipe.sh` on the device, derived by diffing Android's
+mixer state (`/system/bin/tinymix`) while it was playing a ringtone against Linux's
+idle state.  With it applied a playback to `hw:0,0` really does stream: with the two
+AGCP DMA channels enabled (`GLB_CHN_EN_STS` 0x5665001c = 0x3), the VBC playback FIFO
+status (0x56510034) walks 0x29c21 -> 0xd4a1 -> 0x1a0c1 -> 0x17ce1 as the DMA consumes
+it.
+
+### 24.3 The blocker: no period boundary ever reaches ALSA
+
+Measured during that playback (`busybox devmem`):
+
+| where | register | value |
+| --- | --- | --- |
+| AGCP DMA @0x56650000 | `GLB_INT_RAW_STS` 0x10 | 0x3 |
+| | `GLB_INT_MSK_STS` 0x14 | 0x3 |
+| | `GLB_REQ_STS` 0x18 | 0x0 |
+| | `GLB_CHN_EN_STS` 0x1c | 0x3 |
+| VBC AP regs @0x56510000 | `AUDPLY_FIFO_CTRL` 0x20 | 0x00f00650 |
+| | `AUD_EN` 0x2c | 0x300 |
+| | `AUDPLY_FIFO0_STS` 0x34 | moving |
+| | `AUD_INT_EN` 0x44 | 0x4 |
+| | `AUD_INT_STS` 0x48 | 0x10 (sticky) |
+| | `AUD_CHNL_INT_SEL` 0x4c | 0x0000 |
+| | `AUD_DMA_EN` 0x50 | 0x3 |
+
+Both interrupt-status registers sit pending and are never cleared, and the
+`/proc/interrupts` lines `28: GICv3 251 sprd_dma` (AP DMA) and `40: GICv3 87
+sprd_dma` -- the DT's `agcp_dma@56650000`, `interrupts = <GIC_SPI 55>` -- both stay
+at 0 for the whole run.  The data path completes, the completion *event* does not:
+nothing in the vendor audio tree calls `snd_pcm_period_elapsed()` except the DMA
+callback `sprd_pcm_dma_buf_done()`, and that callback never runs.
+
+Two definitions the routing would need are dead code here: `REG_VBC_AUD_CHNL_INT_SEL`
+(0x004c, the AP/DSP channel-interrupt selector) and its DSP-window twin
+`REG_VBC_CHNL_INT_SEL` (`VBC_DSP_ADDR_BASE + 0x0f74`) are *defined but never
+written*, and `REG_VBC_AUD_INT_EN` (0x0044) has no writer either.  On Android that is
+the AGDSP firmware's job -- the one piece this port does not run.
+
+What that does to a plain ALSA client:
+
+* `sprd_pcm_pointer()` is not the problem.  It returns
+  `dmaengine_tx_status().residue`, and `sprd_dma_tx_status()` reads the *live*
+  channel address (`sprd_dma_get_src_addr()` / `sprd_dma_get_dst_addr()`) whenever the
+  descriptor is the current one, so the position is accurate without a single
+  interrupt.
+* ALSA's *cached* `hw_ptr`, however, only moves when the driver calls
+  `snd_pcm_period_elapsed()`.  Probe on `hw:0,0`: the first two 4096-frame blocking
+  writes return immediately (avail 5504 -> 1408), the third blocks and never returns,
+  and `snd_pcm_drain()` then waits forever because its loop only breaks on the state
+  change a period tick would have produced.  `aplay` prints `Playing WAVE ...` and
+  hangs in exactly the same place.
+* Android never sees this because its HAL opens the PCM with `PCM_NOIRQ`
+  (`SNDRV_PCM_HW_PARAMS_NO_PERIOD_WAKEUP`): `sprd-dmaengine-pcm.c` then builds the
+  link-list node with `SPRD_DMA_FLAGS(0, 0, SPRD_DMA_FRAG_REQ, SPRD_DMA_NO_INT)` and
+  registers no callback at all -- it feeds the DMA from a timer and never waits on a
+  period.  `p_wakeup = !(params->flags & SNDRV_PCM_HW_PARAMS_NO_PERIOD_WAKEUP)` is the
+  whole difference.
+
+### 24.4 The tried fix, reverted, and the two traps in it
+
+A software period ticker calling `snd_pcm_period_elapsed()` (module parameter
+`period_timer`, delay `period_size / rate`) was added to `sprd-dmaengine-pcm.c` and
+tried as a `timer_list` and then as a `delayed_work`.  Both images panicked within
+about a minute of the desktop session opening the PCM, so the change was dropped in
+full and the trigger was never isolated.  What the attempt did establish:
+
+* **A softirq cannot be the context.**  `normal_dma_protect_spin_lock()` is
+  `spin_lock(&pm_dma->pm_splk_dma_prot)` -- plain `spin_lock()`, no irqsave -- and
+  `sprd_pcm_pointer()` takes it for the normal playback streams, as do
+  open/hw_params/trigger/hw_free/close.  A timer that lands on a CPU already inside one
+  of those sections spins on a lock that CPU can only release after the softirq
+  returns: a soft lockup, and this configuration panics on one
+  (`CONFIG_BOOTPARAM_SOFTLOCKUP_PANIC=y`, `CONFIG_BOOTPARAM_HUNG_TASK_PANIC=y`).  A
+  workqueue removes that self-deadlock, but the second image still died.
+* **Do not cancel synchronously where a tick can re-enter.**  A period tick can drive
+  `snd_pcm_stop()` into the driver's `trigger(STOP)`, so anything armed there must use
+  `cancel_delayed_work()`; only `sprd_pcm_close()` may use the `_sync` form, and ALSA
+  does reach it without the stream lock (`snd_pcm_release_substream()` calls
+  `do_hw_free()` and `ops->close()` outside the lock).  `sprd_pcm_hw_free()` releases
+  the DMA channels and `sprd_pcm_close()` frees `rtd`, so the tick has to be stopped
+  before either.
+
+No panic text survived: `sysdump.ko` is not in the image, so `sysdumpdb` still holds
+only Android's old reports, and `/sys/fs/pstore` stays empty even though ramoops
+registers as a backend.  The one thing that did work is the 4 MiB block at 56 MiB
+inside `boot_b` that `boot/init` rewrites every 15 s
+(`dd if=/dev/block/by-name/boot_b bs=1M skip=56 count=8` from Android reads it back):
+it stops at `switch-root`, so a copy of that loop inside the real rootfs is what
+captured the last `dmesg` before a post-switch-root death.
+
+### 24.5 Two boot traps found while chasing the panics
+
+* **`sysctl.kernel.panic_on_oops=0` must stay in the cmdline.**  This config sets
+  `CONFIG_PANIC_ON_OOPS=y`, and the image has a pre-existing oops at ~25 s:
+  `Unable to handle kernel paging request at virtual address ffffffc00ac1b7d8` with
+  `string -> vsnprintf -> add_uevent_var -> kobject_uevent_env -> kobject_synth_uevent
+  -> uevent_store`.  An image whose cmdline dropped the parameter panics on that same
+  oops; with it, the task dies and the boot continues.  The `_regulator_disable`
+  WARNING (`drivers/regulator/core.c:3002`, twice a boot) and the `dev_watchdog`
+  TX-timeout WARNING (`net/sched/sch_generic.c:481`) are noise.
+* **From Android, arm the slot and reset with sysrq, not `adb reboot`.**  Android's
+  init rewrites the A/B metadata on a clean reboot, so a slot-b BCB written just before
+  `adb reboot` is lost and the device comes back on slot a.
+  `echo 1 > /proc/sys/kernel/sysrq; echo b > /proc/sysrq-trigger` resets without that
+  rewrite and boots the armed slot (verified both ways).
+
+### 24.6 What is still open
+
+_Resolved 2026-09-25 by the second bullet (an hrtimer ticker with the lock made
+irqsave) -- see 24.8.  The interrupt still does not arrive with the DSP running._
+
+* Route the completion interrupt to the AP: find who is supposed to write
+  `REG_VBC_AUD_CHNL_INT_SEL` / `REG_VBC_AUD_INT_EN`, or whether the AGCP DMA line is
+  simply not wired to the GIC on this part.  The AGDSP firmware is the suspect for
+  both, and it is not running here.
+* Or tick the period from a context that cannot deadlock on `pm_splk_dma_prot` -- a
+  kthread with a try-lock, or making that lock irqsave where the process-context paths
+  take it -- and stop it before `sprd_pcm_hw_free()` / `sprd_pcm_close()`.
+* Or sidestep the question for a first audibility test: open the PCM
+  `PCM_NOIRQ`-style (`SNDRV_PCM_HW_PARAMS_NO_PERIOD_WAKEUP`), feed it at a fixed rate
+  and listen.  That path needs no interrupt at all, and it is the one Android uses.
+
+### 24.7 The E5 ships the missing piece: measured on Android, 2026-09-23
+
+_One `adb root` session against the handset's own Android, no flashing.  It settles
+who was supposed to write the interrupt-selector registers, and where the AGDSP
+image was all along._
+
+* **The firmware is on the device.**  The F50 has no audio DSP partition and mu300
+  had to hunt a donor image; this device has `l_agdsp_a` / `l_agdsp_b` in the GPT
+  (`/dev/block/mmcblk0p26` / `p27`).  The image is 6 MiB with the header
+  `SharkL5_AUDCP_2023Y_VER_3029` (`AUDCP.SharkL6`, sha256 `6384966f...a6157a`), and
+  `audiocp_boot`'s `ldinfo` on the running Android reads `0xafa00000 / 6291456`: the
+  image *is* the reserved `audiodsp-mem` region, so it is this SoC's own binary.
+* **The device tree is complete where the F50's was stripped.**
+  `reserved-memory/audio-mem@af700000` and `audiodsp-mem@afa00000` are present, and
+  `audio-mem-mgr` carries `memory-region = <phandle 218> <phandle 219>` -- exactly
+  the property whose absence forced mu300's `of-reserved-mem-add` /
+  `audio-mem-fixed-region` patches.  None of that machinery is needed here.
+* **Android runs the whole stack built-in** -- the card is up (`sprdphone-sc2730`,
+  19 PCM devices, `FE_ST_NORMAL_AP01` on 00-00) with zero audio modules in
+  `/proc/modules`, and `vbc-rxpx-codec-sc27xx` binds `sound@0`.  The same driver
+  sources this port builds as modules are what Android compiled in.
+* **The AGDSP is a real, load-bearing component here** (unlike on the audio-less
+  F50): `audiocp_boot/status` reads powered-down while idle (`core=7 sys=7`), the
+  340-control mixer carries the full profile select/update surface, and /odm has
+  the native parameter XMLs (`audio_structure` 0x43 modes x 0x2da, `dsp_vbc` 0x48
+  x 0x6c4, `cvs` 0x43 x 0x33c).
+* **The bring-up is now ported** (mu300-linux's `mu300-audio-dsp` flow, on this
+  device's own firmware): `tools/vbc-profile` converts the XMLs,
+  `rootfs/pull-audio-firmware.sh` stages image + blobs into the rootfs overlay, and
+  `/opt/e5/e5-audio-dsp` (run by `e5-audio.service` before the session starts, so
+  PipeWire only ever sees a card whose DSP is up) does modules -> card registered ->
+  firmware write -> DSP start -> speaker route -> profiles.  The modules load from
+  the root filesystem (`/usr/lib/modules/<rel>/audio`, modprobe/depmod), not the
+  initramfs -- the 2026-09-19 resets were the session's pipewire probing a card
+  whose power domain's core had nothing to execute.
+* **One correction to 24.1's narrative:** `agdsp_pd` in the kernel tree is the stock
+  vendor driver (the "hybrid" variant only ever lived in test images).  That is the
+  right base here precisely because it is what Android runs *with the DSP booted*;
+  the boot-order guarantee above is what replaces the hybrid's neutralisations.
+* **The open question after the first boot of this image** is 24.6's first bullet
+  restated: with the DSP actually executing this image, do the AGCP/VBC completion
+  interrupts reach the GIC and `snd_pcm_period_elapsed()` fire (in which case
+  PipeWire needs nothing else), or not (in which case `/opt/e5/e5-noirq-play` -- the
+  `NO_PERIOD_WAKEUP` feeder the Android HAL uses, already in the image -- is the
+  audibility test, and the kthread ticker the kernel-side fallback).
+
+### 24.8 The speaker plays (2026-09-25): what it took, and every trap on the way
+
+Confirmed by ear: stock `aplay` on `hw:0,3` and `pw-play` through PipeWire's
+"Speaker" sink.  Signal path: FE_FAST (hw:N,3) -> AGDSP FAST_P scene -> VBC DAC0 ->
+IIS0 -> UMP9620 DAC -> AO driver (AOL/AOR) -> aw87xxx (i2c 6-0058) -> speaker.
+
+**Card assembly.**  `sound@0` deferring forever looked like the hook parser's
+`Get gpio failed:-2` on `sprd,spk-ext-pa-gpio`.  It is not: `asoc_sprd_card_parse_of()`
+only propagates `-EPROBE_DEFER` from the hook, an `-ENOENT` just skips it.
+`dynamic_debug` on `soc-core.c` gave the real line -- `platform component (null) not
+found for link FE_NORMAL_AP01` -- and the missing platform was `/sprd-pcm-audio`,
+which had failed with `-ETIMEDOUT` ("deferred probe timeout, ignoring dependency").
+This kernel's `driver_deferred_probe_timeout` defaults to **0**, so a module device
+that probes before its genpd provider exists fails for good -- and 0010 v2 registers
+the agdsp provider only at mailbox setup.  A pure race, which is why the same image
+had a card in the morning and none in the evening.  `e5-audio-dsp` re-probes every
+unbound `agdsp-power-domain` consumer (their devlinks list them).  Do not "fix" it with
+`deferred_probe_timeout=` on the cmdline: `=30` killed the kernel before the initramfs.
+
+**The gpio still mattered -- for the amp.**  The dtb's `<0 1 1 0>` selects
+`hook_general_spk_for_aw87xxx`, which drives the amp over i2c only, but the parser
+looked the gpio up *first* and dropped the hook, so the aw87xxx sat in profile "Off"
+in every Linux test until then.  `kernel/patches/0012`.  Manual stand-in:
+`echo Music > /sys/bus/i2c/devices/6-0058/profile`.  `Speaker Mute=1` forces the hook
+to on=0 on this kernel (need_mute), so it must stay 0 even though Android's playing
+mixer reads 1.
+
+**Periods.**  Both `sprd_dma` lines stay at 0 even with the DSP booted, so
+`kernel/patches/0013` ticks `snd_pcm_period_elapsed()` from an hrtimer at the period
+rate and always programs the DMA without interrupts; `pm_splk_dma_prot` became
+irqsave (24.4's soft lockup), the tick is try-cancelled in trigger and cancelled
+synchronously in hw_free/close.  Module param `period_timer=0` restores the old path.
+
+**What made it audible, beyond a routed and powered DAPM graph** (diffing codec, VBC
+and aw87xxx registers *while playing* against Android found both):
+
+* The DSP profile selects.  Android plays with `Audio Structure Profile Select = 0`
+  and `DSP VBC Profile Select = 0x404B0000`.  The controls are declared
+  `max 0x0fffffff`, so amixer clamps 0x404B0000 to 0x0fffffff -- which the driver
+  then applies as dsp_case 0xffff.  The kernel `put()` does not range-check:
+  `/opt/e5/e5-ctl-raw` writes the element value directly.
+* `VBC_IIS_MST_WIDTH_SET` = `MST_WD_16BIT`.  The enum's items are `MST_WD_24BIT` /
+  `MST_WD_16BIT`, and tinymix prints them as `WD_16BIT`; a route written from the
+  tinymix dump silently matched nothing.
+* With both right, `ANA_CDC7` reads 0x000f (AO buffer DC calibration done), as on
+  Android.
+
+**Traps.**
+
+* `e5-audio-dsp start` did `set -- $(od ... ldinfo)` and then called
+  `do_profiles "${2:-}"` -- the MODE argument was the ldinfo size by then, so every
+  cold start selected garbage profiles.  Save positional arguments before reusing `$@`.
+* The "IMPD ENABLE" control oopses (strcmp NULL in the headset regulator lookup) if
+  written before the headset's codec-side probe fills its regulator table; with
+  `panic_on_oops` that is a panic.  An `alsactl` pass at 57 s did exactly that on two
+  boots in a row and LK fell back to slot a.  `kernel/patches/0014`.  Who ran that
+  alsactl was never found (not the shadowed alsa-restore unit, not udev's rule).
+* `alsa-restore.service` must be shadowed by a *regular file*: `boot/init` copies the
+  overlay with `find -type f`, so a `/dev/null` symlink never arrives.  The store at
+  shutdown is what keeps recreating `asound.state`.
+* PipeWire's ACP builds a pro-audio profile by opening, configuring and preparing
+  every PCM.  On this card that is 19 DSP scenes, most failing with "no backend DAIs
+  enabled" (840 failed PREPAREs in 15 s), and it kept wireplumber at 100 % of a core
+  for minutes after every login.  PipeWire 1.4.2 has no switch for it; a WirePlumber
+  rule turns ACP off for the card and creates only the hw:N,3 node.  UCM still owns
+  the route (`e5-audio-dsp routes` = `alsaucm set _verb HiFi set _enadev Speaker`).
+  The ALSA card *driver* name is the card name cut to 15 characters,
+  `sprdphone-sc273`, which is what the UCM directory has to be called; UCM also needs
+  `alsa-ucm-conf` for `ucm2/ucm.conf`.
+* Raw ioctl players: a hw_params mask must be *set* exclusively -- OR-ing a bit into
+  the all-ones `any()` mask pins nothing, access falls to MMAP_INTERLEAVED and every
+  WRITEI returns EINVAL.  Period 1024 is refused; 960 (20 ms) works.  Capture on
+  FE_NORMAL_AP01 is IRAM-backed and capped at 3840 frames / 3 periods.
+* Capture does not work yet: the capture DMA never moves (hw_ptr stays 0, arecord
+  EIO), on NORMAL_AP01 and on the DSP capture FE alike -- a separate problem.
+* Rebuilding modules on the Mac: a single-target `make` runs modpost with vmlinux's
+  exports only (sibling exports are "undefined") and rewrites `Module.symvers` as
+  vmlinux + those targets.  `work/build-audio-modules.sh` builds the set together
+  with `KBUILD_MODPOST_WARN=1`, ships only modules whose imports all resolved, and
+  restores the full `Module.symvers`.  Host tools need `C_INCLUDE_PATH=work/hostinc`
+  (elf.h) and Homebrew LLVM first in PATH.
+* A panicked Linux leaves the rootfs journal dirty: mounting `rootfs.ext4` read-only
+  from Android needs `-o ro,noload`, and SELinux must be permissive for the loop
+  read (`shell_data_file`); set it back to enforcing afterwards.
+
+## 25. The first on-device takeover: `unisoc-cpd` as the only reader of the AT channel (G2)
+
+_2026-09-20, on the handset booted into Android (slot a), rooted, `urild` the
+incumbent owner.  Everything below was done over `adb` with `su`; the binary is
+the static `aarch64-unknown-linux-musl` build pushed to
+`/data/local/tmp/ucpd/` with the e5 profile beside it.  The whole session ran
+with `vendor.modem_control` left alone — the CP stays booted when only the RIL
+is stopped._
+
+### 25.1 Who holds the channel, before and after
+
+A `/proc/*/fd` scan for `stty_nr0/nr1` is the honest statement of ownership:
+
+* with Android up: exactly one holder, `/vendor/bin/hw/urild`
+  (`init.svc.vendor.ril-daemon`); `slogmodem` runs but holds only `slog_*`;
+* after `stop vendor.ril-daemon`: **no holder at all** — the channel is free,
+  and the takeover is a plain open, not a race.
+
+### 25.2 What worked, first try
+
+As the only reader, every probe and every capability answered:
+
+* `link --seconds 30 --interval 10`: 3/3 probes OK at ~200 ms, **0 timeouts,
+  0 errors**, 16 URC lines with `max_gap 0.0 s`, mailbox IRQ delta 41;
+* `sim`: `+CPIN: READY` — matches Android's `gsm.sim.state = LOADED,LOADED`;
+* `serve` (100 s) + a client over the socket: `sim` and `register status`
+  answered through the daemon, and `state` reported `channels.cmd.opens: 1`,
+  `reopens: 0` — one open for the whole window, which is the entire point of
+  the resident owner;
+* the socket `urc` query returned decoded events: the CP pairs a `+CSQ` and a
+  `+CESQ` URC roughly twice a second once registered, and the decoder read
+  **50 of 50 lines** (`urc_lines 50, decoded 50` — 100 %, no `urc-other`);
+* `band lock lte 1 41` / `band lock nr 41 78` both took and read back exactly
+  (`+SPLBAND=0` → `0,256,0,1,0`, `+SPLBAND=3` → `0,0,272`);
+* 0 CP asserts from beginning to end of the session.
+
+### 25.3 The one thing that did not work, and what actually brings the stack up
+
+Stopping the RIL does not leave the modem runnable: its shutdown path parks the
+radio at **`+CFUN: 0`** (`+CEREG: 2,0`, `+CSQ: 0,99`, every `+CESQ` field 255).
+The recovery the contract already carried — `AT+SFUN=2`, `AT+SFUN=4` — sets
+`+CFUN: 1` but **does not register**: five minutes of waiting stayed at
+`+CEREG: 2,0` with no RF, and band locking (LTE b1/b41, NR n41/n78) changed
+nothing.  What did work is the full cold cycle the Linux side's `radio_on`
+uses:
+
+    AT+CFUN=0 ; then AT+SFUN=2, AT+SFUN=4   →   75 s later:
+
+    +CEREG: 2,1,"10002B","00592002",11      PS registered, home, AcT 11 = NR SA
+    +CGATT: 1                               attached
+
+— which matches the Android oracle for that SIM (46015 广电, NR_SA).  The
+measurable conclusion: **after a RIL shutdown, `SFUN=2/4` alone is not stack
+bring-up; the `CFUN=0 → SFUN=2/4` cold cycle is.**  (Conversely, a CP that
+boots without a RIL at all — the Linux case, FINDINGS §22 — registers after
+the plain `SFUN` pair, so it is the *RIL-shutdown state* that needs the cold
+cycle, not the generation.)
+
+### 25.4 `255` is "not reported", not "-115 dBm"
+
+The unregistered CP answers `+CESQ: 99,99,255,255,255,255,…`, and the literal
+`idx-140` mapping turned 255 into "RSRP 115 dBm" — a nonsense number a reader
+will believe.  `decode_cesq` now returns `None` for a 255 field and the
+display says `not reported`; a *reported* field still decodes (the same line's
+SS-SINR 73 → 26.5 dB).
+
+### 25.5 The procedure error the session made, and the rule it fixes
+
+Restoring the vendor side, `start vendor.ril-daemon` was issued while the
+100 s `serve` was still alive: the fd scan then showed **`unisoc-cpd` and
+`urild` holding the channels at the same time** — the plan's only red line,
+violated by sequencing, not by the code (the flock is advisory and `urild`
+never takes it; it only coordinates our own instances).  Nothing broke — and
+the session had one clean piece of evidence that the daemon *noticed*: its
+idle probe failed exactly once, in that window.  The rule for every future
+transfer, in both directions:
+
+> **never `start` the other owner until our daemon has exited and the fd scan
+> shows the channel free; never `serve` past the point the other side is told
+> to start.**  Verify with the `/proc/*/fd` scan, not with an assumption.
+
+### 25.6 Left changed on the device: nothing
+
+The band experiment was reverted before the RIL came back: LTE re-locked to
+the RIL's own set (read back `+SPLBAND: 0,482,2056,213,0` = bands
+1,3,5,7,8,20,28,34,38,39,40,41) and NR unlocked (`+SPLBAND=2,0,0,0,0`,
+read back `(none)`).  After `start vendor.ril-daemon`: `LOADED,LOADED`,
+`46015,46001`, `NR_SA,LTE` — identical to the pre-session baseline — and the
+closing `diag asserts` read 0.
+
+### 25.7 Second session: SMS surface, the MT path works, the MO path does not
+
+_2026-09-20, same setup (Android slot a, daemon as the only reader), with
+`serve` held open for the whole session and clients on its socket._
+
+* **The SMS surface the RIL leaves behind is hostile, and the daemon now
+  re-arms it at start-up.**  Measured: `+CSCS: "HEX"` (under which
+  `CMGS="<number>"` is not a phone number) and `+CNMI: 0,0,0,1,0` (mt=0 — new
+  messages are stored *without* announcing them, so the `+CMTI:` path never
+  starts).  `serve` now sets `CMGF=1`, `CSCS="GSM"` and `CNMI=2,1,0,0,0` once
+  and reports all three in its `state`.
+* **MT works end to end.**  A message sent to SIM1 announced itself with
+  `+CMTI: "SM",1`; the daemon read it between requests with `AT+CMGR=1` and a
+  client saw sender, status, service-centre timestamp and body — the body
+  arriving as UCS2 hex (`"6D4B8BD5"` = 测试) under `CSCS="GSM"`, which the
+  daemon now decodes.  Reading moved the message to `REC READ` and nothing
+  was deleted.
+* **MO works over the plain AT channel; the long blockade was a bug in our
+  own PDU, and the earlier "MO rides IMS" reading is withdrawn.**  The
+  blockade looked like this: text-mode submit `+CMS ERROR: 313`; PDU mode
+  `+CMS ERROR: 302` on two different subscriptions, national and
+  international destinations alike — always with the CP registered on NR SA.
+  The vendor's own submit, captured in the radio log as
+  `RIL-AT: AT> 0001000B…<pdu>^Z` during a successful `IMS_SEND_SMS`, showed
+  the difference: its first octet is **`0x01`** (no validity period), while
+  our encoder wrote **`0x11`** (TP-VPF = relative), which promises a TP-VP
+  octet the encoder did not carry — so the CP read every later field one slot
+  off (DCS, UDL, body) and refused the result.  Everything else was already
+  identical: SMSC length 0, the 11-digit national destination with TOA
+  `0x81`, DCS `0x08` UCS2, and the user data.  With the first octet fixed the
+  daemon's submit is accepted (`+CMGS: <mr>`, `OK`) and the message arrives
+  at the recipient, verified end to end on a second subscription.  The
+  `IMS_SEND_SMS` layer above is control glue: urild converts it into exactly
+  this PDU-mode `CMGS` on the AT channel, so **no IMS client is needed for
+  SMS on this generation** — and A5's MO half is done.
+* **Registration needed the band recipe, again.**  With the RIL stopped the
+  stack came up (`+CFUN: 1`) but would not register until the bands were
+  locked to **LTE b1/b41 + NR n41/n78** *and* the `CFUN=0 → SFUN=2/4` cold
+  cycle was run — on this unit, an unbounded NR scan (移动/广电 bands) hangs.
+  The locks stayed in place for the rest of the session.
+
+### 25.8 The internet, restored under our bearer (G3's AT half)
+
+With the RIL stopped the handset had no data — expected, because nothing
+re-establishes the bearer.  What the session established, all measured:
+
+* **The RIL's teardown destroys the internet context.**  `AT+CGACT?` after the
+  stop shows only cid 11 active, and `AT+CGCONTRDP=11` names it `ims` — the
+  VoLTE context survives, the internet one does not.  (Its interface
+  addresses linger on `sipa_eth0`, which reads as "up" and is a lie: a ping
+  has no route.)
+* **A fresh context works.**  `CGDCONT=1,"IPV4V6","cbnet"` → `CGACT=1,1` →
+  `CGCONTRDP` (address 10.x/8, DNS 43.239.172.x) → `CGDATA="M-ETHER",1` →
+  `CONNECT` — the same sequence the contracts §4.1 carries, on the 广电 card.
+* **Android's policy routing kills unknown bearers, twice.**  Rule
+  `32000: from all unreachable` swallows any packet whose lookup does not
+  match an earlier table, so a main-table default is not enough; and the
+  *return* path of a tethered client looks up the same tables after
+  de-NAT.  The working recipe: default route in table **`legacy_system`**
+  (matched at priority 18000 by unmarked traffic) *plus* the on-link subnets
+  in that table (`10/8` via `sipa_eth0`, the hotspot's `192.168.43.0/24` via
+  `wlan0`), so replies reach the client.
+* **Tethering needs two more rules.**  `tetherctrl_FORWARD` carries a
+  catch-all `DROP` and netd only inserts ACCEPT pairs for uplinks it knows —
+  with the RIL stopped `sipa_eth0` is unknown, so 2670 client packets were
+  dropped there.  `iptables -I tetherctrl_FORWARD` with the
+  `wlan0 ↔ sipa_eth0` ACCEPT pair, plus `-t nat -A POSTROUTING -o sipa_eth0
+  -j MASQUERADE`, and hotspot clients reached the internet.
+* Client DNS still has to be set statically for now: DHCP advertises the
+  upstream DNS netd knows, which is nothing.  All of these are runtime
+  fixes; the permanent home is the daemon's `data up` plus the rootfs's own
+  NAT (`e5_nat`) on the Linux side, which is the G3 acceptance itself.
+## 26. Losing the management LAN: what actually started `systemd-networkd`, and who hands out the leases
+
+Removing NetworkManager (commit `304385e`) looked like pure cleanup: every
+device on the board is unmanaged, `apt-get -s remove network-manager` takes
+only `network-manager`, `plasma-nm` and `plasma-welcome` with it, and the
+desktop's network panel was its only remaining user.  The next boot came up
+with no management LAN at all -- `usb0` with no address, the host left on a
+self-assigned `169.254.x`, and nobody answering `192.168.77.1`.
+
+`NetworkManager.service` is *disabled* in this image, and so is
+`systemd-networkd`, and the overlay cannot ship enable symlinks (it travels
+into the initramfs as plain files -- `boot/init` links `e5-bt-attach` and
+`ufi-tools` by hand for exactly this reason).  What actually started networkd
+was a drop-in that only looked like it was about NetworkManager:
+
+    /etc/systemd/system/NetworkManager.service.d/50-e5-networkd.conf
+    [Unit]
+    Wants=systemd-networkd.service
+    Wants=e5-telnetd.service
+
+Deleting it with the package removed the last thing that started networkd, and
+with it `usb0`'s `192.168.77.1` and its DHCP server.  Fixed in `b53aebe`:
+`configure-rootfs.sh` enables `systemd-networkd{,.socket}` in the rootfs,
+`device-finalize.sh` does the same on an installed device, and `boot/init`
+links the unit into `multi-user.target.wants` at every boot for a device whose
+rootfs predates that.
+
+### The DHCP server that never starts
+
+With networkd running, `usb0` got its address -- and the host still got no
+lease, because networkd's own log says, every two minutes, forever:
+
+    usb0: Failed to wait for the interface to be initialized: Connection timed out
+    usb0: Failed
+    usb0: Trying to reconfigure the interface.
+    usb0: Configuring with /etc/systemd/network/10-e5-usb0.network.
+
+The same rtnl timeouts hit `sipa_eth3`, `sipa_usb0` and `ip6_vti0`, so it is
+the sprd SIPA pseudo-interfaces wedging networkd's netlink queue: the address
+lands, the `DHCPServer=` that would have followed never starts.  The fix stops
+asking networkd for DHCP at all (`168b405`).  `dnsmasq` serves *both* LANs --
+which is what its own header already argued for the hotspot, that networkd's
+DHCPServer can hand out addresses but cannot answer queries -- with
+`bind-dynamic` (at boot only `usb0` exists; `wlan0` appears later with
+hostapd) and tagged ranges, so `usb0` clients get `192.168.77.1` as their
+resolver and *no* router option, while hotspot clients keep `192.168.9.1` for
+both.
+
+Verified on a cold boot of `work/boot-linux-slotb-cpd11.img`, from the
+device's own journal, and on the host with the port back on "using DHCP":
+
+    dnsmasq-dhcp[5361]: DHCPDISCOVER(usb0) 02:50:00:00:e5:02
+    dnsmasq-dhcp[5361]: DHCPOFFER(usb0) 192.168.77.21 02:50:00:00:e5:02
+    dnsmasq-dhcp[5361]: DHCPACK(usb0) 192.168.77.21 02:50:00:00:e5:02
+
+`en8` had `192.168.77.21` about twelve seconds after the device appeared.
+
+### The escape hatch: the gadget's other half
+
+With no address anywhere there is still the serial console.  The same USB
+gadget that carries the NCM netdev also exposes a CDC-ACM port, macOS names it
+`/dev/cu.usbmodemE5LINUX3`, and `serial-getty@ttyGS0` is listening on it:
+`root`/`root` gets a shell, and `systemctl enable --now systemd-networkd`
+brings the LAN back from there.  `tools/e5-serial.sh` drives that port from
+the host:
+
+    tools/e5-serial.sh 'ip -br addr show usb0; systemctl is-active systemd-networkd'
+
+Two things about it are worth remembering.  The agent's own shell cannot open
+`/dev` nodes ("Operation not permitted"), so this is a step the human has to
+run.  And `/dev/cu.usbmodem*` only exists while the gadget is bound: after the
+UDC was lost the host saw neither half of the device, and a power cycle -- not
+a replug -- was what brought it back.  In the case that cost the most time it was the host port being switched from a hand-set address to DHCP that lost the path; the gadget itself was fine.
+
+### Two red herrings from the same boot
+
+Both looked like password problems and were not.  `passwd -S e5` said `P` the
+whole time.  And the greeter appeared because the *autologin session died*,
+not because the password was wrong:
+
+    sddm-helper[5304]: pam_systemd(sddm-autologin:session): Failed to create session: Connection timed out
+
+-- the same family of timeouts, this time inside logind while udev was still
+absorbing the boot's device flood.  The next boot logged `Authentication for
+user "e5" successful` and the session stayed on seat0.
+## 27. Two sessions, one working: SDDM, the renderer, and a profile that was not readable
+
+The phosh desktop did not come up for a day, and the cause was three things stacked.
+
+First the login: the e5 password in the deployed rootfs did not match the one being
+typed, so SDDM's autologin failed and SDDM fell back to its greeter -- and the Wayland
+greeter cannot draw on this image (it wants kwin_wayland, which left with KDE), which
+looks exactly like a black screen with a working backlight.
+
+Then a wrong turn of mine: reading that as "SDDM is unusable", I replaced it with an
+autologin on tty1.  That path does not carry the env line the image's own
+phosh.desktop has -- Exec=env WLR_RENDERER=gles2 phosh-session -- and without it phoc
+spins at 90% CPU: the session never reaches the UI, and the physical keys look dead.
+They are not: a raw capture of /dev/input/event2 shows the keypad reporting KP_ENTER,
+BACK plus BACKSPACE, digits and DOWN the whole time; nothing was consuming them.
+(The profile pins gles2 against a stray WLR_RENDERER=pixman in /etc/environment, which
+is worse still.  Removing the line makes the session not start at all -- verified both
+ways.)
+
+Third, and invisible: /home/e5/.bash_profile arrived from the overlay as 0600 root:root,
+so the login shell stopped at the permission check and exited without a word.  cpio
+records the packing host's modes and uid; boot/init now chowns /home/e5 back to e5.
+
+With the password reset, the ownership fixed and the no-display-manager change reverted,
+SDDM autologins into phosh and touch, the physical keys and phosh-osk-stub (the on-screen
+keyboard) all work.  The X11 greeter works too, since X is installed -- anyone who wants
+a login screen only has to clear Autologin/User.
+
+## 28. Traps from the work log
+
+Moved here from `docs/STATUS.md` when its dated sections were cleared; each one cost
+at least a session.
+
+* **The initramfs overlay is baked into the flashed image and wins on every boot.**
+  `boot/init` copies `e5-overlay/` over the root filesystem each time, so a file pushed
+  onto the device by hand is reverted by the next reboot if the *flashed* image carries
+  an older copy (files the image does not carry at all survive).  That is how the
+  hotspot came back on 2.4 GHz channel 6, how the device's `sddm.conf.d` kept naming
+  `plasma-mobile.desktop`, and how a power-key drop-in "disappeared".  Edit
+  `rootfs/overlay/`, rebuild with `boot/build-boot-image.py --overlay rootfs/overlay`,
+  flash.  (`/var/lib/*` is the exception since 2026-09-25: it is state, so the overlay
+  only seeds it when the file is missing -- UFI-TOOLS' token lives there.)  The copy is `find -type f`: symlinks in the overlay are dropped, so a
+  `/dev/null` mask has to be a regular shadow unit instead.
+* **`systemctl restart sddm` takes the screen away until a reboot.**  SDDM's default
+  `DisplayServer` is x11; with no `/usr/bin/X` it retries three times, fails, and
+  exports `DISPLAY=:0` into the session, so phosh exits with `cannot open display: :0`
+  and `mobi.phosh.Shell.service` hits "Start request repeated too quickly".
+  `DisplayServer=wayland` in `etc/sddm.conf.d/10-e5.conf` is the fix; a reboot is the
+  recovery.
+* **Both boot slots once held Linux images.**  `boot_a` had been overwritten with a
+  Linux image, so every "back to Android" landed in Linux again (LK still logs
+  `ANDROID: Booting slot_a`).  Before arming slot b, check that `boot_a` hashes to the
+  stock Android image.
+* **A reconnect storm got the IoT SIM barred (2026-09-18).**  After a network-side
+  detach (`+CGEV: NW DETACH`, `+SPERROR: 14,27`), `e5-mobile-data`
+  (`Restart=on-failure`) and its watcher (`Restart=always`, 15 s) retried the bring-up
+  continuously -- `SFUN=2/4`, `CEREG` polls, `CGACT` -- amplified by `sim-reset`
+  (`SFUN=5/3`) and manual pokes.  The card was then refused on Android too
+  (emergency only, healthy LTE cell, `PS is rejected`).  A guard was written that night
+  (5 failures in 30 min, watcher backoff 60 s -> 30 min, no `Restart=` on the data
+  unit, no `SFUN=5/3` in `sim-reset`, which left the SIM undetected until a reboot) --
+  and the 2026-09-19 straight port of mu300's `mobile-data` dropped it on purpose.
+  **The current tree has no storm guard**: `e5-mobile-data.service` is
+  `Restart=on-failure` and `sim-reset` sends `SFUN=5/3` again.  `unisoc-cpd`
+  (section 25) is meant to own the bearer instead.  Lifting a bar is the operator's
+  call.
+* **`btattach` holds up shutdown.**  It ignores SIGTERM and outlived the final
+  SIGKILL; `e5-bt-attach.service` has `KillSignal=SIGKILL` + `TimeoutStopSec=2`, and a
+  `system.conf.d` drop-in caps `DefaultTimeoutStopSec` at 5 s so a watchdog reboot
+  never waits on vendor teardown.
+* **From Android, arm slot b and reset with sysrq** (24.5): a clean `adb reboot` lets
+  Android's init rewrite the A/B metadata back to slot a.
+* **ADB on the Linux side was tried and taken back out (2026-09-18).**  What the
+  attempt established: configfs accepts a new function (`functions/ffs.adb` and its
+  link into `configs/c.1/`) while the gadget is bound, but a FunctionFS function cannot
+  be *bound* until a daemon holds its `ep0` -- adding `ffs.adb` to the boot-time gadget
+  makes the composite bind fail and the board loses USB entirely, network and console
+  alike.  The working order is add function, mount FunctionFS, start `adbd`, and only
+  then (re)bind; and an explicit `echo '' > UDC` + rebind twice left the gadget
+  half-configured (ACM back, NCM gone) until a power cycle, which is why
+  `e5-gadget-guard` rebinds only an *empty* UDC.  Telnet on the management LAN and the
+  serial console are the ways in instead (section 26).  Two side lessons from the same
+  day: an overlay script's mode is the mode git records (`git add --chmod=+x`, or
+  `status=203/EXEC`), and `After=network.target` on the hotspot plus
+  `Before=network.target` on the unit it wanted made a `Transaction order is cyclic`.
+* **One bridge for the USB LAN and the hotspot cost a day and was reverted
+  (2026-09-21).**  br0 on 192.168.9.0/24 with usb0 and the AP as ports is right on paper,
+  but it stacked two layers that fail silently on this SoC: systemd-networkd's rtnl
+  requests time out against the sprd pseudo-interfaces, leaving br0 an empty shell (no
+  ports, no address, no DHCP); and hostapd's `bridge=br0` places the AP port only if
+  the bridge already exists -- otherwise the AP serves clients that never get a lease.
+  An interface hostapd owns cannot be enslaved afterwards (silently refused), and `iw`
+  cannot change the type of an enslaved interface ("Interface wlan0 wasn't started").
+  Two LANs it is: usb0 192.168.77.1, wlan0 192.168.9.1.  The revert missed three
+  bridge-only comments and the bounded `systemctl restart systemd-networkd/dnsmasq`
+  step in `hotspot-start.sh`, and trimmed the dnsmasq/networkd comments; the history
+  cleanup of 2026-09-25 put all of that back to the pre-bridge state.  (The bridge
+  came back on 2026-09-26 built the other way round -- section 31.)
+
+## 29. "High load at boot": what the number was made of (2026-09-25)
+
+The load average read 8.8 one minute after boot and never went below 6, which looked
+like a busy system and matched the session feeling sluggish.  It was three separate
+things, and only one of them was CPU.
+
+**The floor of 6 was accounting.**  A five-second `/proc/stat` delta was 99.4 % idle
+and `/proc/pressure/cpu` read 0.06 %, while six vendor kernel threads sat permanently
+in `D` (uninterruptible sleep), each of which counts in the load average:
+
+| thread | wait | module |
+|---|---|---|
+| `sdiohal_tx_thread`, `sdiohal_rx_thread` | `wait_for_completion()` | `wcn_bsp` |
+| `pub_int_handle_thread` | `wait_for_completion()` | `wcn_bsp` |
+| `62110080.time_sync_ch` | `TASK_UNINTERRUPTIBLE` + `schedule()` | `sprd_time_sync_ch` |
+| `slog-0-0` | `msleep(2000)` until `log_transport`, which nothing on Linux sets | `slog_bridge` |
+| `agdsp_access` | `msleep(200)` in a retry loop | `agdsp_pd` |
+
+`kernel/patches/0015` puts the first five to sleep the way idle kernel threads should
+(interruptible completions -- kernel threads ignore every signal, so nothing else
+changes -- `TASK_IDLE`, `msleep_interruptible()`).  The sixth was ours: 0010 had
+taught `agdsp_access_init_thread()` to retry `smsg_ch_open()` on `-ENODEV`, on the
+theory that the audio SIPC target did not exist *yet*.  It never exists:
+`agdsp_pd_probe()` initialises `dst = 0, channel = 0` and never reads either from the
+DT, and SIPC target 0 is the AP itself.  The vendor code logs one `Failed to open
+channel 0,dst=0,rval=-19` and lets the thread end; audio works without it (it did all
+along, with the thread spinning).  The retry is gone from 0010.
+
+**The console cost real time.**  The bootloader's command line is Android's
+(`console=ttyS1,115200n8`, `initcall_debug=1`, `rcupdate.rcu_expedited=1`, ...), our
+`console=`/`loglevel=` do not survive into it, and `boot/init` set the console level
+to 7.  printk writes to the console synchronously in whoever printed:
+
+    console level 7:  10.3 ms per info line (200 lines to /dev/kmsg, timed)
+    console level 4:  ~0
+
+and `sprd_drm` prints three info lines on every atomic commit (3371 of the 7282 lines
+in the first nine minutes), so each phoc screen update stalled ~30 ms in the kernel;
+the Wi-Fi driver logs per ARP/DNS packet.  `etc/sysctl.d/10-e5-printk.conf` sets
+`kernel.printk = 4 4 1 7` once the real root is up (the initramfs keeps 7, where the
+serial console is the only witness).  The ring buffer, the journal and pstore's panic
+dump keep every level.  `rcu_expedited` stayed 1 for the life of the system -- every
+`synchronize_rcu()` an IPI to all eight cores -- and `etc/tmpfiles.d/e5-rcu.conf`
+turns it off once userspace is up.
+
+**The worst boots also lost Wi-Fi, and that was the loop device.**  `hotspot-start.sh`
+still attached `/lib/firmware/wcnmodem.bin` to a read-write loop device for the DT's
+`/dev/block/by-name/wcnmodem`, although 8.3 had already shown the loader is the real
+path.  The driver's partition reader is compiled out altogether
+(`FIRMWARE_PARTITION_DEBUG_EN` is never defined, so `btwf_load_firmware_data()` returns
+NULL), and a read-write loop over the file makes `request_firmware()` fail with
+`ETXTBSY`:
+
+    loading /lib/firmware/wcnmodem.bin failed with error -26
+    marlin_download_from_partition buff is NULL
+    marlin download timeout ... sprd-wlan: failed to power on WCN!
+
+After one failure `is_btwf_in_sysfs` is set for the rest of the boot (the same sticky
+flag as GNSS in 8.3), so a WCN power-on that landed after the `losetup` -- usually
+Bluetooth's -- cost Wi-Fi until the next reboot, with hostapd retrying into its start
+timeout and dragging `user@1000` and networkd-wait-online down with it.  Two boots out
+of three that day did it.  The loop device is gone.
+
+Measured on the image with all of it (load2):
+
+    before:  load 8.8 at 1 min, 6.2 at 10 min; userspace 42.0 s; 6 threads in D
+    after:   load 3.5 at 1 min, 0.64 at 4 min; userspace 25.1 s; none in D;
+             no failed units, hotspot up, zero WCN download failures
+
+## 30. A CP reset nobody recovered from, and IPv6 for the hotspot (2026-09-26)
+
+(The 300 s wait for the dump: answered by `e5-modemd` since 2026-09-28, section 47.6.)
+
+**The CP asserts, and the device stays offline.**  At 00:24:11 the modem firmware
+asserted on its own -- `/var/log/e5-android-log.txt` (modem_control's log through
+`logdw.py`):
+
+    Modem Assert: LASM Task  PS CP assert in file PS/sdi/common/msg/sdi_msg_iram.c
+    line 98 exp=MM Task 's Q full info=[], [dfs=5]
+
+One assert in that log, which spans every boot since 22:32 the day before; what
+filled the MM task's queue is not known (the unisoc-cpd page and UFI-TOOLS were both
+polling at the time -- correlation, not a cause).  What followed is ours:
+
+1. `modem_control` waits for "dump complete" before it resets the CP, which on
+   Android the CP log daemon sends.  Nothing on Linux does, so every assert costs its
+   full 300 s timeout (00:24:11 -> 00:29:11 `Modem Reset`).
+2. The CP comes back at `+CFUN: 0` with no context.  Android's RIL turns the radio
+   on after a reset; `e5-bearer-up` did one pass at boot and was done, so the device
+   stayed offline with a stale IPv4 address on `sipa_eth0`.
+3. `unisoc-cpd data up` flushes `sipa_eth0` before it adds the IPv4 address, which
+   also removes the link-local.  With no link-local the kernel sends no router
+   solicitation, so after any re-bring-up IPv6 was gone until the next boot.
+
+`e5-bearer-watch.timer` now looks once a minute -- one `AT+CGACT?`, the CP is
+sensitive to AT volume (25.3) -- and restarts `e5-bearer-up` when context 1 is not
+active; the retrying stays in that unit.  Tested by dropping the context by hand
+(`AT+CGACT=0,1`): bearer, new IPv4 address and new IPv6 prefix back within a
+minute.  The 300 s dump wait is still there.
+
+**IPv6 pass-through.**  The context is `IPV4V6` (`AT+CGDCONT`), and the network side
+is the 3GPP arrangement: `+CGPADDR` carries only an interface identifier (upper 64
+bits zero), and the RA on `sipa_eth0` has the prefix **autonomous but not on-link**
+-- no `/64 dev sipa_eth0` route, the interface is NOARP ("Device does not do
+neighbour discovery"), and the whole /64 is routed to the UE.  So it can be moved to
+one downstream link without any NDP proxy (a /64 can only be on one link; the
+hotspot gets it, usb0 does not).  `opt/e5/e5-ipv6-share`:
+
+* `accept_ra=2` on the uplink: with `net.ipv6.conf.all.forwarding=1` the kernel
+  ignores RAs on `accept_ra=1` interfaces, and turning forwarding on at runtime also
+  purges the RA-learned default router (the carrier's unsolicited RAs are hours
+  apart, so the script re-solicits by re-adding the link-local when there is no
+  default route);
+* the uplink link-local from the `+CGPADDR` interface identifier;
+* `<prefix>::1/64` on wlan0, dropping the prefix of an earlier bearer.
+
+dnsmasq advertises it (`constructor:wlan0,ra-stateless`), RDNSS pointing at the
+global `::1` (`option6:dns-server,[::]` -- without it dnsmasq advertised its
+link-local); decoded from a solicitation on wlan0: `prefix/64 L=1 A=1 valid 3600`,
+`MTU 1500`, `RDNSS <prefix>::1`.  `table inet e5fw6` is a home-router firewall:
+replies and the ICMPv6 PMTU/diagnostics need come in, new inbound connections from
+`sipa_eth*` are dropped.
+
+Checked with a client simulated in a network namespace at `<prefix>::c1`: ping and a
+725 KB HTTP download over IPv6 from that address -- the carrier delivers traffic for
+any address in the /64, not only the device's own.  A real Wi-Fi client has not been
+tried yet.
+
+## 31. One LAN after all: br0 for the USB port and the hotspot (2026-09-26)
+
+Two reasons to merge them: one subnet (a laptop on the cable and a phone on the
+Wi-Fi without routing between them), and IPv6 -- the bearer's /64 can only live on
+one link (section 30), so with two LANs the USB host had none.  The 2026-09-21
+attempt failed on two silent layers (28); this one avoids both:
+
+* **networkd builds nothing.**  `opt/e5/net-bridge.sh` (`e5-net-bridge.service`,
+  before `network.target`, dnsmasq, the hotspot and the management services) makes
+  `br0` with `ip`, gives it usb0's fixed MAC, 192.168.9.1/24 and -- as a second
+  address -- 192.168.77.1 (the initramfs's rescue subnet, so a host still holding
+  that lease keeps working), and enslaves usb0.  Both `.network` files are now
+  `Unmanaged=yes` (kept rather than deleted: an overlay file that disappears stays on
+  the device), and `systemd-networkd-wait-online` is a no-op, since it would only
+  wait out its two minutes for links nobody manages.
+* **hostapd gets br0 ready-made.**  `bridge=br0` in both configs; `hotspot-start.sh`
+  waits for `br0/brif/usb0`, takes wlan0 out of the bridge before the `__ap` type
+  change, and counts the hotspot as up only when `br0/brif/wlan0` exists.
+
+dnsmasq serves only br0: pool .10-.200, `dhcp-authoritative` (NAKs the old
+192.168.77.x lease at renewal), and the USB host -- the gadget's fixed host MAC
+`02:50:00:00:e5:02` -- always gets 192.168.9.2 with the router option empty, so a
+laptop keeps its own default route (verified: IPv4 default stays on the Mac's own
+interface, IPv6 via the device; this gateway suppression was removed on
+2026-10-02 after the USB IPv4 report, see §56). `e5-ipv6-share` puts the /64 on br0, so the RA
+reaches both ports.
+
+**The price of one L2: the management services see the hotspot.**  They already
+listened on every address (telnet `root/root` on `*:23`, UFI-TOOLS, gotty) -- and,
+once the uplink had a public IPv6 address, on the internet too.  Two tables in
+`etc/e5/nat.nft`:
+
+    table inet e5in       input from sipa_eth*: established/related and ICMP only
+    table bridge e5mgmt   input from the wlan0 port: tcp 23, 1146, 2333, 7887 dropped
+
+The bridge-family table is what tells the ports apart; the IP layer cannot.  Tested
+from a veth port in a namespace with the same rule: 23, 2333, 7887 blocked, DNS and
+forwarding to the internet unaffected.
+
+**Trap: never take usb0 down.**  To make the host renew its lease the first time,
+usb0 was set down and up on the device.  The NCM function lost its framing with the
+host -- every frame from then on `configfs-gadget gadget: Wrong NTH SIGN`, counters
+frozen, ARP incomplete -- and only a reboot brought it back (a re-plug would do too).
+Enslaving usb0 and moving addresses on and off it live are harmless; the serial
+console (ACM on the same gadget) survived and was the way back.  A second trap from
+the same day, already in 28: `net-bridge.sh` was created without the executable bit,
+and the first boot with it came up with no bridge (`status=203/EXEC`).
+
+Clean boot on br2: no failed unit, userspace 21.5 s (25.1 s before -- wait-online),
+br0 = usb0 + wlan0 with the public /64, the Mac at 192.168.9.2 with IPv6.
+
+## 32. An audio DMA read that rebooted the device into Android (2026-09-26)
+
+After 5 h 50 min of an idle desktop the device rebooted and came up in Android.
+Nothing had been asked of it -- the last commands were read-only AT queries.
+pstore held the record (`dmesg-ramoops-0.enc.z`, raw deflate):
+
+    Internal error: synchronous external abort [#1]      CPU4, data-loop.0 (PipeWire)
+    pc : readl
+    sprd_dma_tx_status <- sprd_pcm_pointer [sprd_dmaengine_pcm] <- soc_pcm_pointer
+      <- snd_pcm_update_hw_ptr0 <- snd_pcm_hwsync <- snd_pcm_sync_ptr (ioctl)
+
+The PCM position is the live address register of a DMA channel in the AGCP domain,
+and reading it while the AP has no access to that domain is a bus error, not an error
+code.  The stream was open (`sprd_pcm_open` holds the domain's runtime-PM reference
+for every FE but voice/FM/HFP, FE_ST_FAST included), no system suspend was logged,
+and nothing in the 64 KB before the oops touched audio -- so what took the access away
+is still not known.  What is known is what makes it fatal: `sprd_pcm_pointer()` is
+called continuously and never asks.
+
+`kernel/patches/0016`: it asks `agdsp_can_access()` first.  That is the vendor's own
+check, exported by agdsp_pd, and it reads only always-on registers -- the AP access
+enable (`ap_access_ena` = AON APB `0x14c` mask `0x20`, i.e. 0x6490014c bit 5), AGCP
+deep sleep and the AGCP system/DSP power states in PMU APB (`0x850`, `0x860`,
+`0x544`) -- so it is safe to call at any time.  Without access the position is held
+at its last value; the event is logged rate-limited ("AGCP not accessible"), which is
+the trace to look for if it happens again.  The check's own messages are rate-limited
+too, since it now runs on every position query.
+
+**Why a panic lands in Android, while a reboot does not.**  The bootloader log after
+the crash: `panic type boot count 6`, a sysdump written to `sysdumpdb`, then
+`bootable slot 1 ... tries_remaining: 1` and `check rollback slot 1 tries: 1 ->
+Booting slot_a`.  A panic makes LK run a sysdump boot first, and that boot uses one of
+slot b's two tries, so the real boot finds one left and rolls back.  An ordinary
+`systemctl reboot` keeps Linux.  (`boot/init` sets `panic_on_oops=1` on purpose, so
+this is the designed fallback, not a fault of its own.)
+
+Trap from the same recovery: `(sleep 2; systemctl reboot) &` over the telnet helper
+never reboots -- the job dies with the session.  Run `systemctl reboot` in the
+foreground and let the connection drop.
+
+## 33. Microphone, earpiece and Bluetooth, from the device's own Android (2026-09-26)
+
+One Android boot supplied the references (kept in `work/android-ref/`, not in the
+repo): the HAL route table `/odm/etc/audio_route.xml`, the parameter XMLs, the eight
+`/odm/firmware/bt_configure_*.ini`, a btsnoop log and the vendor HAL's logcat.
+
+### 33.1 Capture: two routing controls nobody had set
+
+With the codec side alone (mic, bias, PGA, ADC switches) both capture front ends
+streamed and returned `EIO`: the DMA never moved.  The route table's
+`be_switch/codec_c` and `vbc_iis_mux/only_codec_c` add what was missing --
+`ag_iis1_ext_sel_v2 = aud_4ad_iis0_ad0` (the codec ADC into the AGCP's IIS1) and
+`VBC_MUX_ADC0/1/2_IIS_PORT_SEL`; with them FE_CAPTURE_DSP (hw:N,2) delivers.
+`devices/main_mic` sets `ADD0_DATA_MIC13` and inverts the ADC LRCLK: in stereo MIC1 is
+the left channel and the right one is the unpowered MIC3 ADC pinned at -32768 (the
+pinned channel moves with the LRCLK setting, which is how that was told apart); a mono
+open returns MIC1 alone.  Gains from `audio_params/sprd`: ADC 6
+(`adc1_capture_volume`), VBC ADC0 DG 0x11 (`Music/Handsfree/Record`).
+
+The DSP capture scene writes 16-bit samples whatever hw_params say: opened `S24_LE`
+-- which PipeWire picks when the DAI offers it -- each 32-bit word held two samples
+(`0xf9530021`) and the recording was noise at -0.5 dBFS.  `kernel/patches/0017` offers
+S16_LE only.  Result: an "Internal Microphone" PipeWire source (mono, S16) with a
+plausible level.  A speaker-to-mic tone never showed up in the capture, noise did --
+not echo cancellation, as first assumed, but a speaker that was not playing (34); with
+34 fixed the tone comes back from the mic at its own frequency, and recording voice
+with GNOME Sound Recorder works (confirmed 2026-09-26).  The AP capture FE (hw:N,0)
+still stalls after one period.
+
+### 33.2 Earpiece
+
+`devices/handset`: the receiver hangs off the HPL driver (`HPL EAR Sel = EAR`,
+`EAR_HPL Mixer DACHPL`, `Earpiece Function`, `VBC_MIXER1_DAC0 = HALF_ADD`,
+`DAHP OS D = 5`).  As a UCM device conflicting with Speaker the EAR/RCV DAPM path
+powers up during playback and the aw87xxx goes Off.  Not yet confirmed by ear.
+
+### 33.3 Bluetooth: the vendor configuration the HAL sends first
+
+The btsnoop log starts at HCI Reset; the vendor HAL (`bt_chip_vendor`,
+`marlin3_lite`, chip id `2/Marlin3Lite_AB_0x2355B001/1`, which selects the `.xpe.ini`
+pair) sends before it, and only logcat and the kernel's mtty dumps show it:
+
+    0xfca0  pskey, 176 bytes   (answer: firmware node 5256, 2015-04-26)
+    0xfca2  RF, 252 bytes
+    0xfca1  00 00 01           core enable
+    0xfcb0/1/2                 super-SSP enable and keys (not reproduced)
+
+The payloads are the ini fields little-endian in file order, each value L/values bytes
+per `/L=` block (rf.ini's BR/EDR channel powers share one block), zero-padded; the
+pskey carries the factory address from `/mnt/vendor/btmac.txt`.
+`tools/sprd-bt-config.py` rebuilds them byte for byte against the logged prefixes.
+Linux's btattach sent none of it, which is why the controller had a placeholder
+address and manufacturer 0.
+
+A userspace prototype (send the three, then attach the same fd to N_HCI) proved it:
+factory address, manufacturer 0x01ec, scans work.  The native form is
+`kernel/patches/0018`: hci_uart's setup recognises the `ttyBT` transport and sends them,
+payloads via `request_firmware` (`sprd/marlin3lite_{pskey,rf}.bin`, written into the
+overlay by `pull-wcn-firmware.sh`).  hci_uart is built in, so this is the first Image
+since 0009 (`work/Image-bt1`, sha256 `03787d59...`; `#4`).  The stock btattach is
+unchanged.  Pairing and audio profiles are not tested yet.
+
+Trap from the prototype: `HCIUARTSETPROTO`/`HCIUARTSETFLAGS` take their argument by
+value; passed a pointer (Python's `fcntl.ioctl(fd, op, struct.pack(...))`) they fail
+with `EPROTONOSUPPORT`/`EINVAL`.
+
+## 34. The speaker after the first sound: three faults on one path (2026-09-26)
+
+Reported as "the Settings sound test is silent".  It was three independent faults, each
+hiding the next; the mic (33) turned out to be the best instrument -- a 440 Hz tone
+played through PipeWire and recorded through the mic, with a Goertzel scan over the
+recording, tells silent, stalled and wrong-pitch apart without anyone listening.
+
+### 34.1 The codec probed against dummy regulators
+
+Every playback in every boot of the journal logged `daaor_en_event check cal_done
+failed -110`, and `ANA_CDC7` (codec analog + 0x90, readable in
+`/proc/asound/card0/sprd-codec`, "analog part" row 0x0090) stayed 0 where Android
+reads 0x000f: the AO buffer DC calibration never completed.  The boot log said why:
+
+    23.06  sprd-codec-ump9620 ...: supply VB / BIAS / HEADMICBIAS / DAHPL_CHN not found,
+           using dummy regulator
+    25.51  snd_soc_sprd_codec_ump9620_power, _power_dev loaded (by e5-audio-dsp)
+
+udev autoloads the codec by modalias; the codec power regulators (`SRG_*`, instantiated
+by `-power-dev`, which has no modalias of its own) come 2.5 s later.  The calibration
+enables `DAHPL_CHN` around its poll, and a dummy enables nothing.  Fix, in the native
+place: `rootfs/overlay/etc/modprobe.d/e5-audio.conf`, a `softdep ... pre:` on the codec
+for both power modules.  After it the codec holds `SRG_DAHPL_CHN`, the calibration
+passes and `ANA_CDC7` reads 0x000f while playing.
+
+Reading the PMIC regmap for this: `/sys/kernel/debug/regmap/spi4.0/registers` is slow
+(each line is an ADI read; a grep for one register took minutes), but it seeks: lines
+are 15 bytes, so `dd bs=15 skip=$((reg/4)) count=1` reads one register at once.  The
+codec's analog block sits at regmap 0x1000 there (the driver's 0x3000 "AGCP" base is
+remapped).
+
+### 34.2 FE_FAST_P plays one S24 stream, then stalls
+
+With calibration fixed the first sound after boot was heard, nothing after it: every
+later `pw-play`, Amberol or Settings stream hung with the Speaker node running at
+quantum 0.  The PCM position (`echo "debug_pointer_log 1" >
+/proc/asound/card0/sprd-dmaengine`) sat at 0x5a0 from the start of the stream.  The AGCP
+DMA channel was enabled with request line 9 pending-enabled and never requested; its
+destination, 0x56500010, is the MCDT, not the VBC -- FAST_P goes AP DMA -> MCDT DAC4 ->
+DSP.  MCDT `DAC4_FIFO_ADDR_ST` (0x565000f4) read 0x02E00048 in a good stream (both
+pointers moving) and 0x00000168 in a stalled one: 0x168 words = 1440 bytes written, read
+pointer 0 -- the DSP never read the FIFO.
+
+The AP side was identical in both (same open/hw_params/trigger/SIPC sequence, same MCDT
+and DMA setup, same timing), and neither re-sending the per-stream controls Android
+sends (`KCTL_SET` MDG/DG, the profile select) nor the UCM route revived it.  Raw
+`aplay` isolated it: S16 streams restart every time (8/8, gaps 0-20 s); after an S24
+(`VBC_DAT_L24`) stream the next one stalls whatever its format, and it takes one or two
+stalled streams to clear.  PipeWire opened S24_32, so it stalled from its second
+stream on.  Android's HAL opens this FE S16 only (`data_fmt=VBC_DAT_L16` in its
+dmesg).  `kernel/patches/0019`: FE_FAST_P offers S16_LE only.
+
+### 34.3 PipeWire took the planar layout
+
+Now streams ran, and music sounded "strange": the mic heard 880 Hz for a 440 Hz tone,
+with a level spike per period, while raw interleaved `aplay` came back at 440 Hz.
+`pw-top` showed `S16P` -- planar.  `sprd_pcm_hardware_v1` advertises
+`SNDRV_PCM_INFO_NONINTERLEAVED` for every FE (the AP FEs split left/right over two DMA
+channels), but for an MCDT FE `sprd_pcm_hw_params()` forces one channel, so a planar
+buffer is played as interleaved frames: each plane twice as fast.  The 24-bit format
+had hidden this, since PipeWire only goes planar where it can.
+`kernel/patches/0020`: a startup callback constrains the MCDT FEs (the ids
+`mcdt_dma_config_init()` handles) to interleaved access.  Result: `S16LE 2 48000`,
+the tone back at 440 Hz three streams in a row, each 4 s file done in 4.2 s.
+
+Trap from this session: `busybox devmem` on an AGCP register (MCDT, DMA) while the
+domain is not accessible is the same synchronous external abort as 32 -- it rebooted
+the device into Android once.  Only read those while a stream is running, or use the
+driver's own dumps (`/proc/asound/card0/{vbc,sprd-codec}`, `debug_pointer_log`).
+
+## 35. Wi-Fi under NetworkManager, the hotspot as a bridge port, and the 30 s BT close (2026-09-26)
+
+Plan A of the Phosh integration: NetworkManager owns `wlan0` -- station mode from
+Phosh's Wi-Fi menu and the hotspot -- and nothing else.  The LAN (`br0` = `usb0` +
+the AP, 192.168.9.1/24) stays with `e5-net-bridge`, the bearer with `e5-bearer-up`
+and `unisoc-cpd`, DHCP/DNS/RA with dnsmasq, filtering with `nat.nft`.  hostapd,
+`e5-hotspot`, its retry timer and `hotspot-start.sh` are retired.
+
+### 35.1 NetworkManager confined to wlan0
+
+`etc/NetworkManager/conf.d/50-e5.conf`: `unmanaged-devices=*,except:interface-name:
+wlan0,except:interface-name:br0`, `dns=none`/`rc-manager=unmanaged` (resolv.conf is
+the bearer's), connectivity checks off, no default wired profiles.  `br0` is left
+managed on purpose: NM finds it configured by someone else and runs it as
+"connected (externally)" -- its addresses untouched -- which is what lets NM attach
+the AP to it.  That also answers the old NM trouble (FINDINGS 26): it never sees
+`sipa_dummy0`, and `NetworkManager-wait-online` is a no-op drop-in anyway.  Started
+live behind a dead-man switch (roll back to hostapd unless confirmed within 60 s);
+the USB link never blinked.
+
+### 35.2 The hotspot profile
+
+`Hotspot` (`usr/lib/NetworkManager/system-connections/Hotspot.nmconnection`): mode
+`ap`, SSID `E5-Linux`, WPA2-PSK, `master=br0`/`slave-type=bridge`, no IP settings --
+NM passes the bridge to wpa_supplicant, so EAPOL is handled on the port the way
+hostapd's `bridge=br0` did.  Three details it took:
+
+* **Channel 149 at 80 MHz needs a patched NetworkManager.**  At 80 MHz
+  wpa_supplicant failed the AP after its HT scan ("Interface initialization
+  failed"); its debug log said `VHT seg0 index 154` for channel 149.  The centre
+  comes from NetworkManager: `get_ap_params()` in 1.52 computes `((ch/4 - 1)/4)*16 +
+  10`, right for 36-144 and one off for 149-161 (154, should be 155).  Upstream fixed
+  it in 2026 (`5763b9b4`, `a0e03b12`, "supplicant: fix center channel calculation");
+  trixie has 1.52.1.  153/161 "started" with the same bogus centre.  Channel 36 at
+  80 MHz came up with the stock package (`cf1=5210`), but no phone ever associated --
+  nothing reached the driver or wpa_supplicant, as if it was not on the air -- while
+  149 is what hostapd and stock Android use.  So the fix is carried instead:
+  `rootfs/deb-patches/network-manager-vht80-center.patch` (the upstream table),
+  built into Debian's own source package by `rootfs/build-patched-debs.sh` (a
+  `debian:trixie` arm64 container, version `1.52.1-1+e51`), installed and held by
+  `install-packages.sh`.  With it: `VHT seg0 index 155`, `cf1=5775 MHz`,
+  AP-ENABLED.  `keyfile` wants `channel-width=80` (an integer), not `80mhz`.
+* **Phones saw the AP and could not join: WPS.**  Nothing reached wpa_supplicant
+  or the driver -- this driver associates in firmware (`device_ap_sme=1`), and the
+  firmware turned every station away.  The same radio, channel and bridge under
+  the old hostapd config let the phone straight in, so the two AP setups were
+  diffed from their `-dd` logs.  wpa_supplicant's AP mode had added a **WPS
+  element** to the beacon, probe response and association response
+  (`beacon_ies`/`proberesp_ies`/`assocresp_ies` = `dd .. 00 50 f2 04 ...`), which
+  hostapd never sends; it also left out the Country element and advertised every
+  HT/VHT hardware flag (VHT cap 0x01b07031 against hostapd's 0x00000020).
+  `wps-method=1` (disabled) in the profile makes NM pass `wps_disabled=1`; with
+  that alone the phone associated (`AP-STA-CONNECTED`, handshake completed, DHCP
+  192.168.9.41 on br0).  Also found on the way: NM 1.52 (and upstream main)
+  appends `WPA-PSK-SHA256` to an AP's key_mgmt whenever wpa_supplicant can do PMF,
+  even with PMF disabled -- AKM 00-0F-AC:6 without MFPC (`key_mgmt_suites=0x102`).
+  `network-manager-02-ap-psk-sha256.patch` limits such an AP to WPA-PSK (`0x2`, as
+  hostapd).  It was not what made the phone join -- that was WPS, tested after it
+  -- and is kept because that RSN element is invalid.  (The package is
+  `1.52.1-1+e5.2`, the suffix counting the patches.)
+* **Read-only in /usr/lib.**  The overlay is copied over `/etc` at every boot, so a
+  profile there would lose every SSID/password change.  NM treats
+  `/usr/lib/NetworkManager/system-connections` as read-only and writes an edited
+  profile to `/etc/NetworkManager/system-connections`, which shadows it and is not
+  in the overlay.  `boot/init` chmods the shipped keyfile 0600: the image builder
+  packs every overlay file a+r, and NM ignores a keyfile others can read.
+* **Up at boot.**  `autoconnect=true`, like the hostapd hotspot; with equal
+  priority NM restores whichever of the hotspot and a joined network was used last,
+  and its autoconnect retries replace the retry timer for the WCN's refused first
+  beacon.
+
+UFI-TOOLS drives the same profile through `nmcli` (`control.py`): status, up/down,
+SSID/PSK/auth/channel/hidden via `connection modify` (an active hotspot is brought
+up again), and the MAC allow/deny list -- which NM's AP mode lacks -- as an nftables
+bridge filter on frames entering from `wlan0` (`table bridge e5acl`, reloaded at
+start-up).  Two UFI-TOOLS bugs surfaced on the way: the web UI sends the password
+base64-encoded and the backend had stored that string as the passphrase, and the
+"broadcast SSID" box was inverted on save.
+
+**Phosh's switch.**  Phosh (0.46 and main) starts the first AP-mode profile from its
+hotspot switch -- ours -- but `is_active_connection_hotspot_master()` only counts an
+active connection with `ipv4.method=shared`.  A bridge port has no IP settings, so
+the switch reads off while the hotspot runs and cannot stop it.  Not solved here.
+
+### 35.3 The 21 s shutdown was the BT core, not NetworkManager
+
+With NM, a reboot sat 21 s in "NetworkManager/wpa_supplicant: State 'final-sigterm'
+timed out ... Processes still around after final SIGKILL" -- both in the kernel.
+The WCN log had the chain: bluetoothd exits, btattach closes `ttyBT` ->
+`stop_marlin [MARLIN_BLUETOOTH]` -> `MEM_PD: marlin bt state:1` and nothing more;
+then Wi-Fi's `stop_marlin [MARLIN_WIFI] wait for lock release`.  The BT close waits
+for the CP's thread-delete interrupt (`bt_close_completion`, `CP_TIMEROUT` 30 s)
+holding `power_lock`, and Wi-Fi's teardown needs the same lock.  This is also what
+FINDINGS 23 measured and blamed on NM, and why `e5-bt-attach` always ended in
+"final-sigterm timed out".
+
+Android's dmesg shows the HAL sending `01 A1 FC 03 00 00 00` -- 0xfca1 with `00 00
+00`, the counterpart of the `00 00 01` enable from 0018 -- 25 ms before
+`mtty_close`, and `cp bt delete thread ok` 17 ms after it.  `kernel/patches/0021`
+sends that from `mtty_close()` itself, before `stop_marlin()`.  First tried from the
+HCI driver's `hdev->shutdown` at adapter power-off (with a non-persistent setup to
+re-configure at power-on): that left the controller dead -- with the tty still open
+the CP no longer answered the next pskey (`0xfca0 tx timeout`).  The disable belongs
+right before the tty goes, as the HAL has it.  Also `e5-bt-attach` is now
+`Before=bluetooth.service`, so bluetoothd has powered the adapter off before
+btattach is killed.  Result: `cp bt delete thread ok` at once, NM stopped in under a
+second, the whole shutdown 2.7 s, and the USB link gone 8 s after `systemctl
+reboot` (35 s before); BT power-off/on from bluetoothctl still works.  0021 is in a
+module (`sprdbt_tty`, initramfs), so the kernel stays `#4`.
+
+## 36. Native baseband, step 1: the SIPC AT channel as a WWAN port (2026-09-26)
+
+Goal: the stock Linux modem stack (kernel WWAN framework, ModemManager,
+NetworkManager, Phosh, Calls, Chatty) on the baseband, instead of unisoc-cpd's private
+socket.  The CP boot stays Android's `modem_control` in its chroot for now
+(`sprd_modem_loader` accepts no other caller, and it needs the Trusty TA).
+
+**The port.**  `stty_nr` (SIPC dst 5, channel 6, 32 rings) are spipe character
+devices, not ttys, so ModemManager cannot take them.  `kernel/patches/0022`
+(`sipc_wwan`, `CONFIG_WWAN=m`) registers one WWAN AT port, `/dev/wwan0at0`, on the
+`stty_nr` platform device, modelled on `rpmsg_wwan_ctrl`: writes to ring 1 (the
+command ring), reads from ring 1 with ring 0's URCs merged in by whole lines between
+reply lines (the SMS `> ` prompt has no newline, so ring 1 passes straight through).
+Checked by hand: `+CPIN: READY`, `+CEREG: 2,1`, `+CGMI` Spreadtrum, URCs (`+CSQ`,
+`+CESQ`, `+CGREG`) arriving merged, `AT<CR><LF>` (ModemManager's terminator) fine.
+
+**Three ways to lose the CP's AT server** found on the way -- each silent (AT dead
+for every client, unisoc-cpd included, no assert) or an assert, each costing a reboot:
+
+* **Writing to ring 0.**  The first version exposed rings 1 and 0 as two AT ports;
+  ModemManager probed both with `AT`, and nothing on either answered from then on.
+  Ring 0 is receive-only; nobody ever writes it (unisoc-cpd only reads it).
+* **Leaving the rings unread.**  Three seconds into a handover (unisoc-cpd stopped,
+  port not yet open), after an earlier ModemManager session had changed the modem's
+  report settings: `MN_AL Task PS ... Error 0xb, The queue was full`.  A 2 KiB ring
+  fills in seconds when reports flow, and the CP's queue backs up behind it.  The
+  driver now drains both rings from load and drops what arrives while the port is
+  closed (285 bytes over one ModemManager session) -- which makes it and a user of
+  `/dev/stty_nr0/1` mutually exclusive.  The CP recovered from this assert by itself
+  (dump wait, then the bearer came back).
+* **`ATZ`.**  ModemManager's enable sequence starts with it; no reply, and AT was
+  dead from then on.
+
+**ModemManager 1.24, generic plugin**, ports tagged by a runtime udev rule
+(`ID_MM_DEVICE_PROCESS`, `ID_MM_PORT_TYPE_AT_PRIMARY` on `wwan0at0`, the same
+`ID_MM_PHYSDEV_UID` on it and `sipa_eth0`): the modem is created -- Spreadtrum,
+firmware `5G_MODEM_V2_23B_W24.16.1`, IMEI, own number, SIM (IMSI, ICCID, operator
+46015), modes 4G/5G, ports `wwan0at0` (at) + `sipa_eth0` (net) -- after about sixty
+probe/init commands, none of them harmful.  Enabling fails on `ATZ`.  Next: a
+`unisoc` ModemManager plugin (no `ATZ`, the vendor power-up, the M-ETHER bearer with
+the static IP config of `+CGCONTRDP`), carried in Debian's source package like the
+NetworkManager fixes.
+
+## 37. Native baseband, step 2: ModemManager and NetworkManager own the modem (2026-09-26)
+
+The CP still boots under Android's `modem_control` in its chroot; everything after
+that is the stock Linux stack.  At boot `e5-sipc-wwan` loads `sipc_wwan`,
+ModemManager's `unisoc` plugin drives `wwan0at0` and `sipa_eth0`, and
+NetworkManager's `Mobile` connection brings the data up.  Phosh shows the signal,
+Calls and Chatty see the modem, and `unisoc-cpd` with `e5-bearer-up`/`-watch` is
+retired (installed, not enabled; starting `unisoc-cpd` stops `e5-sipc-wwan` and
+ModemManager through `Conflicts=`/`BindsTo=`).  Verified on a cold boot: 5G SA,
+home, signal from `+CESQ`, context 1 on `sipa_eth0`, IPv4 and IPv6 (ping, HTTP),
+the IPv6 /64 on `br0` for the LAN, and the SIM's SMS listed.
+
+### 37.1 ModemManager, patched (`rootfs/deb-patches/modemmanager-0[1-5]`)
+
+Debian's 1.24.0 rebuilt by `rootfs/build-patched-debs.sh modemmanager`, held:
+
+* **01, the `unisoc` plugin**, on the ports `77-mm-unisoc-sipc.rules` tags
+  `ID_MM_UNISOC_SIPC`.  The generic modem, except:
+  * no `ATZ`, and no `+CPMS=` at all -- a new killer: `AT+CPMS="SM","SM","SM"`,
+    which only selected the storages already in use, left the AT server silent until
+    a reboot, no assert.  The core gains `MMBroadbandModemClass.sms_storages_fixed`:
+    storage locks succeed without a command for the storages `+CPMS?` reported and
+    are refused for any other, so listing, reading, storing and deleting stay on SM.
+  * capabilities (GSM/UMTS, LTE, 5G NR) and IP families (IPv4, IPv6, IPv4v6) are
+    stated: `+GCAP` says `+CGSM` only, `+WS46=?` is unsupported, and `+CGDCONT=?`
+    lists `"IP"` only although the contexts are IPV4V6.  Without this ModemManager
+    ran CS/PS registration checks only and never saw the NR SA registration.
+  * signal from all nine `+CESQ` fields (the generic parser stops at LTE; `+CSQ`
+    answers `255,99` on NR), also from the `+CESQ` the modem sends unsolicited every
+    few seconds.  Its unsolicited `+CSQ`, `+SIND`, `+SPSLICEQUE`, `^CONN`/`^CEND` ...
+    are swallowed -- they had ended up inside replies (the model read
+    `+SPSLICEQUE:2|1,1|1 ^CONN: 11,2,2 V1.0.1-B7`).
+  * power, measured: `+CFUN=4` and `+CFUN=1` are flight mode and back with the SIM
+    kept on.  **`+CFUN=0` switches the SIM off and nothing brings it back within
+    that boot**: afterwards `AT+SFUN=2` answered "operation not allowed" or nothing,
+    `+CPIN` stayed "SIM not inserted", and a second `CFUN=0` timed out.  So power
+    down/off is `+CFUN=4`, never 0.  The CP modem_control boots is at `+CFUN: 0`
+    with the SIM off, though; from there the vendor RIL's `AT+SFUN=2` (SIM on) and
+    `AT+SFUN=4` (stack on) work, and the plugin sends them as soon as the port is
+    open, before initialization reads the SIM.
+  * the bearer: `+CGACT=1,<cid>`, `+CGDATA="M-ETHER",<cid>` (CONNECT, the port stays
+    in command mode), then `+CGCONTRDP=<cid>`: IPv4 static (no gateway -- the
+    default route goes out of the interface), IPv6 by RA with the DNS servers of the
+    dotted IPv6 line and **the network's interface identifier as the link-local
+    address**: `sipa_eth0` is `link/none`, so NetworkManager has no MAC to derive
+    one from, and without an address from the bearer IPv6 never came up.
+    Disconnect is `+CGACT=0,<cid>`.
+* **02**: the solicited `+CREG`/`+CGREG`/`+CEREG` patterns took a one-digit AcT and
+  are anchored at the end, so `+CGREG: 2,1,"0000","00246005",11` (NR on a 5G core)
+  was "Unknown registration status response" -- on any 5G modem.
+* **03**: `+CMGL` in PDU mode puts an empty line between each header and its PDU
+  here, which failed the whole listing.
+* **04**: `at_command_via_dbus` on, so `mmcli --command` works without `--debug`:
+  `/opt/e5/e5-at` (and UFI-TOOLS through it) asks ModemManager now, and refuses
+  `ATZ`, `AT&F`, `AT+CPMS=`, `AT+CFUN=0`, `AT+SFUN=3/5`.
+* **05**: new contexts may take the ids below the first defined one.  **The CP
+  routes context N to the SIPA net id N-1, and only context 1 reaches `sipa_eth0`**.
+  The CP boots with only the IMS context at 11 (unisoc-cpd defined 1 itself), so
+  ModemManager put the APN at 12: connected, addressed, and not one packet back on
+  `sipa_eth0` (none on `sipa_eth11` either, by hand).  The bearer now uses
+  `sipa_eth<cid-1>` and says so if ModemManager does not have it.
+
+`mm-modem-helpers` tests (32 programs) pass with 02, 03, 05 and a test for 05.
+
+### 37.2 Getting the ports to ModemManager in one piece
+
+* `sipc_wwan` loads long before the CP has booted, and a port that refuses to open is
+  probed once and forgotten.  `kernel/patches/0023`: the port is registered when the
+  sbuf channel comes up and removed when it goes down (a CP reset), watched once a
+  second besides `SBUF_NOTIFY_READY`.  A module reload -- the same thing as a CP reset
+  to ModemManager -- came back as a new modem and NetworkManager reconnected by itself.
+* ModemManager sees `sipa_eth0` from early boot.  Alone, it fails probing (a virtual
+  netdev has no driver for the plugin filters), and the device's probe list is reset,
+  so the AT port arriving later made a modem with no data port.
+  `78-e5-mm-sipc.rules` hands `sipa_eth0` over only while an AT port exists, and
+  re-announces it when one appears.
+* Checksum offload on `sipa_eth*` is off by `etc/systemd/network/10-e5-sipa-eth.link`
+  (unisoc-cpd did it with ethtool after each bearer).
+* NetworkManager manages `wwan0at0` (the modem device; `sipa_eth0` stays unmanaged
+  as its IP interface), `Mobile.nmconnection` in `/usr/lib/NetworkManager`, APN
+  `cbnet`, retries forever.  The dispatcher runs `e5-ipv6-share` with
+  `E5_V6_NM=1`, which leaves the uplink's IPv6 to NetworkManager and only moves the
+  /64 to `br0`.
+
+### 37.3 Two boot faults this exposed
+
+* **An ordering cycle dropped `e5-vendor` on every boot**: `e5-cp_diskserver` was
+  `Before=e5-vendor` (which is `Before=sysinit.target`) but, with the default
+  dependencies, after `sysinit.target`.  systemd deleted the `e5-vendor` start job;
+  the CP only came up because `unisoc-cpd`'s `Wants=` queued the vendor again later.
+  cp_diskserver is `After=` it now (`android-run` waits for the chroot anyway).
+* **`/dev/null`, `zero`, `full`, `random`, `urandom`, `tty` arrive mode 0660** from
+  early boot on some boots (the kernel creates them 0666; the culprit is not found
+  yet).  dbus-daemon, which drops to `messagebus`, then died with "Failed to open
+  /dev/null: Permission denied" and NetworkManager, bound to it, never started.
+  `rootfs-fixups` (before sysinit) logs and restores 0666.
+
+### 37.4 Sending SMS and calls
+
+* **MO SMS: the service centre has to be written once per boot.**  Until then
+  every `+CMGS` answered `+CMS ERROR: 313` ("SIM failure") -- from ModemManager,
+  and from unisoc-cpd's exact sequence replayed on the port with ModemManager
+  stopped; with the SMSC in the PDU or not, national or international
+  destination, GSM7 or UCS2, `CSCS` GSM or UCS2, `+CGSMS` 2 or 3, voice- or
+  data-centric (`+CEUS`).  `AT+CSCA="<smsc>",145` with the very value `+CSCA?`
+  reported (what unisoc-cpd's "re-arm the SMS surface" did, FINDINGS 25.7 of
+  its tree) and the next submit went through, and every submit after it,
+  ModemManager's included.  The plugin writes the SMSC back (verbatim, in
+  whatever charset it read it) right after setting up the SMS format;
+  verified from a fresh boot, delivered.
+* Also measured on the way: `+CIREG` reports registration (`1`) with no
+  capability bits at all, before and after `+CEUS=1` -- this CP does not fill
+  them in, so they say nothing about IMS SMS or voice.
+* **MO VoLTE call through ModemManager**: `ATD<n>;` answers `+CDU: 1` before
+  its `OK`, which ModemManager took for a failed dial ("Unhandled response
+  '+CDU:1'") while the CP placed the call anyway.  With `+CDU:` swallowed:
+  dialing, ringing-out (followed by ModemManager's `+CLCC` polling, every 2 s),
+  hang-up.  The call reports `^DSCI:`, `+SPCALLEXTINFO:`, `+CLCCS:`, `+ECIND:`,
+  `+SIND:` along the way, all swallowed.  There is no audio yet: nothing routes
+  the codec into the CP's voice path (unisoc-cpd never had it either:
+  `voice.supported = false`, the far end heard silence).
+* `sipc_wwan` (kernel `0024`) drops the `<LF>` ModemManager puts after every
+  command on a non-tty port: the vendor RIL ends commands with `<CR>` only,
+  and after `AT+CMGS=<n><CR>` the `<LF>` would be the PDU's first byte.  (It
+  was not what the 313 was.)
+
+### 37.5 UFI-TOOLS piled up hundreds of nmcli
+
+The web page polls its status once a second, and every status ran two or three
+`nmcli` (the hotspot, and since the mobile-data toggle moved to NetworkManager,
+one more).  When NetworkManager was slow to answer, `run_shell`'s timeout killed
+the `sh` wrapper but not the `nmcli` under it: load average 635, 1.2 of 1.4 GiB
+used, telnet and the web page unresponsive, the shell only reachable over the
+USB serial console.  `run_shell` now kills the whole process group on timeout,
+and `SystemControl` reuses a read-only `nmcli` answer for 3 s with one query in
+flight at a time (20 concurrent status calls: 2 `nmcli` runs).
+
+### 37.6 Behaviour to know
+
+* **Chatty deletes the SMS it imports** from the SIM (standard Chatty; they live in
+  its history database, `~/.purple/chatty/db/chatty-history.db`).  unisoc-cpd never
+  deleted anything.
+* The unisoc-cpd web page (`:7887`) is gone with the daemon; UFI-TOOLS keeps working
+  through `e5-at`.
+* Confirmed in use afterwards: SMS and calls both ways from Chatty and Calls.
+  Open: call audio (neither side hears anything), and a real CP reset (the module
+  reload stands in for it).
+
+### 37.7 Cell info: band, PCI and the neighbours (2026-09-26)
+
+ModemManager had no cell info for this modem (`mmcli --get-cell-info`:
+"operation not supported") and its Signal interface only what `+CESQ` carries,
+which has no LTE SINR.  The CP's engineering-mode query has all of it, and is
+what UFI's own firmware tools read: `AT+SPENGMD=0,<page>,<item>` answers one
+line of `-`-separated fields (a negative number just follows its separator,
+`-9963--1209`), levels in hundredths of a dB(m).
+
+    0,14,1  NR serving: 0 band, 1 NR-ARFCN, 2 PCI, 3 RSRP, 4 RSRQ, 7 bandwidth
+            (MHz), 8 gNB id, 9 NCI (low 32 bits), 15 SINR
+    0,14,2  NR neighbours, a list per field: band, NR-ARFCN, PCI, RSRP, RSRQ, SINR
+    0,6,0   LTE serving: 0 band, 1 EARFCN, 2 PCI, 3 RSRP, 4 RSRQ, 7 bandwidth
+            code, 10 eNB id, 11 cell id, 29 TAC
+    0,0,6   LTE physical layer: 2 SINR
+    0,6,6   LTE neighbours, a field per cell: EARFCN, PCI, RSRP, RSRQ, ...
+
+Checked on NR SA (band n41, 504990): field 5 is a constant -1.20 and 15 the
+one that moves, so 15 is the SINR; field 9 is the NCI cut to 32 bits, and with
+the gNB id (24 bits here) put back above it it equals the 36-bit
+`+C5GREG` cell id (`A10246001`, `A10277005`).  The serving cell changes every
+few minutes where this handset lies, and a cell being reselected reports its
+NCI as 0.  The LTE pages follow UFI's layout and have not been seen on LTE.
+
+The unisoc plugin (`modemmanager-01`) implements the Modem interface's cell
+info from pages 14,1 / 14,2 / 6,0 / 6,6 -- PCI and cell ids in hexadecimal, as
+ModemManager keeps them, bandwidth in Hz -- and adds page 0,6's LTE SINR to the
+Signal interface.  ModemManager's cell info has no band field: the consumers
+look it up from the channel (an EARFCN belongs to one band; NR bands overlap,
+and the ones used in China win: n78 before n77, n41 before n90).  An NR cell's
+TAC is not in its cell info either; the 3GPP location has it.
+
+* Settings' Modem Details (`gnome-control-center-02`) gains a "Serving Cell"
+  group -- band, channel, PCI, cell id, TAC, bandwidth, RSRP, RSRQ, SINR, per
+  RAT under EN-DC -- and a "Neighbour Cells" group, refreshed every 5 s while
+  the dialog is shown.
+* UFI-TOOLS (`modem.py`) fills the web UI's per-RAT fields from the cell info
+  (`Nr_bands`, `Nr_fcn`, `Nr_pci`, `Nr_cell_id`, `Nr_bands_widths`, `Z5g_rsrp`,
+  `nr_rsrq`, `Nr_snr`, and the `Lte_*` counterparts) and its neighbour table.
+  It used to copy the NR RSRP into the LTE fields as well, and had no SINR,
+  band, channel or PCI at all.
+
+## 38. The phone UI on the E5: hotspot switch, dialogs, the black panel, scale, BT vs Wi-Fi (2026-09-26)
+
+* **The hotspot in Phosh and Settings.**  Both took only `ipv4.method=shared`
+  connections for a hotspot, and the E5's `Hotspot` is a port of `br0` with no IPv4
+  setting.  Phosh (0.46) showed the switch off and its `stop_hotspot()` refused to
+  run; it has no way to turn a hotspot *on* at all (`start_hotspot()` has no caller
+  in the UI).  Settings' Wi-Fi panel did not find the connection and offered to
+  create a new one -- NetworkManager's own NAT-sharing hotspot, which would fight
+  br0/dnsmasq -- and its hotspot dialog adds `ipv4.method=shared` to a connection
+  without IPv4 settings, which would have broken the bridge port.
+  `rootfs/deb-patches/phosh-01` and `gnome-control-center-01`: an access point (or
+  ad-hoc network) is a hotspot whatever its IP setup, a bridge port is found and
+  reused, and no IPv4 setting is added to a port.
+* **Dialogs could not be closed.**  Phosh sets the window button layout to
+  `appmenu:` in phone mode (`docked-manager.c`), so no window has a close button,
+  and this device has no Escape: the back key reports KEY_BACK and BackSpace
+  (section 12.1), neither of which closes a `GtkDialog`.  Settings' "Modem Details"
+  (a `GtkDialog`) could only be left by killing the app.  `phosh-02` keeps
+  `appmenu:close` in phone mode.
+* **After a lock the panel stayed black.**  phoc: `DRM_IOCTL_MODE_CREATE_DUMB
+  failed: Invalid argument` ... `Failed to commit power mode change to 1`.  The
+  vendor display driver counted dumb-buffer creations in a static that never went
+  down (10, raised to 64 by kernel `0006`), and wlroots builds a new swapchain
+  whenever the output is reconfigured or comes back from blanking -- live scale
+  changes with `wlr-randr` used up the rest of the boot's budget, and screen-off/on
+  cycles alone would have in time.  Kernel `0025` removes the count (buffers are
+  freed with their GEM object; `dma_alloc_wc()` is the real limit).  Verified: 40
+  output off/on cycles after boot, the panel on, no allocation failure.
+* **Settings turned the hotspot on four times.**  Its Wi-Fi panel connected the
+  hotspot dialog's "response" handler every time the dialog was opened, so the
+  n-th use activated the connection n times, each activation tearing down the one
+  before.  `gnome-control-center-01` connects it once, when the dialog is built.
+* **The hotspot is what wlan0 does after boot.**  `Hotspot.nmconnection` has
+  `autoconnect-priority=100`: without it a Wi-Fi network joined once from Phosh
+  took wlan0 as a station at the next boot (the driver allows one of
+  station and AP at a time, `#{ managed, AP } <= 1`).
+* **The on-screen keyboard could not be closed.**  Phosh hides it on Escape or a
+  swipe, the back key is BackSpace (section 12.1), and the swipe needs a keyboard
+  that is not in the way of the text field.  The keypad's Menu key (KEY_MENU,
+  keysym `XF86MenuKB`) was free: `phosh-03` binds it as a global accelerator
+  that toggles the keyboard, and it opens and closes it in use.
+* **BT off took Wi-Fi down, and the hotspot with it.**  "Cannot join the network"
+  after boot: the AP was up for a minute, then `sc2355_assert_cmd reason:3`,
+  `hif->cp_assert is 1`, and wlan0 answered nothing until a reboot.  The saved
+  rfkill state had the chip-level `bluetooth` switch (sprd-mtty; hci0 is the other
+  one) blocked, and systemd-rfkill restores it at boot:
+  1. The block ran `stop_marlin(MARLIN_BLUETOOTH)` with ttyBT0 open (btattach) and
+     no "core disable" sent, so it waited the 30 s CP timeout for the BT
+     thread-delete interrupt with the WCN power lock held -- the same stall as the
+     shutdown one in section 35 -- and Wi-Fi's `start_marlin` waited behind it.
+  2. bluetoothd kept using hci0, whose switch was not blocked.  Its HCI Reset went
+     down SDIO to a BT subsystem that was powered off; the transfer never
+     finished (`sdiohal_tx_thre holds xmit_lock`), and four seconds later the
+     Wi-Fi firmware, which shares the bus, asserted.
+  Kernel `0026`: a block sends the core disable first (60 ms, as on a close), and
+  ttyBT0 drops writes while BT is powered off -- hci0's commands time out, which
+  is what they should do with BT off.  Verified: booted with the switch blocked
+  (both orders of btattach and systemd-rfkill came up), blocked it live with the
+  tty open, sent HCI traffic while blocked (`dropping 4 bytes`), unblocked and
+  powered hci0 again: no assert, the AP up throughout.  The block had been saved
+  during the BT bring-up, not by the shell.
+  Still open: the vendor configuration (pskey/RF/core enable, kernel `0018`) is
+  sent once, when btattach attaches, so after any BT power cycle (rfkill, or the
+  shell's BT switch, which blocks both switches) hci0 comes back on the ROM
+  defaults with the placeholder address 27:93:31:14:22:11.
+* **The hotspot still could not be joined: P2P.**  With `0026` the firmware no
+  longer asserted, the AP beaconed (seen from a Mac at -40 dBm) and still nobody
+  got in: the Mac's CoreWLAN join failed (`-3938`), a phone the same, and nothing
+  reached the host -- no `EVT_NEW_STATION` from the firmware, no event in
+  wpa_supplicant's debug log.  An open AP, 2.4 GHz channel 6 and 149 at 20 MHz
+  failed the same way, and so did a freshly powered chip.  hostapd on the same
+  radio, channel and bridge let the Mac straight in (`AP-STA-CONNECTED`, DHCP
+  on br0), also with wpa_supplicant's exact HT40/VHT80 capabilities, and after
+  an AP-mode scan (with or without a WPS element in it).  A wpa_supplicant of its
+  own, outside NetworkManager, joined the Mac with `p2p_disabled=1` and failed
+  without it: the difference is the **P2P Device** wpa_supplicant adds next to
+  wlan0 whenever the driver offers P2P (NetworkManager's instance always does).
+  While it exists this firmware -- which answers an AP's authentication and
+  association itself -- answers no station.  Deleting the device once the AP is
+  up does not bring it back.  Kernel `0027`: the driver offers station and AP
+  only (no P2P-GO/client/device, and no interface combinations: cfg80211 rejects
+  a one-interface combination and allows one interface at a time without any).
+  Verified after a clean boot, BT on: the Mac joins `Hotspot` under
+  NetworkManager and gets 192.168.9.64 from dnsmasq.  The phone join that
+  section 35 records was probably made before the BT attach and NM's P2P device
+  were both in place; the `0026` analysis above stands, but it was not the whole
+  story.
+  Seen on the way, not fixed: the band tables list the HT MCS rates (6.5-130
+  Mbps) as legacy bitrates, so every beacon carries an Extended Supported Rates
+  element whose values from 65 Mbps up overflow into the basic-rate bit
+  (`82 9c d0 ea` read as basic 1, 14, 40, 53 Mbps).  Clients tolerate it (hostapd
+  builds the same element), but it is wrong.
+* **Scale 0.85** after trying 1, 0.9 and 0.85 in use (the text is scaled to 1.25 in
+  Settings; section 21 has the measurements).  `wlr-randr` is in the image to change
+  it live; it cannot be applied while the panel is blanked.
+
+## 39. OpenWrt next to Debian (2026-09-27)
+
+`openwrt/` builds OpenWrt 25.12.5 (armsr/armv8, musl) as a second system in the
+same root image, the way mu300-linux offers OpenWrt next to Ubuntu; its README has
+the layout.  What the E5 needed on the way:
+
+* **Booting a directory of the image.**  `boot/init` `pick_root` reads
+  `e5linux/boot-os` (and `boot-os-next`, removed as it is read: one boot) and
+  switches to `/openwrt` in the image instead of the image's top level.  Debian's
+  overlay is applied only when the root is Debian.  The Wi-Fi/BT firmware and the
+  Android vendor subset stay the Debian root's: the initramfs binds them into the
+  new root **before** `switch_root`.  A bind in OpenWrt's preinit came too late --
+  the WCN driver's firmware request was already pending, fell through to the sysfs
+  fallback, and procd has no loader answering it at that point.  The preinit hook
+  stays as an idempotent fallback.
+* **usb0 must never go down.**  netifd builds its bridge by taking the port down
+  and up, and on the NCM function that loses the framing with the host
+  ("configfs-gadget gadget: Wrong NTH SIGN" for every frame).  Once it went further:
+  memory corruption, a kernel panic, and -- the trial slot not re-armed yet -- the
+  device came back in Android (recovered with the `misc` block from adb, section
+  24.5).  netifd now owns an empty `br-lan` (`bridge_empty`), and a hotplug script
+  enslaves usb0 into it without touching its link state
+  (`overlay/etc/hotplug.d/iface/10-e5-usb0`).
+* **`CONFIG_BRIDGE_VLAN_FILTERING`.**  netifd sends `IFLA_BR_VLAN_FILTERING` with
+  every bridge it creates, and a kernel without the option rejects the whole
+  request: no `br-lan` at all.  Added to `kernel/e5-linux.fragment` (`Image` #8);
+  Debian is unaffected.
+* **procd makes device nodes 0600** where udev makes them 0660 root:root.  The
+  vendor daemons drop to uid system with group root, and `modem_control` failed on
+  `/dev/chsys` ("Permission denied"): no CP.  The build changes procd's default in
+  `hotplug.json` to 0660.
+* **fw4 loads its ruleset in one piece**, and this kernel has no conntrack helpers:
+  one `ct helper set` rule it cannot take and there was no firewall and no NAT.
+  `auto_helper=0`.
+* **ModemManager without udev.**  OpenWrt's MM package ships its own rules parser
+  and hotplug glue.  The parser takes one action per rule (the unisoc rules are
+  one assignment per rule now, in `modemmanager-01` too), and the hotplug scripts
+  drop virtual netdevs, which `sipa_eth0` is:
+  `openwrt/patches/modemmanager-package-sipa-eth.patch` reports it once an AT port
+  exists (as `78-e5-mm-sipc.rules` does on Debian).  `wan` is `proto
+  modemmanager` on `unisoc-sipc` (`ID_MM_PHYSDEV_UID`).
+* **The proto's IPv4 route.**  The bearer has no gateway (`AT+CGCONTRDP` gives
+  none, section 37), and the proto added a default route only via one:
+  `modemmanager-package-ipv4-no-gateway.patch` adds a device route instead.
+* **The initial EPS bearer.**  OpenWrt's proto sets the initial EPS bearer at every
+  connect (to an empty APN unless `init_epsbearer` says otherwise).  The empty
+  one went to context 1, so the data APN went to 2 -- `sipa_eth1`, nothing on
+  `sipa_eth0` (section 37.1, 05) -- hence `init_epsbearer=default` (the data APN
+  as the attach APN, context 1 for both).  But ModemManager stores the initial
+  bearer by modifying the profile at its context id, and after a CP boot there is
+  only context 11: "Profile '1' not found", and the proto blocks restarts after
+  that error -- no WAN until someone intervened.  `modemmanager-06`: a profile set
+  by an id that is not defined yet is created with that id (`+CGDCONT=<cid>,...`
+  defines as well as changes).  Verified from a fresh install: context 1 created
+  as `cbnet`, IPv4 and IPv6 up on the first connect.
+* **IPv6 for the LAN.**  odhcpd's relay mode cannot work on this uplink:
+  `sipa_eth0` is a raw-IP device (type 65534, NOARP), `PACKET_ADD_MEMBERSHIP`
+  fails on it and so does every proxied NDP message.  As on Debian (section 30)
+  the /64 moves to the LAN: the proto's dhcpv6 interface already extends the RA
+  prefix (`extendprefix`, RFC 7278), `lan` takes it (`ip6assign 64`), odhcpd
+  sends the RA (SLAAC, stateless DHCPv6 for DNS).  Verified: a USB host with an
+  address from the prefix fetches over HTTPS, and the server sees that address.
+* **Wi-Fi**: `wifi config` writes the interface disabled as well as the radio;
+  the first-boot script enables both.  hostapd (wpad-basic-mbedtls) brings up
+  the AP on 5 GHz ch149/80 MHz, WPA2-PSK, and a phone joins and gets its lease.
+  The "Out of memory (-12)" and "Not supported (-95)" lines hostapd's setup logs
+  are harmless.
+* A test trap: a host whose DNS answers with a VPN's fake IPs (`2001:2::/..`)
+  cannot test IPv6 through the E5 with its own resolver -- ask the E5's dnsmasq.
+
+## 40. The vibrator (2026-09-27)
+
+The PMIC has one (`pmic@0:vibrator@2390`, `sprd,ump9620-vibrator`), and Android
+loads its driver ("input: sc27xx:vibrator").  Ours was built
+(`CONFIG_INPUT_SC27XX_VIBRA=m`) but never staged.  It is in the initramfs list now
+(`boot/module-order.extra`, image native16), so both systems have it: a
+force-feedback input device (`EV_FF`, `FF_RUMBLE`), which feedbackd drives on
+Debian (Phosh's SMS and call feedback) and anything with `EVIOCSFF` on OpenWrt.
+**The driver takes the strength from `rumble.weak_magnitude`**: an effect with only
+`strong_magnitude` set plays at strength 0 -- accepted, and silent (the first
+test here did exactly that).  Verified by hand with a 400-600 ms rumble.
+
+On OpenWrt, `e5-sms-notify` (procd) listens for ModemManager's
+`Modem.Messaging.Added` with `dbus-monitor` and vibrates through `e5-vibrate` when
+`received` is true -- verified with a real SMS.  Two things on the way: the
+listener reads `dbus-monitor` through a FIFO, not a pipeline, because procd stops
+a service by its main process and a pipeline's other half outlived every restart
+(each one would have added another vibration per message); and the PMIC's
+`sc27xx:red/green/blue` LEDs drive nothing on this board -- the E5 has no
+notification LED.
+
+## 41. Charge control (2026-09-27)
+
+Unisoc's charger-manager (`drivers/power/supply/charger-manager.c`) takes
+`/sys/class/power_supply/battery/charger.0/stop_charge`: `1` stops charging
+(`try_charger_enable(cm, false)`), `0` resumes, a second number 255/254 also
+turns the power path off/on -- left alone, so USB keeps powering the device --
+and a write marks the charger externally controlled, so charger-manager does not
+re-enable it on its own.  It is refused while no charger is plugged in.  Its
+`soc_control` is the ODM's factory run-in mode ("limit soc 70%", `cm_smt_sm()`):
+fixed thresholds, stop at 70 % and resume at 65 %, not a user limit.  So the limit
+is a loop on OpenWrt (`e5-charge`).
+
+**`stop_charge` alone does not stop the chip.**  The first check only read the
+status string (`Not charging`); the current said otherwise -- +125 mA before,
++121 mA after -- and the AW322xx's registers showed it charging on: control
+`0x01=0x30` (CE = 0, enabled), status `0x00=0xd0` (STAT = 01, charge in
+progress).  Two flags stand between the write and the chip: `try_charger_enable()`
+returns early when `cm->charger_enabled` already equals the request, and the
+driver's `aw32257_charger_set_status()` writes CE only `if (!val &&
+info->charging)`; neither matched the hardware.  (`CONFIG_CHARGE_PD` is unset,
+so the CE path, not a GPIO, is the one built.)  The driver's own
+`high_impedance_enable` does reach it: HiZ, the chip stops drawing from USB, and
+since this bq24158-like charger has no power path the battery then runs the
+device -- -118 mA within 5 s, `0x01=0x32`, STAT 00, still so after 60 s; HiZ off
+and it charges again (+25 mA).  So `e5-charge` stops with both (`stop_charge 1`
+for charger-manager's bookkeeping, HiZ 1 for the chip), resumes with both off,
+re-applies HiZ each pass while stopped (a replug resets the chip) and clears it
+when it starts and stops -- HiZ left on would run the battery flat.  Verified:
+limit 80 %, at 100 %: -121 mA, the battery discharging towards the resume level.
+A kernel fix for the two flags would make `stop_charge` enough on its own.
+
+### 41.1 "Not charging" while charging: the JEITA start (2026-10-01)
+
+The info screen showed 已充满 below 100 % with the current going in and no
+limit set.  The status was `Not charging` for whole boots: charger-manager's
+`charging_status` held `CM_CHARGE_TEMP_OVERHEAT` ("battery overheat or cold is
+still abnormal" every poll) at 31-33 C.  The vendor's JEITA code starts from
+status 4 -- the top zone, stop as overheat -- with a reference of 25.0 C
+(`jeita_info_init`), and `cm_jeita_temp_goes_up` never lowers the status while
+the temperature is above the reference: a battery warmer than 25 C at probe or
+plug-in stayed "overheat" until it cooled below the temperature of that start.
+charger-manager then disabled the charger in its bookkeeping only (the AW322xx
+went on charging, its CE bit following its own flag, above) -- hence the
+current in with the status `Not charging`.  Fixed in linux-lts-e5 `c1bb703f0`
+(a fresh start takes the zone the temperature is in): `Charging`,
+`charging_status 0` at 33 C from the boot on.  The info screen no longer reads
+`Not charging` as full either (e5-infoscreen `9b015d5`: full at 100 %, charging
+with current in, 未充电 otherwise).
+
+Still open: one boot read the battery temperature at 17.9, 5.2, -7.3, -8.0,
+4.2, 16.6 C between 130 and 173 s, 30 C before and after (the fuel gauge's
+`temp` and charger-manager alike); the next boot with a sampler from 113 s had
+no such dip.
+
+### 41.2 Temperature sources on the running E5 (2026-10-01)
+
+The kernel exposes 25 thermal zones. They are zones, not 25 independently
+verified physical sensors: SoC physical/core/cluster/GPU/multimedia/LTE/NR zones,
+board/PA/charger NTCs, estimated front/back shell temperatures, the aggregate
+SoC zone and battery temperature. At one sample CPU/SoC were about 37 C, GPU
+36 C, LTE/NR 36-37 C, board and RF PA 36-37 C, battery 31.7 C. The charger zone
+read 84.7 C. `sprd_shell_thm.c` computes the front/back estimates from the
+board/PA/charger history; their apparent 43/48 C should not be treated as
+measured case temperatures while the charger conversion remains unverified.
+
+The info screen's overview and temperature details now show nine summaries:
+CPU (maximum core/cluster zone), GPU, SoC, LTE, NR (maximum of the two NR zones),
+multimedia, board, battery and RF PA. A Show more button reveals the remaining
+individual zones in the details page. The
+API converts thermal sysfs millidegrees and power-supply tenths of a degree to
+Celsius, and caches the sample for 5 s. All zone names and readings remain in
+Advanced Info, with the charger and dependent shell estimates labelled as
+unverified. RAM, eMMC and the SD card expose no separate temperature reading
+here; do not relabel the SoC reading as their temperature. These display
+changes do not alter charging or thermal protection.
+
+## 42. Touch under OpenWrt: libudev-zero wants ABS_X/ABS_Y (2026-09-27)
+
+On OpenWrt the panel took no touch: the info screen's cage never saw the
+touchscreen.  OpenWrt has no udev; libinput's device properties come from
+libudev-zero, whose `set_properties_from_evdev()` tags `ID_INPUT_TOUCHSCREEN`
+only for a device with **both `ABS_X` and `ABS_Y`** (plus `BTN_TOUCH`); it never
+looks at the multitouch axes or at `INPUT_PROP_DIRECT`.  `tlsc6x` declares only
+`ABS_MT_*` (`B: ABS=265800002000000`, `PROP=2`) -- udev's input_id accepts that,
+which is why Debian's libinput always had the panel -- so to libudev-zero it was
+no touchscreen, and libinput dropped it.  `kernel/patches/0028`: the driver
+declares `ABS_X`/`ABS_Y` with the MT ranges (`ABS=...2000003`); the events stay
+the multitouch ones, which libinput reads from a device with slots.  Image
+native17 (the module is in the initramfs).  Debian's touch unchanged (checked by
+hand).
+
+**Do not reload an input driver under a running compositor.**  `rmmod tlsc6x`
+with cage holding the device: a kernel warning in cage's context, the kernel
+tainted `B` (bad page), and the reloaded driver's probe failed (`tlsc6x_hw_init`,
+error -1) -- no touch device until a reboot.  A driver in the initramfs is
+tested with a new boot image.
+
+## 43. OpenWrt without Debian (2026-09-27)
+
+OpenWrt in `/openwrt` of the Debian root image needed Debian for more than
+the space: the firmware, the vendor subset and the modem modules came from the
+Debian root (bound in, section 39), and so did the info screen's CJK font.
+The standalone form is a root image of its own on userdata,
+`e5linux/openwrt.ext4` (1 GiB ext4, about 330 MB used), built by
+`E5_STANDALONE=1 openwrt/build-rootfs.sh` with those files inside:
+`/lib/firmware` from `rootfs/overlay/lib/firmware`, `/opt/e5/android` (chowned
+to root: bionic, section 13), `/lib/modules/<release>/modem` from `out_linux`
+(the vermagic has to be the boot image's kernel's), Noto Sans CJK in
+`/usr/share/fonts/e5-noto` (where the directory form binds it).  `mke2fs -d`
+builds the image from the tree, in Docker, without a loop device on the host.
+
+boot/init (image native18):
+
+* the choice moved to userdata: `e5linux/boot-os(-next)` there, read before
+  the old place inside the Debian image (still read when userdata has none,
+  so a device keeps its choice across the update);
+* `openwrt.ext4` is mounted as the root when chosen, or when there is no
+  `rootfs.ext4` -- so removing Debian leaves OpenWrt as the system;
+* `openwrt.ext4.new`, if present, is swapped in first (the old one kept as
+  `.old`): the running image cannot be replaced under itself, so an update
+  from inside it is staged and takes effect at the next boot;
+* userdata is moved into the new root at `/mnt/e5-data` before
+  `switch_root`, for `e5-os` and the installers.  The initramfs busybox has
+  no `mountpoint` applet, and `/proc` has moved by then: a flag set when the
+  mount succeeded decides;
+* `/run/e5linux/init-features` says what this init can do; the installer
+  declines to reboot into an image under an init that cannot start it.
+
+`openwrt/install-standalone.sh` installs from Linux on the device (Debian or
+either OpenWrt; the configuration of the OpenWrt already there is kept, the
+traffic records with it) or from rooted Android over adb, where the first
+boot's APN and hotspot go to `e5linux/openwrt-install.conf` on userdata for
+`90-e5` to take in.  An older init keeps userdata to itself; the installer
+then mounts the partition a second time -- the same f2fs superblock, not a
+second instance.
+
+Verified: Debian boots unchanged with native18; installed from Debian with
+`--try`, OpenWrt ran from `/dev/loop0` with the modem, WAN, hotspot and the
+info screen up on the image's own files, and the one-shot returned to Debian
+at the next boot; an update run inside the standalone OpenWrt was staged as
+`.new` and swapped in at the following boot.
+
+Later the same day, a flash package for other people's E5s
+(`openwrt/make-flash-bundle.sh`, `openwrt/bundle/`).  The image and the boot
+image flashed here cannot be handed on: the firmware and the vendor subset are
+proprietary, the BT pskey carries this unit's address and the Android property
+area its serial number, and the boot image's initramfs embeds the Debian
+overlay (MAC files, hotspot profile).  So the package has the generic image
+(`E5_DEVICE_FILES=0`: the Debian-signed regulatory.db, the modem modules and
+the fonts, nothing of a device), a boot image built without `--overlay`, and
+the pull scripts: `flash.sh` collects the recipient's own files from their
+Android into `e5linux/device-files.tar` on userdata, and boot/init unpacks it
+into the image before `switch_root` whenever the image lacks the WCN firmware
+or the archive changed (a sha256 stamp in `/etc/e5`).  `device-install-image.sh`
+does the same for updates, and makes the archive from the running system's
+files when there is none.  The first boot of an install from Android makes
+Linux the default (`92-e5-default-boot`, `E5_DEFAULT_BOOT=linux`).
+
+The APN: nothing in uficode detects it (it reads the IMSI and names the
+operator).  `e5-apn-auto` takes ModemManager's SIM `operator-code` (46015 on
+this SIM) to the operator's public APN -- cmnet, 3gnet, ctnet, cbnet -- and
+leaves it empty for others (the network assigns its default at attach); it
+runs at every boot while `network.wan.apn_auto` is 1, so another SIM or the
+other slot gets its own.  Checked on the device: a wrong staged APN was
+replaced by cbnet and the WAN came back.
+
+The first flash package failed on this device in two ways, both fixed.  (1)
+`device-install-image.sh` made the archive from the live tree, and the vendor
+chroot has /proc, /sys and /dev mounted inside it: tar walked into them, left
+a 123 MB `.part`, and the image went in without the files -- no modem, no
+Wi-Fi.  It now reads through a non-recursive bind of the root and refuses to
+install an image with no device files.  (2) With the files in the image, Wi-Fi
+still failed ("failed to power on WCN"): the WCN driver asks for its firmware
+as soon as `wcn_bsp` is loaded in the initramfs's module pass (about 12 s),
+from the initramfs, which gets it from the embedded overlay -- and the
+package's boot image has none.  The eMMC is only probed about 9 s into the
+boot, after the pass has begun, so boot/init now copies lib/firmware out of
+userdata's device-files.tar right before `wcn_bsp` (`stage=device-firmware-early`
+at 12.7 s), and the hotspot came up.
+
+## 44. The speaker under OpenWrt (2026-09-27)
+
+`e5-audio-dsp` ran on Debian only; under OpenWrt four things were different.
+
+* **No module index.**  OpenWrt's modprobe knows only its own flat directory,
+  so the modules go in with insmod from `/lib/modules/<release>/audio`, and
+  insmod follows no dependency.  The codec and its power modules link against
+  `snd-soc-sprd-card` (`get_sp_audio_debug_flag`), which was last in the list:
+  the power module failed, and the "loaded?" test matched by prefix, so
+  `..._power_dev` counted as `..._power` and the codec went in without its
+  regulators.  The card now comes right after the PA (its only dependency), the
+  test matches the whole name, and the codec waits for both power modules (the
+  softdep of `etc/modprobe.d/e5-audio.conf`, for insmod too).
+* **No alsaucm** in OpenWrt's alsa-utils: the route is the same UCM file's
+  `cset` lines (the verb, Speaker, Mic), applied with amixer -- 48 controls.
+* **No Python**, so the DSP profile selects (above amixer's clamp) are written
+  by `openwrt/src/e5-ctl-raw.c`, the same ioctl as the Python tool.
+* **"The DSP is already running" was a powered domain**: the route's
+  `agdsp_access_en` keeps the AGDSP domain up with no firmware in it, so a
+  second `start` skipped the image and every open failed ("channel 0 not
+  opened, ... dsp_ready 0", -EIO).  Only an image written since boot counts now
+  (`/run/e5-audio-dsp.started`).
+
+With that, `aplay -D hw:0,3` plays (heard).  `e5-volume`: 16 levels on
+`VBC DAC0 DG Set` (1.5 dB a step, so 3 dB a level), level 15 = 39, the media
+gain of the device's own Android, level 0 = 0 (mute); the info screen's volume
+keys step it.  `/etc/init.d/e5-audio` brings the card and the DSP up at boot and
+restores the level (checked across reboots).
+
+## 45. Bluetooth headphones under OpenWrt (2026-09-27)
+
+The link came up at once (`btattach -B /dev/ttyBT0 -S 3000000`, the kernel's
+vendor setup, bluetoothd), scanning worked; a pair of Redmi Buds 6 took five
+faults to play, each hiding the next:
+
+1. **A search running during the pairing** kept it from completing on this
+   chip: the link came up and a link key was made, the pairing never
+   finished.  `e5-bt-connect` stops any search first (the discovery belongs
+   to the bluetoothctl that started it).
+2. **Not bondable**: the E5 itself sent "No Bonding" in its IO capability
+   reply (btmon), so the key was not kept.  bluetoothd sets the adapter
+   bondable when pairable: `AlwaysPairable = true` (94-e5-bluetooth).
+3. **The headphones' own connection needed an agent**: the moment the pairing
+   was done they opened A2DP themselves, an untrusted device's connection is
+   authorised by an agent, the pairing's bluetoothctl had gone ("a2dp.c:
+   auth_cb() Access denied: org.bluez.Error.Canceled"), and they dropped the
+   pairing ("Authentication Failed" from then on).  Trusted before pairing.
+4. **The SDP answer was dropped**: the Buds send 679-byte SDP PDUs over a
+   channel whose MTU is the default 672, the kernel drops them ("Dropping
+   L2CAP data: receive buffer overflow"), the service search never finishes and
+   no profile connects ("br-connection-create-socket").  BlueZ has
+   `SDP_LARGE_MTU` (1013) for one Sony controller that does the same;
+   `rootfs/deb-patches/bluez-01-sdp-large-mtu.patch` uses it for every device
+   (a larger MTU offer is always within the specification);
+   `openwrt/build-bluez.sh` builds OpenWrt's bluez with it (r902).
+5. **No sink**: OpenWrt's PulseAudio init passes `--disallow-module-loading`,
+   and a connecting headset's sink is a module loaded then
+   (module-bluez5-device).  `/etc/init.d/e5-pulseaudio` runs it without.
+
+Then the speaker went silent through PulseAudio (after a Bluetooth
+disconnection, and in fact always): measured with the device's mic playing a
+440 Hz tone -- the Goertzel method of 34 -- it came back from aplay and from
+PulseAudio with `tsched=0` or `mmap=0`, not from the default (timer-based
+scheduling over mmap).  The speaker sink has `tsched=0`: period interrupts,
+the kernel's period timer (0013), as aplay uses them; two streams in a row
+both measured.
+
+The model string: `+IMSREGADDR:<the IMS addresses>` came in while ModemManager
+read AT+CGMM and was stored in front of V1.0.1-B7 (shown as an IPv6 address).
+The unisoc plugin ignores `+IMSREGADDR:` and `+SPNRINDICATE:` now
+(modemmanager-01); the OpenWrt package carries an E5 revision in its release
+(r909) so apk takes a rebuild for a new package.  After ModemManager restarts,
+netifd does not bring the WAN up by itself: `ifup wan`.
+
+## 46. A module-load watchdog panicked the first boot of an update (2026-09-27)
+
+The first boot after an update (flash.py --update) came up in Android.  pstore
+(`/sys/fs/pstore/dmesg-ramoops-0.enc.z`, read from Android, raw deflate):
+
+    Kernel panic - not syncing: sprd_dmaengine_pcm.ko loads too long time,
+    panic timeout = 2000 ms
+      panic <- sprd_modules_exit [native_hang_monitor] <- call_timer_fn
+
+`native_hang_monitor` (drivers/unisoc_platform/sysdump) carries, besides
+Android's native hang monitor, a module notifier that arms a 2 s timer at
+MODULE_STATE_COMING and panics if MODULE_STATE_LIVE does not follow --
+MODULES_TIME_OUT, no parameter.  e5-audio-dsp's last insmod, sprd-dmaengine-pcm,
+completes the sound card, and the card's whole probe runs inside that init; on
+a busy first boot (uci-defaults, the image just swapped in) it passed 2 s.
+The panic's sysdump boot used a try of slot b, and LK fell back to Android
+(section 32).  Earlier boots of the same image were under the limit: a race.
+`boot/module-order.skip` leaves the module out of the initramfs (stage-modules.sh
+filters the generated order); nothing depends on it.  Recovered from Android with
+boot/flash-trial.sh and the rebuilt boot image; the updated image, its settings
+and the installed apps were all there.
+
+
+## 47. Two SIM cards, and a CP that asserts without a band lock (2026-09-28)
+
+Mainline 6.18 trials under OpenWrt, SIM 1 China Broadnet (46015), SIM 2 China Mobile
+(46000); the Android side was read with the RIL's AT log (47.8).  Result: the modem
+switches between the cards (`e5-sim`, the info screen, ModemManager's SIM slots), data
+on `sipa_eth0` for the first card and `sipa_eth8` for the second.
+
+### 47.1 Channels are not cards; `AT+SPACTCARD` is
+
+The vendor RIL opens `stty_nr0`-`5` (and 13, 14), rings 0-2 for the first card and
+3-5 for the second, and the guess was that the ring picks the card.  It does not: on
+ring 4 `+CIMI`, `+CCID` and `+CGSN` answered for the first card.  A command reaches a
+card through **`AT+SPACTCARD=<card>` as a prefix on the same line**
+(`AT+SPACTCARD=1;+CIMI`, as UFI-TOOLS' `RootSttyAT.kt` sends every command), and the
+card **sticks to the channel** until a power change: a bare `AT+CIMI` right after
+answers for the card named last.  urild itself never sends it (not a string in any of
+its libraries).  `sipc_wwan card=<n>` (linux-lts-e5 `9ec968c3b`) puts the prefix in
+front of every `AT+` command a port sends, except one that names its card already;
+with `card=` set on both cards' ports, a channel left on the other card cannot
+mislead ModemManager (it did once: the first card's port without the prefix read the
+second card's SIM, and e5-apn-auto kept the wrong APN).
+
+The **URCs are per card**: the first card's on ring 0, the second's on ring 3.  Both
+rings have to be read.  With the port on ring 4 and nothing reading ring 0, the CP's
+AT server stopped answering everybody within a minute or two, with no assert, until
+the CP was reset; `sipc_wwan` now drains the other card's URC ring (`cfbb848c9`), and
+ring 4 then answered for 5.5 minutes and on.  **Correction:** the first hang of the
+day was put down to a bare `AT+SPACTCARD?`; it was this undrained ring.
+
+### 47.2 The band lock is per card, and a card without one asserts the CP
+
+    Modem Assert: DRM_SPR_RF Task  PHY CP assert in file drm_rfresourcehandle.c
+    line 3925 exp=0 info=[Drm allocate spr rf path fail! res_type=16,
+    <rat,band,rx,tx>:0x68a0201 0x6290400 0x0 0x0 0x0, is_nr_ant_reduce:0,0 ]
+
+came 10-25 s after the second card's data connection came up, every time -- on Linux
+and, it turned out, **on Android too**: with the new card as Android's data card the CP
+reset every 15-30 s (the 12:20 capture already had two).  The observed requirement for this
+device: the baseband (likely its hardware) needs a band lock on every card -- China
+Broadnet and China Mobile on n28 or n41, or they may not register at all; the validated configuration
+uses b1+b41 and n41+n78.  `AT+SPLBAND` is per card:
+
+    AT+SPACTCARD=1;+SPLBAND=0    +SPLBAND: 0,256,0,1,0      LTE b1 b41
+    AT+SPACTCARD=1;+SPLBAND=3    +SPLBAND: 0,0,0            NR: none -> the asserts
+    AT+SPACTCARD=1;+SPLBAND=2,0,0,272,0                     NR n41 n78
+
+The first card had its lock, the freshly inserted second one had LTE but no NR lock.
+With both locked: two minutes of data on the second card, both cards on NR SA, no
+assert (Android), and none on Linux since.  A lock programmed with the configuration tool survived
+the reboot; one sent by hand over `/dev/stty_nr6` on Android was gone at the next CP
+reset.  `e5-sim` warns about a card with no NR lock and never writes one.  Note: the
+info screen's "默认频段" (NR unlocked) is exactly what this device must not do.
+
+### 47.3 Bringing both stacks up: two more asserts, and the order that has none
+
+    T_P_ATC PS CP assert in file mnphone_api.c line 7048
+    T_P_ATC PS CP assert in file mnphone_api.c line 7038
+
+* **7048**: one card's protocol stack brought up (`+SFUN=4` from `+CFUN: 0`) while the
+  other card is attached.  Every time, and in Android's command order too.
+* **7038**: both stacks brought up from a fresh CP without the cards' work modes
+  (`+SPTESTMODEM`).
+* No assert: from a fresh CP (both at `+CFUN: 0`), as the RIL does after a restart --
+  both SIMs on (`AT+SPACTCARD=<n>;+SFUN=2`), each card's work mode
+  (`+SPTESTMODEM=<mode 1>,<mode 2>`, the modes `+SPTESTMODE?` holds), the data card
+  (`+SPSWDATA` on that card), then both stacks, the first card's first.  Both register;
+  the stacks then stay up, and moving the port to the other card never brings a stack
+  up from off.
+
+`AT+SPSWDATA` makes the card it is sent for the one that carries data (`+SPSWDATA?`
+reads it; the CP starts on the first card).  Android sends it on the target card's
+channel for `setPreferredDataModem`, then `CGACT=0`, `CGDCONT`, `CGPCO`, `CGEQREQ`,
+`CGDATA="M-ETHER",1` -- no `CGACT=1`; the plugin's `CGACT=1` then `CGDATA` works as well.
+Not on this CP: `AT+SPSWITCHDATACARD` (the old RIL source's primary-card switch) is
+`+CME ERROR: 4` in every state, and `+SPTESTMODE=<m1>,<m2>,1` answers OK and changes
+nothing.  (`persist.vendor.radio.primarysim` is 1 on Android while its data card is the
+second one; no AT for it was seen.)
+
+### 47.4 The second card's data interface is `sipa_eth8`
+
+The RIL's log names it (`Net interface addr linker = sipa_eth8`, `socket_id= 1`): SIPA
+net id 8 for the second card's context 1, as net id 0 (`sipa_eth0`) is the first
+card's.  No AT names it -- the old source's `AT+SPAPNETID` is not in this RIL.  On
+Linux: bearer up, `sipa_eth8` with the `+CGCONTRDP` address, IPv4/IPv6 ping, DNS and
+HTTP through it.  (An earlier try that saw nothing on any of the 16 interfaces was the
+47.2 assert tearing the bearer down seconds after it came up.)  Also: `sipa_eth`'s
+debugfs `stats` prints `tx_errors` in the `rx_errors` field.
+
+### 47.5 The switch
+
+* `sipc_wwan card=` from `/etc/config/e5-sim` (`e5-sipc-wwan`; the 5.15 build has no
+  `card` parameter and loads without it for the first card);
+* the unisoc plugin (patch 01, OpenWrt release E5REV 5): the 47.3 bring-up from
+  `+CFUN: 0`, `+SPSWDATA` before every dial, context 1 on the modem's own net port (not
+  `sipa_eth0` by name), and **SIM slots**: both cards listed (the other one's ICCID and
+  IMSI read with its prefix), `SetPrimarySimSlot` runs `e5-sim` (detached: it restarts
+  ModemManager).  LuCI's ModemManager page shows both then;
+* `26-e5-sipa-eth` hands the card's interface to ModemManager and withdraws the other
+  card's from its event cache (both are tagged as the modem's net port);
+* `e5-sim <0|1>`: `ifdown wan`, stop ModemManager, the port for the other card, start
+  ModemManager, the card's APN (`e5-apn-auto`), `ifup wan` -- about 45 s, no CP reset;
+  `e5-sim` alone lists both cards and their band locks.
+
+Seen on the device: SIM 1 -> 2 from the info screen, 2 -> 1 with `e5-sim 0`, 1 -> 2 with
+`mmcli --set-primary-sim-slot=2`, and a fresh CP straight onto the second card; data
+each time, no assert.  The second card has no own number: `AT+CNUM` is `Not found` on
+it (the SIM holds no MSISDN), so ModemManager shows none.  Its ICCID has an `F` in it
+(`898600642825F7137081`), as on Android.
+
+### 47.6 CP resets in seconds: `e5-modemd`
+
+`modem_control` waits for the CP log daemon's `SLOGMODEM DUMP COMPLETE` before it resets
+an asserted CP -- 300 s without one (section 30).  `openwrt/src/e5-modemd.c` is that
+client on the abstract socket `@modemd`: it answers every `Modem Assert` (and `Modem
+State: Assert` for a client that connects during one) and `Modem Blocked`, which
+`modem_control` resets after the same dump ("block, later reset").  Reset to `Modem
+Alive` in 4-5 s, a dozen times today.  `e5-modemd blocked` sends `Modem Blocked` itself:
+a CP reset on demand, for an AT server that hangs without an assert.  (It first
+answered only `Assert`, and a `blocked` then sat unanswered.)
+
+### 47.7 Traps on the way
+
+* ModemManager without udev reads only rule files named `77-mm-*` to `80-mm-*`
+  (`mm-kernel-device-generic-rules.c`): OpenWrt's `78-e5-mm-sipc.rules` had never been
+  read -- neither its tty ignore nor, later, the `sipa_eth8` tags.  Now
+  `78-mm-e5-sipc.rules`.
+* The trial root was older than the repository: its `e5-sipc-wwan` still insmodded
+  `wwan.ko`, which does not exist on mainline (built in), exited 1 and never loaded
+  `sipc_wwan` -- the "did not load it by itself" of the M4 re-check.
+* The info screen's WebKit keeps its HTTP cache in `/tmp/run/e5-infoscreen/.cache`,
+  which outlives the session; uhttpd sends no `Cache-Control`, so a restarted page ran
+  the old `app.js` until the next boot.  The session clears `WebKitCache` at start.
+* The first `CFUN=0` then `CFUN=1` of the day brought a hot-inserted SIM back (`+CPIN:
+  READY`), unlike section 37's note that nothing does within a boot.  Only seen once.
+* SIM hot plug is not handled: the plugin drops the CP's `+ECIND: 3,<v>` (the RIL's
+  hot-plug report) with its other unused URCs, so a card inserted while running is not
+  seen until the CP reads it again.  Not finished: the CP's report on a real plug was
+  not captured.
+
+### 47.8 Reading the Android RIL's AT log
+
+The AT lines (`RIL-AT`) are logged only when urild starts on a `userdebug` build:
+
+    logcat -G 16M -b radio
+    resetprop ro.build.type userdebug
+    logcat -b radio -v time > /data/local/tmp/radio.log &    (before the restart)
+    setprop ctl.restart vendor.ril-daemon
+    sleep 5; resetprop ro.build.type user
+
+The default 256 KiB radio buffer loses the init sequence within a minute.  `pkill -f`
+with a pattern that is on the running shell's own command line kills that shell (and
+the `resetprop` after it).  For AT on Android next to urild: `/dev/stty_nr6` is free
+(urild holds 0-5, 13 and 14; other daemons 21, 28, 31).
+
+## 48. Userdata's F2FS damaged under mainline, three times; the power off (2026-09-29)
+
+### 48.1 What was found
+
+Three times the userdata F2FS (`mmcblk0p70`, plain F2FS, Android 13's) came back from
+a reset or power cycle under the mainline kernel with metadata blocks that hold an
+**older version of some metadata** -- never under the vendor 5.15 kernel (Android).
+Evidence under `logs/noboot-20260929/` (`meta*.bin` are the first 154 MiB: SB, CP,
+SIT, NAT, SSA; `third/` the third one).
+
+1. **First** (found 2026-09-29 morning; Android stayed on its logo, Linux fell to the
+   rescue): NAT block 0's current copy (`0xa00`, the root inode nid 3 in it) held a
+   SIT block, NAT block 5 too.  The root inode unreachable: the whole `/data` gone.
+   Userdata was formatted in TWRP.
+2. **Second** (the same day; after an OpenWrt reboot that left userdata dirty, the
+   root being a loop image in it): NAT block 1's current copy (`0xa01`) held a
+   checkpoint block of an older checkpoint (version `...119`, elapsed 1972 s, about a
+   minute before the reset), NAT block 4's (`0xa04`) an older SIT block 1.
+   `/data/e5linux` (nid 476, NAT block 1) listed by its parent but not found.
+3. **Third** (the next boot after a *clean* power off -- remounted read-only, CP
+   `0x45` `CP_UMOUNT`, reliable writes already off, section 48.3): the mount failed,
+   `Current segment's next free block offset is inconsistent with bitmap, logtype:1,
+   segno:2521, type:0, next_blkoff:19, blkofs:19` (-EUCLEAN).  Android's fsck.f2fs
+   then found 4423 blocks in use that the SIT has free, all in segments 2510-2521 --
+   one SIT block (#45, segments 2475-2529) read back as a version from before those
+   segments were written, while the checkpoint written after it was the new one.
+   fsck fixed it; Android boots.
+
+What is common: the damaged blocks are F2FS metadata written by mainline in its last
+checkpoints before a power cycle, read back afterwards as an *older* content (of
+themselves, or of another metadata block); the checkpoint that followed them is
+there.  That is what a write cache that loses writes it had acknowledged looks like
+-- or an eMMC mapping that went back to stale pages.
+
+### 48.2 What was tested, and is not it
+
+* `blackbox` (`mmcblk0p48`, backed up to `logs/noboot-20260929/blackbox-mmcblk0p48.img.gz`)
+  as a raw target: self-tagged 4 KiB blocks, random writes of 1-16 blocks, a quarter
+  O_DSYNC (REQ_FUA), fdatasync now and then, reset in the middle -- 4 x `reboot -f`
+  and 3 x SysRq-B, 36 000-58 000 writes each: no block ever held another block's
+  data (`work/mmctest/tagwrite.c`).  **It could not see the failure of 48.1**: an
+  older generation of the same block counted as fine.  The test to do (STATUS):
+  everything written and flushed, then the power cycle, then every block must be the
+  last generation.
+* **The durability test (2026-09-29, `upstream/init-durability` + `upstream/tools/blkgen.c`;
+  `logs/durability-20260929/`): flushed data is not lost.**  On `blackbox` (500 MiB,
+  127 743 blocks of 4 KiB, backed up first), each cycle wrote a new generation to every
+  block in a random order through the page cache, `fdatasync` (the cache flush), marked
+  it done, flushed again, then ended the boot; the next boot, under 6.18.54 at
+  `1684c0ccb` with userdata never mounted, read every block back.  4 x `poweroff -f`
+  (the PMIC power off; the cable in, back up in charger mode), 2 x `poweroff -f -n` with
+  4000 blocks written after the last flush, 2 x `reboot -f`, 2 x SysRq-B: every block
+  held the generation flushed last, every time (the 4000 unflushed ones had landed as
+  well); no torn block, none with another block's data.  So neither the power off
+  nor a reset loses what the kernel flushed on this eMMC path, and 48.4's eMMC
+  differences are not what corrupts userdata by themselves -- which fits 48.1 better
+  anyway: the damaged blocks held *other* metadata blocks' contents (a NAT block
+  holding a SIT or a checkpoint block), wrong data at the right place rather than a
+  lost write.  Next: the F2FS side (STATUS).
+* **The F2FS test (2026-09-29, `upstream/init-f2fstest`; `logs/durability-20260929/
+  f2fs-run-log.txt`): no damage in 30 cycles.**  `blackbox` formatted as userdata is
+  (static f2fs-tools 1.16: `encrypt verity extra_attr project_quota quota_ino casefold`,
+  utf8 -- the same feature word, 0x1499), mounted with boot/init's options
+  (`noatime,nodiratime`, mainline's defaults otherwise, discard among them), a 200 MiB
+  ext4 image in it on a loop device with `noatime` as OpenWrt's root; each cycle 90 s
+  of load (small files with fsync, rename over and deletes in the ext4 image, larger
+  files with fsync and a growing log straight in F2FS, directories and `sync`), then a
+  `reboot -f` or (every fourth) `poweroff -f` with everything mounted; before each mount
+  a dry-run `fsck.f2fs -f`.  30 cycles: every fsck clean, every mount fine, from the
+  fourth on every checkpoint `CP_UMOUNT` as in 48.1's third and fourth damage; one
+  uncontrolled power loss (a hang of the test's own) came back clean as well.  What the
+  test did not have of the real userdata: 22 GiB used and aged rather than a fresh
+  500 MiB, Android's own writes in between (encrypted and casefolded directories, the
+  5.15 kernel's F2FS -- in all four cases Android had written the filesystem before
+  Linux did), runs of 20 minutes and more.
+* Earlier (sequential, parallel random, FUA checkpoint stress with verification) and
+  one Linux -> Android reboot: clean.
+* Reliable writes: the vendor kernel strips `REQ_FUA` from every mmc0 request
+  (`sdhci-sprd.c`, `mmc_hsq_status`), so Android never issues one; mainline did for
+  every checkpoint.  Off since linux-lts-e5 `155c85bc4` (`MMC_CAP2_NO_REL_WR`): the
+  third damage happened with them off -- not the (only) cause.
+
+### 48.3 What changed on the way
+
+* **The power off** (linux-lts-e5 `262b225ba`): mainline had no PMIC power-off; a
+  `poweroff` fell to PSCI SYSTEM_OFF, which this firmware takes as a reset ("Reboot
+  into normal"): the E5 came back.  `sc27xx-poweroff` now knows the UMP9620
+  (`sprd,ump9620-poweroff`, PWR_PD_HW `0x2020`, SLP_CTRL `0x2248` LDO_XTL_EN and
+  SLP_LDO_PD_EN cleared first, from the vendor driver).  LK logs it as
+  `pwroffcause="write pwroff"`.  With a charger connected the PMIC powers the E5
+  up again at once (`bootcause="in charging during shutdown the devices"`,
+  `sprdboot.mode=charger`) -- Android shows its charging screen there; boot/init
+  boots the system (configured behaviour), so a power off is a real one only without
+  the cable.
+* **Filesystems read-only before a reset** (linux-lts-e5 `1684c0ccb`,
+  `CONFIG_REBOOT_REMOUNT_RO`): OpenWrt cannot unmount its root (a loop image in
+  userdata), so userdata was left dirty under every reset.  A reboot notifier now
+  syncs and remounts every block filesystem read-only, the last mounted first.
+  boot/init logs userdata's last checkpoint before mounting it
+  (`stage=data-last-cp ... clean-unmount|dirty`): clean after every reboot and power
+  off since.
+* The early firmware pass mounts userdata `ro,norecovery` (it only reads
+  `device-files.tar`).
+
+### 48.4 Differences to the vendor kernel still in play
+
+The mainline eMMC path is not the vendor's in: HSQ (vendor: its own `swcq` for mmc0,
+`supports-swcq` in the DT), the cache (enabled by mainline's `mmc_init_card`; the
+vendor's handling unchecked), the shutdown sequence (flush, POWER_OFF_LONG, then the
+vmmc regulator and the PMIC), discard (the vendor sets mmc0's discard granularity to
+the preferred erase size), and the mount options (Android: `fsync_mode=nobarrier`,
+`checkpoint_merge`, `reserve_root`).  The eMMC: manfid `0x37`, 29.1 GiB, HS400ES.
+
+### 48.5 The fifth time (2026-10-01), with no Android in between
+
+Evidence: `logs/linux-fail-20261001/` (`userdata-meta-39424blk.img.gz`, the
+first 39424 blocks -- SB, CP, SIT, NAT, SSA -- read in the rescue before Android's
+fsck ran; the rescue's dmesg; boot_b's persistent log).
+
+* The boots before it were Linux only.  The E5 ran the SD card system (userdata
+  mounted read-write at `/mnt/e5-data` the whole session, as boot/init did then).
+  A test boot image had a kernel without the SD slot (`upstream/out-release` was
+  still `1684c0ccb`, the card support is `2019815f2`/`af5e09329`): no card, so boot/init
+  took the OpenWrt image on userdata -- a loop root in the F2FS, read-write, about
+  30 minutes of use.  Before it `stage=data-last-cp ver=24dbb8b flags=0x45
+  clean-unmount`; it ended with a `reboot` (the read-only remount of 48.3).
+* The next boot: `data-last-cp ver=24dbb98 flags=0x45 clean-unmount`, and every
+  mount -- the early `ro,norecovery` one included -- failed with
+  `SIT is corrupted node# 8264 vs 4132` / `Failed to initialize F2FS segment
+  manager (-117)`: the SIT's valid node blocks summed to exactly **twice** the
+  checkpoint's valid node count.
+* So Android writing the filesystem in between (48.2's open point) is not needed:
+  two Linux sessions in a row, the last one a loop root under load, then a clean
+  checkpoint, then a damaged SIT.  The doubled count is a lead for the dump: node
+  segments counted twice -- a SIT block holding the entries of another (as 48.1's
+  NAT blocks held other metadata), or the SIT journal and a SIT block both carrying
+  them.
+* Android's fsck repaired it at the next boot (2026-10-01;
+  `android-fsck-dmesg.txt`, cut by the kernel's log buffer): at least 3047 blocks
+  in use whose SIT bitmap said free, all in segments 993-1034 -- **all inside one
+  SIT block** (#18, segments 990-1044, 55 entries a block), and their summaries
+  rewritten.  The third time's were in one SIT block as well (#45).  So both times
+  one SIT block read back older than the checkpoint written after it.
+
+## 49. The SD card install, and why `--update` cannot update it (2026-09-30)
+
+`flash.py`'s first install -- its default since 2026-09-30 -- puts the root on
+an SD card: GPT, one Linux partition only as large as the image, the image
+written onto the partition, so the partition *is* the root filesystem and
+boot/init mounts it straight.  The marker `/etc/e5/sd-root` is what tells the
+card from the eMMC ("removable" cannot be asked of this controller: both mmcblk
+devices report 0), so the card may move between units.  The only write outside
+the card is `e5linux/boot-os` on userdata, a few bytes naming the boot target
+(`sd` for the card, `openwrt` for the image on userdata; the last install wins,
+and the card is the fallback when userdata names nothing, so a card whose
+userdata cannot be mounted still boots).  `--data` is the form before the card
+(the image in `/data/e5linux`).  Measured on the E5: the card installs and
+boots -- `findmnt /` = /dev/mmcblk1p1 ext4, mc1 at 208 MHz UHS SDR104, 13.4 GiB
+of the card left free.
+
+`--update` was written for the userdata form and cannot update a card install;
+it refuses with a message rather than update the wrong system.  The mechanism,
+step by step:
+
+* `openwrt/device-install-image.sh` hardcodes its target -- `D=/mnt/e5-data`,
+  `IMG=$D/e5linux/openwrt.ext4`.  A card system has no such file: what it has
+  is the card's partition, mounted as `/`.
+* Called on a card system it sees `/etc/openwrt_release` with
+  `image-form=standalone`, takes the `running_image` path, and writes the new
+  image as `openwrt.ext4.new` on userdata; `flash.py`'s update then writes
+  `boot-os = openwrt`.
+* boot/init's `.new` swap exists only for that userdata file, and with
+  `boot-os=openwrt` and the image mounted it takes the userdata branch -- the
+  card branch wants `boot-os` empty or `sd`, or no other system found.
+* So the update would land a *second* system on userdata, leave the card (the
+  currently running one) at its old version, and move the boot there.  Settings are
+  kept (the installer copies the running configuration into the new image), but
+  the target is wrong -- which is why the refusal is in place instead.
+
+Two ways to make an SD install updatable:
+
+* **A.** Stage the new image on userdata (`openwrt.ext4.new` as now, settings
+  kept by the installer as now), and let boot/init write it onto the card's
+  partition before it mounts anything, then remove the staging file.  Wants
+  ~1 GiB free on userdata while it runs, freed after the swap.
+* **B.** Write the new rootfs in place over the mounted card root, at file
+  level: fewer parts, but it rewrites the filesystem it is running from.
+
+Either needs a `boot.img` and a package built and one device test.
+
+### 49.1 The update as built (2026-10-01): the card's second root partition
+
+Neither A nor B: A puts a gigabyte of writes back on userdata, which is what the
+card install is there to avoid (48), and B rewrites the running root.  Instead the
+card holds more than one root:
+
+* `device-install-image.sh` on a card system writes the new image into another
+  root partition of the card (`e5root*`; the oldest generation, a failed trial or an
+  unmarked one first, never the running one), created in the card's free space when
+  there is none that fits -- by `/usr/libexec/e5-gpt`, a GPT editor in ucode (OpenWrt
+  has no sgdisk; the backup table first, then the primary; checked with `sgdisk -v`).
+  The kernel cannot re-read the table of a card whose partition is mounted, so the
+  image goes through the whole disk at the partition's offset and is mounted through
+  a loop device at that offset; the new partition gets its node at the next boot.
+  The superblock is zeroed first, the configuration and the device's files copied in
+  as on userdata, and the marker (`/etc/e5/sd-root`) is written last, with
+  `/etc/e5/sd-gen` (the running one's + 1) and `/etc/e5/sd-trial`.  70 s for 1 GiB.
+* boot/init boots the highest generation among the marked card roots.  A trial is
+  set to 0 as it boots and `e5-boot-ok` removes it once the system is up; one found
+  still at 0 is passed over, so the previous root boots again with its settings.
+* boot/init waits for the card, up to 10 s, when `boot-os` says `sd` or userdata
+  names nothing (a damaged userdata names nothing): looking before the userdata
+  image instead of after it, it ran before `mmcblk1` appeared.
+* A card system mounts userdata read-only (48): read-write only for a system that
+  lives there (kept for tests) or to take a one-boot choice off it.
+
+### 49.2 Repeated updates and the multi-system boundary (2026-10-01)
+
+Ordinary updates reuse the other sufficiently large `e5root*` partition;
+they do not create a new partition on every update. The current card has
+`e5root` (1 GiB) and `e5root2` (1.25 GiB). If neither inactive candidate fits
+a larger future image, the updater allocates another with 256 MiB of headroom.
+
+This is one system with rollback roots, not multiple independently maintained
+systems. The updater identifies candidates by `e5root*` names and the boot
+selector compares generations across all marked roots. A second OS using those
+markers could be overwritten or selected accidentally. Rootfs rollback also
+does not roll back `boot_b`, which the bundle updates separately. Multiple
+systems need explicit system IDs, partition identities and separate A/B pairs;
+the design and its shared-kernel constraint are in `openwrt/MULTIBOOT.md`.
+
+## 50. LuCI SMS layout, ttyd's LAN bind and Wi-Fi QR codes (2026-10-01)
+
+The Argon theme gives headings and default form labels widths that do not suit
+the SMS page's ad-hoc layout. The inbox refresh button was pushed against the
+card edge, the compose labels left large gaps, and the forwarding description
+was outside the card. The view now has scoped CSS, a header toolbar, a compact
+compose form and a forwarding card containing its description and template
+help. No SMS transport or forwarding semantics were changed.
+
+Installing ttyd with its default `interface '@lan'` resolved the logical
+network to `br-lan`; libwebsockets selected the first address added to that
+bridge, the initramfs compatibility address `192.168.77.1`. Nothing listened on
+`192.168.9.1:7681`. `e5-ttyd-bind` changes that logical bind to
+`network_get_ipaddr` (netifd's primary address), skips startup if no address is
+ready, and an interface hotplug hook rebinds on up/down/address updates. The UCI
+setting remains `@lan`, so a changed LAN does not require editing ttyd's address.
+The optional package's service gets the adjustment at build/boot and interface
+events. Device test: an isolated test LAN changed from `198.18.0.1` to `.2`;
+ttyd moved its listener automatically. The real LAN was not changed.
+
+The info screen's Wi-Fi QR generator used `wifi_config().secured`, a field
+that only `wifi_status()` had computed. It was therefore always false and
+encoded protected hotspots as `WIFI:T:nopass`, omitting the password. The
+configuration now supplies the security flag; QR output includes security,
+escaped SSID/passphrase and the hidden flag. It uses a four-module quiet zone.
+The frontend also invalidates its QR on wireless configuration changes and
+on opening the hotspot page; previously only an SSID change refreshed it.
+Native ucode checks cover protected/open/hidden networks, missing passwords
+and special characters.
+
+### 50.1 A nonempty SMS inbox failed in the ID parser (2026-10-01)
+
+The user sent a test message: ModemManager listed `/SMS/0` as received and
+`e5-sms-notify` saw its Added signal, but LuCI could not read the inbox.
+`e5-sms list` failed inside `sms_id()` with "Repetition not preceded by valid
+expression": its optional path prefix used PCRE's `(?:...)` syntax, which
+ucode's POSIX regex implementation rejects at runtime. An empty inbox never
+called this function, so the previous empty-list checks missed it. The same
+parser is used by delete and forwarding.
+
+The parser now strips the exact ModemManager SMS path prefix and validates the
+remaining decimal ID. The command-line and RPC lists both read the real test
+message, with its text and sender matching ModemManager. The RPC wrapper keeps
+stderr in failures instead of returning only "e5-sms failed"; the frontend no
+longer labels every failure as a missing SIM. `openwrt/tests/sms-list.sh` uses a
+private fake mmcli to cover a nonempty and empty inbox, object paths including
+ID zero, UTF-8 text with quotes/newlines, directions and newest-first sorting.
+
+## 51. Status audit and deferred scope (2026-10-01)
+
+STATUS is a work list, not a second history. Completed SD updates and rollback,
+userdata read-only operation, current-card SMS reception/listing, charging-status
+display/JEITA startup, temperature summaries, app/settings merge, ttyd's dynamic
+LAN bind and Wi-Fi QR encoding are recorded in their sections above. They no
+longer need implementation tasks in STATUS; physical tests and unresolved sensor
+readings remain separate.
+
+Remote branch heads were checked: e5-linux, e5-infoscreen, infoscreen-plugins and
+linux-lts-e5 all matched the corresponding local heads at the start of this
+audit. The claim that none had been pushed was stale. The info screen's v1.1.0
+release is already public with its tarball and latest.json; the original first
+release/upload task is complete. New fixes need a newer version for the device's
+version comparison to offer them.
+
+The app store repository exists and its application check/build pass. The first
+`store` run failed at `actions/configure-pages`: Pages had not been enabled then.
+The later generic Pages deployment succeeded but did not publish the generated
+store index. Pages now reports `build_type=workflow`; the failed store job was
+rerun successfully: the public index and package both downloaded, with size and
+SHA-256 matching the index; the device fetched one app (bigclock). This was
+deployment state, not a package-builder failure. The workflow gains a manual
+trigger and uses Pages' actual base URL.
+
+### e5-modemd is optional abnormal-state recovery
+
+Historical snapshot: the 2026-10-15 shared recovery fix now enables this helper
+for E5, T551M and M8. See `MODEM-ASSERT-RECOVERY-20261015.zh-CN.md` for validation
+and deployment boundaries. The disabled state described below is retained as
+the history explaining the missing dump acknowledgement.
+
+The binary and procd script are installed, but there is no enabled rc.d link and
+no e5-modemd process. The vendor modem_control is running and owns @modemd.
+Normal modem startup/data do not require e5-modemd. Its purpose remains specific:
+the vendor reset path waits for SLOGMODEM DUMP COMPLETE after an assert/block,
+historically 300 s without a client; section 47.6 measured 4-5 s when the helper
+answered. No other component in the current tree sends that acknowledgement.
+It skips collection of a CP crash dump and does not replace ModemManager.
+It remains an optional, currently disabled helper.
+
+### Deferred observations, not claims of fixes
+
+* Deferred Debian/Phosh items: idle blank versus session locking (18),
+  /dev/null permissions (37.3),
+  desktop portal backend selection, the CP dump client on Debian, and the
+  unisoc-cpd 72 h soak remain deferred. The maintained modem stack is MM/netifd.
+* The earpiece test was silent and its hardware existence is unknown; further
+  validation is deferred. Call signalling works, but call audio is postponed.
+  SIM hotplug and simultaneous reception from both cards are not implemented.
+* The one 2026-09-25 flash-from-linux reboot straight into Android is still
+  unexplained. Later flash.py updates worked; that does not establish the cause
+  of the older event. It is historical evidence, not an active release blocker.
+* Audio's guarded AGCP-access loss (32), the non-primary AP capture FE stall,
+  VBC device-change rejection, headset regulator warnings, DPU blank warnings,
+  and bogus advertised hotspot rates are not all resolved. Normal speaker/main
+  mic operation is verified; these observations should be investigated if kept
+  in scope or reproduced, not relabelled as solved.
+* AP+STA concurrency is unavailable; the hotspot currently shares cellular WAN.
+  GPU scanout uses vendor KMS dumb buffers and its frequency is pinned at index 3
+  (384 MHz). Full pinctrl, frequency scaling, GSP and the USB/debug pin mux are
+  enhancements rather than completed milestones. System suspend is blocked by
+  the SIPA data path. The SD slot itself is now implemented and used as the root.
+
+## 52. Overview update notification and serialized jobs (2026-10-01)
+
+Info screen 1.3.0 adds a non-modal notice on the overview when a newer release
+is available. Release notes expand into a scrollable region, navigable with
+touch or the keypad. Update now starts the existing verified installer; Later
+saves the offered version and a 24-hour reminder deadline in UCI. Another
+release is not hidden by the earlier deadline. Checks run in the background,
+normally every six hours with a ten-minute retry after failure, without waking
+a blank or key-locked screen. Settings and the overview share one update API.
+
+The API reserves a job slot before spawning the shell worker: reserving only
+inside the worker left a gap in which two HTTP requests could both be accepted.
+A token hands the reservation to the worker. The worker runs private copies of
+the launcher and installer so extraction of a new release cannot alter scripts
+still executing. Failed installs retain the existing rollback path.
+
+On-device checks: a second check request was rejected while a delayed fetch ran;
+a deferred release stayed deferred on the next request, while a higher release
+was offered; a local 1.3.0 package installed from 1.2.0 through the new API,
+passed the existing archive/hash checks, restarted the screen and left a backup.
+The update notice disappeared after installation. Browser checks covered notes
+expansion/keypad scrolling, Later hiding the notice, busy controls and overview
+visibility. Battery temperature is now in the overview battery row, with no
+duplicate temperature tile; the detailed temperature page retains nine items.
+
+## 53. Mainline flash bundle: fresh SD install verified (2026-10-01)
+
+Bundle `e5-openwrt-flash-25.12.5-mainline-20261001-3dc73ff` contains the rebuilt
+6.18.54 release kernel (`00064-gc1bb703f034c`) and a freshly generated OpenWrt
+25.12.5 generic image with info screen 1.3.0, the overview update notification,
+battery-temperature layout and the SMS ID-parser fix. Package checksums passed;
+the image has no per-device firmware/vendor subset and the boot image has no
+Debian overlay. ZIP and tar.gz were generated; Windows execution is not tested.
+
+The macOS first-install path was tested from normal rooted Android on slot a:
+`--check` passed, then the default SD-card installation completed all eight
+steps. GPT was recreated with one `e5root` partition, both previous OpenWrt
+roots removed, about 13.4 GiB left unallocated. Firmware/vendor files were
+collected from that device's Android and unpacked onto the card. The existing
+SSID/key were supplied as initial-install parameters, with no restoration of
+the previous configuration archive. A private configuration backup remains in
+`work/fresh-flash-20261001/`, outside the distributable package.
+
+After first boot: image `3dc73ff`, info screen 1.3.0, root `/dev/mmcblk1p1`,
+userdata read-only, default/next boot Linux, modem connected with IPv4/IPv6
+addresses, IPv4 ping successful, hotspot up, Bluetooth powered, sound card and
+DSP registered, current-card SMS listing readable, Argon login served and the
+app-store index fetched. No kernel panic/oops was found. A subsequent ordinary
+reboot returned to the same SD root and Linux default. This does not replace
+the remaining physical client, Bluetooth-cycle or thermal checks in STATUS.
+
+## 54. Fresh mainline Debian and SD OpenWrt/Debian pairs (2026-10-01)
+
+The user resumed Debian/Phosh for call-audio research and requested SD
+multi-system verification, with Debian **4 GiB x 2**. The kernel repository's
+remote `e5-6.18` head matched local `c1bb703f034c`; the E5 port is on v6.18.54.
+A new kernel build volume (`e5-debian-kernel-20261001`) and a new Debian tree
+volume (`e5-debian-rootfs-20261001`) were used, not incremental object/root
+outputs. Kernel release: `6.18.54-e5-00064-gc1bb703f034c`, 78 modules total,
+45 in the shared initramfs and 24 audio modules in each Debian root.
+
+### Build corrections
+
+The Debian builder had only staged `out_linux`'s vendor-5.15 audio/modem
+modules. It now accepts `E5_MAINLINE=1` and indexes the selected mainline
+build's full module archive. The patched-package installer now requires its
+binary package set, includes `all` packages (phosh-common and Control Center
+data) and the matching libphosh shared library, and fails on installation
+errors. An apostrophe inside the single-quoted services chroot command had
+broken the configure stage; that quoting was corrected. Standalone home/NM
+permissions are applied at build time rather than relying on a Debian overlay
+in the boot image. `callaudiod` and `grim` are explicit packages. Packing uses
+a clean read-only e2fsck pass after repairs instead of hiding fsck failures.
+
+Fresh Debian 13.7/trixie arm64: 952 installed packages, including Calls,
+Chatty, Phosh, patched ModemManager/NetworkManager, PipeWire/WirePlumber and
+callaudiod. Image size 4294967296 bytes; roughly 2.6 GiB used and 1.3 GiB
+available on-device. The initial 950-package raw image was verified after
+writing into both slots, then the two small added packages installed into
+each; the final host image includes all 952. Initial raw SHA-256:
+`16f0e67d66234e1e4bd80dac6aab37d409ac855ea27f5f70761ca8144da5e55b`.
+Final raw SHA-256:
+`417a3e926451491a4b1d07461ee2118e52c5dd0589419e84ff310ba93fb52584`.
+Artifacts and checksums are in `out/debian-mainline-20261001-c1bb703f/`.
+They contain this device's firmware/vendor subset and are private outputs.
+
+### Card identity and shared boot
+
+Backups of boot_b, misc, both GPT copies and the OpenWrt configuration were
+saved in `work/debian-mainline-20261001/backups/` and their hashes checked.
+The original OpenWrt partition entry was unchanged byte-for-byte when the
+new layout was added; GPT header/table CRCs passed. Layout after the test:
+
+| partition | name | size / system |
+|---|---|---|
+| mmcblk1p1 | e5root | 1025 MiB partition, original OpenWrt A |
+| mmcblk1p2 | e5boot | 32 MiB registry |
+| mmcblk1p3 | debian-a | 4096 MiB Debian A |
+| mmcblk1p4 | debian-b | 4096 MiB Debian B |
+| mmcblk1p5 | e5root2 | 1280 MiB OpenWrt B, made by the updater |
+
+Format 1 has the kernel release, default and one-shot selection, and
+`systems/<id>/<slot>` PARTUUIDs. A root also identifies itself in
+`/etc/e5/sd-system`. Selection chooses the system before comparing its roots'
+generations. Registered cards own their choice even when userdata contains
+an older boot-os value; userdata is read-only throughout these card boots.
+A failed registered selection does not use a writable userdata fallback.
+The boot image includes only the firmware/factory-data early overlay, not
+the Debian systemd/NM configuration. Its first 56 MiB were flashed and
+verified by readback; the boot log area stays outside the write.
+
+### Device verification
+
+* Original OpenWrt booted with the registry and both systems listed.
+* `e5-os debian --once` booted Debian A; the following ordinary reboot
+  returned to OpenWrt and kept the default unchanged.
+* OpenWrt update created partition 5 and registered its B slot. Full hashes
+  of Debian's two 4 GiB partitions were identical before/after:
+  A `6e71aefdbf6bba6e086dddafefe4e5dd251c1aa779bc2f7675563df3d368df54`,
+  B `1f90b2929751ac2bbf0a285337895d7bbbcc843e433d26b241e2bf0cb6d1f3b5`.
+  The new OpenWrt booted and removed its trial marker.
+* OpenWrt B was then marked as an unsuccessful trial (generation 2,
+  sd-trial=0). Debian B had generation 10. The next boot selected OpenWrt A,
+  not Debian, establishing that rollback stays in the selected system.
+* Persistent `e5-os debian` selected Debian B (generation 10, trial=1).
+  It booted its own Phosh session, cleared its trial flag and retained its
+  own test state. Marking B as a failed trial (generation 11, trial=0)
+  returned to Debian A and A's distinct state. These are marker simulations,
+  not deliberately crashed or power-cut boots.
+* Test flags/generations were restored: both Debian slots are generation 0,
+  no failed-trial flags; OpenWrt B is generation 1 and confirmed. A subsequent
+  ordinary reboot again selected Debian A, with a different boot_id.
+* Final root `/dev/mmcblk1p3`, persistent SD default Debian, next LK boot
+  Linux; userdata read-only. Phosh screenshots from A and B were inspected;
+  A displayed the application grid and B the lock screen. SDDM, DSP, vendor CP, WWAN,
+  ModemManager and NetworkManager were active, with no failed systemd units.
+  ModemManager reported connected 5G NR; Mobile/Hotspot connections were up.
+  The sound card registered and DSP replied on the first command; PipeWire
+  exposed Speaker and Internal Microphone, with CallAudio present. Battery
+  reported Charging. No kernel panic/oops/BUG was found in the checked boots.
+
+Evidence logs and PNGs: `work/debian-mainline-20261001/`, including
+`update-isolation.log`, the rollback health/selection logs and final-health.
+`rootfs/tests/sd-registry.py` passes for persistent/one-shot selection,
+invalid IDs, absent PARTUUIDs, foreign registration, locking and unsupported
+registry format. Shell syntax and git whitespace checks pass.
+
+Call audio is still a research task: no real call was placed or answered,
+and this run did not perform an acoustic speaker/microphone/earpiece test.
+Real call testing requires asking the user for assistance before dialing.
+An automated Debian updater, registered-card installer migration, interrupted
+registry/GPT recovery and real failed-startup/power-cut tests remain open
+(`openwrt/MULTIBOOT.md`). Existing charger/regulator/portal warnings were not
+reclassified as fixed just because the desktop booted.
+
+## 55. Phone keys, 0.8 scaling and the E5 voice backend (2026-10-01/02)
+
+The user requested downlink audio first (E5 cannot hear 10099), physical
+phone/hangup key bindings in Calls, and scale 0.8. Uplink is explicitly deferred.
+All real calls in this session were placed and ended manually by the user;
+the assistant used local audio-mode probes and read-only modem queries.
+
+Physical input capture confirmed green KEY_PHONE=169 (sprd-keypad) and red
+KEY_POWER=116 (gpio-keys). The existing diagnostic tools misleadingly called
+169 NEXT and 523 PHONE; 523 is KEY_NUMERIC_POUND, not the green key.
+Calls 48.2-1+e5.1 now captures Phone/PickupPhone in its main and call windows:
+the green key opens the dialpad or submits its explicit nonempty number,
+and answers an incoming call. No implicit redial is added. Phosh
+0.46.0-3+deb13u1+e5.4 uses short power-key release to hang up the active Calls
+object via the existing CUI interface; idle locking/waking and long press
+retain their existing handling. The new behaviour is gated by
+/etc/e5/keypad-call-keys. Both packages built and were installed, including
+phosh-common and the matching libphosh. After a device reboot the user
+confirmed both physical keys worked. Scale 0.8 was persisted in phoc.ini;
+wlroots reports its quantized 0.796875 value. No failed systemd units were found.
+
+Stock callaudiod skipped the E5 card because its ACP-disabled PipeWire nodes
+have no speaker/earpiece ports. Calls' SelectMode and EnableSpeaker failed.
+Voice codec switches were off; FE_ST_VOICE was never opened. A device-specific
+adapter now implements the existing org.mobian_project.CallAudio session-bus
+API. It uses the hostless FE_ST_VOICE (hw:0,5, determined by name), prepares
+and starts both directions without copying AP samples. A playback application
+pointer advance is needed: plain ALSA start returned EPIPE with an empty
+buffer; snd_pcm_forward enabled the kernel's hostless start. DSP startup,
+hw_params and trigger acknowledged, with both directions RUNNING. Switching
+back to default closed the streams and restored mixer/profile state exactly.
+Fake-hardware tests cover idempotent start, mute, full restore and cleanup
+when the second stream fails to start.
+
+Those facts did not prove downlink audio. The user reported silence with the
+initial adapter, and again after a trial which changed the separate voice
+DG controls. Both real calls reached active state and the adapter ran during
+them; the phone-key/hangup-key test succeeded in the second. The DG trial was
+removed in favour of the vendor HAL's actual volume/profile path.
+
+Reference: jingpad-bsp/vendor_sprd_modules_audio, branch W21.24.3, commit
+059714f9f094efb6cd0bbfb5e1454b04abc77925; local copy under
+work/voice-20261001/hal-reference/. Its whale/audio_control.cpp and
+whale/audio_param/dsp_control.c provide the Unisoc VBC procedure. The E5's
+own XML route and parameters in work/android-ref remain the board authority.
+
+The subsequent correction uses voice scene 5 and the logical parameter ID
+matching Handsfree NB1/WB1/SWB1/FB1 (7/9/11/12), with the same mode offset:
+(mode << 24) | (mode << 16) | 5. It applies DSP VBC, Audio Structure and CVS;
+this E5 driver's CVS selector is named NXP Profile Select (profile index 2).
+The actual vendor voice volume is VBC_VOLUME = volume + 1, set to 9 here.
+That control declares UINT_MAX as a signed maximum (-1), so amixer clamped
+9 to -1 and failed; the existing raw control writer now handles it alongside
+profile selects. Local readback is 0x07070005 for all three NB profiles,
+VBC_VOLUME=9, with successful start/stop. Android's codec IIS0 output is DAC0,
+so the earlier DAC1 override was also corrected.
+
+The backend consumes audio_pipe_voice channel 2 notifications to follow the
+DSP's network bandwidth. Command 0 carries network mask and rate mode;
+0/1/2/3 select NB/WB/SWB/FB. An audio-group udev rule grants access to that
+one pipe. Unknown/assert messages are logged; no modem reset, automatic
+hangup or DSP reset is performed. Speaker is the only supported call output
+until the receiver route has been acoustically verified.
+
+Evidence and source/build logs are in work/voice-20261001/. The HAL-aligned
+revision awaits a further user-controlled downlink test at this checkpoint;
+no claim of audible call audio is made yet. The changes are committed in
+separate build, SD, scale, phone-key and audio commits as requested.
+
+### 55.1 HAL-aligned trial still silent; ordinary speaker verified
+
+The user manually called 10099 with scene-5 DSP/AS/CVS profiles and VBC_VOLUME=9
+on 2026-10-02 00:12. Both streams started and the user hung up with the working
+red key, but the user still heard no call audio. The DSP voice pipe reported
+command 0x35/channel 2 with parameters 0x10,0,0,0 at call start and 0,0,0,0 at
+end. This firmware opcode differs from the older HAL reference's network
+message command 0; its semantics remain to be verified.
+
+The later one-second 880 Hz pw-play test completed, aw87xxx powered its Music
+profile, and the user confirmed audible output. Thus ordinary media playback
+through the speaker is verified on this Debian installation; cellular downlink
+is not. A further active-call DSP/DAPM snapshot is being collected. The old
+snapshot monitor only inspected ObjectManager entries, which did not include
+standalone Call objects; it now follows Modem.Voice.Calls and reads each Call's
+properties directly. No call is initiated by that monitor.
+
+### 55.2 Stock Android audible reference and explicit DSP unmute (2026-10-02)
+
+The user manually called 10099 in stock Android and confirmed audible downlink.
+Root adb captured mixer state, DAPM, kernel and audio HAL logcat with
+`tools/android-call-reference.sh`; it never places, answers or ends calls and
+does not consume the HAL's voice notification pipe. Debugfs was mounted for
+reading. Evidence is private under `work/voice-20261001/android/`.
+
+Stock uses FE_ST_VOICE 5 in both directions, mono S16/8000 Hz and DSP scene 5.
+It applies Handsfree/NB1 with the same mode/offset 7, VBC_VOLUME=7 and codec
+speaker dacs=0/ao=3. The HAL switched from speaker back to receiver, so the late mixer snapshot
+shows Handset/NB1; the intermediate HAL log records the Handsfree parameters
+explicitly. Android omits the PCM status/hw_params proc
+entries; its kernel trigger log supplies the stream evidence instead.
+
+Command 0x35 is logged by the actual stock HAL as "cp voice enable" (16 at
+start, 0 at end); it is not the network-bandwidth command. Stock also receives
+command 0 with network information. Commands 0x34 in the comparison are
+`agdsp_log_point`/`add_audiodsplog` diagnostics, not a missing voice-enable
+protocol; their implementations were checked in the unit's own whale HAL.
+
+Android explicitly forces VBC_DL_MUTE during route changes, restores it after
+the DSP parameters, and releases DAC1 DSP MDG after the PCMs start. The Debian
+adapter now prepares both streams before either start, forces downlink mute,
+applies the measured speaker gains/volume, then explicitly sets DAC1 MDG to
+0,1024 and VBC_DL_MUTE to disable after startup/parameters. It still restores
+the complete prior state on stop or failure and never controls the modem.
+Tests cover preparation/start/unmute ordering and restoration on second-stream
+prepare/start failure. On-device local startup showed both PCMs RUNNING,
+correct unmute readback and exact mixer restoration, without any real call.
+
+The device returned to Debian A with Linux as the next/default boot. The trial
+boot-control block was verified by full 32-byte readback SHA-256 before reboot;
+no boot image or existing SD root was replaced. User-controlled Debian downlink
+verification is pending at this checkpoint; uplink remains deferred.
+
+### 55.3 Debian downlink heard; default speaker remains (2026-10-02)
+
+After revision 8e9b8a4, the user manually called 10099 on Debian and confirmed
+"有声音了，但默认开了扬声器". This is the first acoustically verified cellular
+downlink on this Debian build. The active-call snapshot and backend journal
+are saved under `work/voice-20261001/unmuted/`. The log records the explicit
+post-start unmute, both streams running and later network mask 0x10/band 0.
+
+The speaker-only restriction was intentional during fault isolation; it is
+now the remaining UI/routing issue. Calls issued EnableSpeaker(False), which
+the adapter rejected and left the speaker active. Receiver default and real
+speaker/receiver switching are the next change. Uplink remains deferred.
+
+### 55.4 Default receiver and real speaker switching (2026-10-02)
+
+The adapter now starts with SpeakerState=0, uses the stock handset EAR_HPL
+route (DAHP OS D=5, EAR_HPL mixer on, HPL EAR Sel=EAR, DAC0 mixer HALF_ADD),
+and keeps the speaker/AO path off. Speaker mode disables that receiver path
+and enables the previously audible speaker/AO route. Handset NB/WB/SWB/FB
+mode IDs are 0/2/4/5; Handsfree IDs are 7/9/11/12. Codec gains follow this
+device's volume-7 XML, including the band-specific receiver/AO gains.
+
+The DAC gain control advertises max=2, but its actual two-bit setter accepts
+the stock handset gain 3. amixer clamped it to 2. The raw control helper now
+writes this value as Android tinyalsa does; readback is 3. No kernel or DSP
+firmware was replaced for this change.
+
+EnableSpeaker(False) now succeeds. A live switch mutes the DSP, disables the
+old output, changes routes/profiles/gains and explicitly unmutes, retaining
+both PCM handles. A failed route write restores the previous live state.
+Stopping a call restores every saved control and clears the speaker choice,
+so the following call defaults to receiver. An explicit pre-call choice is
+recorded without changing idle media routes. SpeakerState follows the chosen
+route with the standard libcallaudio values (0 off, 1 on).
+
+Software tests cover default routing, speaker/receiver switching, preserving
+mic mute and PCM handles, failed-switch rollback and next-call defaults.
+On-device local tests verified both PCMs RUNNING through receiver -> speaker
+-> receiver, correct profile/gain/mute readbacks and exact restoration. DAPM
+showed EAR_HPL/EAR/RCV powered in receiver mode, Ext Spk in speaker mode.
+A separate test through the real session D-Bus API under user e5 verified
+properties 0 -> 1 -> 0 and exact mixer restoration after SelectMode(0).
+These tests make no modem/call request. Receiver acoustic verification during
+a user-controlled call remains pending; the speaker downlink is already heard.
+
+### 55.5 Default receiver downlink confirmed (2026-10-02)
+
+After 2c726fc, the user manually called 10099 again and replied "可以了".
+The real-call journal shows receiver profile 0x5, both PCMs running, CP voice
+enabled, and successful cleanup after the user ended the call. Together with
+the earlier speaker result, downlink is now heard on both output routes and
+the default-speaker issue is resolved. This call's journal has no speaker
+toggle; in-call switching has the hardware/D-Bus verification in §55.4, not
+a separately logged acoustic switch during this call.
+
+The active receiver mixer/DAPM/PCM/kernel snapshots are saved privately under
+`work/voice-20261001/receiver-confirmed/`; the confirmation journal is
+`receiver-user-confirmed.txt`. Diagnostic watchers and temporary HTTP servers
+were stopped, ModemManager logging returned to INFO, and both voice PCMs
+were closed. The actual CallAudio service remains available for normal use.
+No failed systemd units were reported. Uplink is still explicitly deferred.
+
+### 55.6 Two further calls: successful audio lifecycle, receiver warnings (2026-10-02)
+
+The user made two more calls and reported hearing the other end in a phone
+recording. After USB was reconnected, the same Debian boot was still running
+(uptime over six hours); no call was initiated by the assistant. Journal windows:
+
+| Call | Dialing | Active | Terminated | Audio cleanup |
+|---|---|---|---|---|
+| modem0/call2 | 08:08:43 | 08:08:50 | 08:09:07 (reason unknown) | VOICE-STOPPED 08:09:07.505 |
+| modem0/call3 | 08:09:34 | 08:09:43 | 08:09:54 (local hangup) | VOICE-STOPPED 08:09:55.029 |
+
+Both audio sessions started the two hostless PCMs and explicitly unmuted.
+Both negotiated DSP bandwidth 1 (WB): receiver profile 0x02020005 and speaker
+0x09090005 were applied. Speaker/receiver requests completed with no adapter
+traceback, failed operation, DSP assert/timeout or kernel panic/oops in the
+examined logs. The first call switched receiver -> speaker -> receiver ->
+speaker; the second switched receiver -> speaker. The user's recording result
+does not by itself establish uplink quality or acoustic verification of each
+individual switch. After both calls, no Call objects remained, both PCMs were
+closed, and prior mixer/profile state had been restored. PipeWire and
+WirePlumber were active; the modem remained connected and registered on 5G NR.
+
+The review did find unresolved errors:
+
+* `ear_switch_event check rcv dvld failed, -110` and the paired DAPM
+  `PRE_PMU: EAR Switch event failed` appeared at 08:08:44, 08:08:46 and 08:09:35.
+  The codec's receiver startup polls ANA_STS1 for the RCV calibration/loop
+  valid bits with a 4 ms timeout. This affected startup and switching back to
+  the receiver; the adapter's successful ALSA start does not eliminate this
+  hardware warning. Its cause and effect on reliability remain unresolved.
+* Four ModemManager warnings could not parse `+CGEV: NW ACT 11,17` / `11,18`.
+  Calls still reached active/terminated normally. These are network-context
+  activation notifications and a modem-event parser gap, not failed dial
+  requests. Subsequent context deactivation notifications were handled.
+* Calls logged four layout warnings at 08:11:39–08:11:57: requested height
+  593 px versus 553 px available. Layout remains too tall in that view even
+  with output scale 0.8.
+* Recurring charger-manager read/enable/property errors (-22) continued in
+  the wider log window. At review time the charger reported Charging, the
+  battery Full and USB online; this does not resolve the driver's errors.
+  One SIPA send/overflow event at 08:09:22 occurred between the calls, with
+  no subsequent ModemManager disconnect in the checked window.
+* The user session's xdg-document-portal was failed because FUSE was missing
+  at 02:08:13 boot startup. This predates the two calls and is separate from
+  the active PipeWire/WirePlumber services. Root login session dependency
+  warnings during evidence collection are not evidence of the user's audio
+  session failing.
+
+Private evidence: `work/voice-20261001/recent-two-calls-window.txt`, the
+filtered `recent-two-calls-relevant.txt`, full kernel/system logs and final
+health checks. The review made no audio, modem or kernel changes. Receiver
+startup timeout and CGEV parsing are tracked as follow-up fixes.
+
+### 55.7 Receiver readiness: healthy after startup, early polling times out (2026-10-02)
+
+The requested receiver investigation compared the original Android capture,
+the vendor 5.15 source and the mainline port. Stock Android's audible call
+also logged `ear_switch_event check rcv dvld failed, -110` twice, with
+ANA_STS1=0 and masks 0x400/0x2. It also logged failed initial FDIN polling.
+The relevant polling/event code is unchanged by the mainline port; the
+failure is not unique to Debian.
+
+`tools/e5-receiver-check.py` was added as a read-only on-device capture tool.
+It reads the actual analog register values, decodes receiver enable/clock/
+depop/valid bits, saves PCM/DAPM state and follows only the properties of
+user-created calls. It never controls calls, changes mixers, opens streams
+or consumes the voice notification pipe. Register-offset parsing and missing
+dump rejection were checked, then the tool ran successfully on the device.
+Register dumps are sequential, not atomic during a route transition.
+
+The user manually called 10099 at 08:26 and confirmed audible output.
+Snapshots showed ANA_STS1=0x403 on the receiver, with RCV_DCCAL_DVLD,
+RCV_LOOP_DVLD and RCV_DAC_FDIN_DVLD all set, SDAHPL_RCV selected, RCV_EN,
+DIG_CLK_RCV_EN and RCV_DPOP_EN set, and both voice PCMs RUNNING. Speaker
+selection cleared the receiver route/enable/valid bits; returning to receiver
+restored them. Ending the call cleared receiver enable/clock/depop/valid
+state and closed both PCMs. Evidence: `receiver-register-check/` and
+`receiver-register-call.txt` under private `work/voice-20261001/`.
+
+Two local probes (no modem action) narrowed the startup sequence further:
+
+| Stage | ANA_STS1 | Meaning |
+|---|---|---|
+| Routes selected, no PCM | 0x000 | receiver inactive |
+| Playback PCM prepared | 0x000 | enable/depop on, status still settling |
+| Both PCMs prepared | 0x402 | receiver calibration/loop valid, no FDIN yet |
+| Playback PCM started | 0x403 | calibration/loop/data valid |
+| Both started, parameters applied, unmuted | 0x403 | all three valid |
+| Stopped | 0x000 | receiver inactive |
+
+The complete-start and live-switch probe sampled ten settled receiver states;
+all were 0x403. Both probes verified exact mixer-control restoration. The
+stage reads add small delays, so they establish ordering, not a measured
+minimum hardware calibration time.
+
+The code checks FDIN in SDAHPL_RCV PRE_PMU (subsequence 102), before EAR
+Switch (109) enables RCV_EN and before playback PCM trigger. It waits about
+100 ms for a data-valid condition that is not ready at that stage. EAR Switch
+then enables the receiver and waits only 4 ms for calibration/loop readiness.
+Both conditions subsequently become valid, as the snapshots demonstrate.
+The concrete issue is premature startup status checking; this evidence does
+not show a receiver that remains uncalibrated or fails to power down.
+
+No kernel workaround was deployed or timeout hidden. A driver correction
+still needs to place data-valid checking after the data path starts and use
+an appropriate bounded calibration wait, then be tested for receiver/speaker
+switching and shutdown. Changing a single DAPM event or increasing a timeout
+without preserving that sequence would not establish the fix.
+
+A separate new WARN at 08:25:11 came from `sprd_dpu_stop` calling
+`cancel_work_sync` during display blanking (phoc), before this call. Its trace
+does not involve the receiver capture or codec; it is saved in
+`receiver-warning-and-sequence.txt` and remains a display-driver follow-up.
+
+## 56. Installer diagnostics, SD capacity preflight and USB IPv4 (2026-10-02)
+
+The generic "the card does not hold the image..." error hid failures earlier
+in SD installation. `flash.py` now checks the remote exit status at each
+partition/write/mount/extract/verification stage, retains the actual stderr
+and relevant mmc/ext4 kernel messages, and distinguishes a missing adb/su
+completion status from an SD content failure. Absolute image symlinks are
+verified inside its chroot. Missing/empty/non-executable paths are named.
+Gzip CRC and actual uncompressed length, card capacity and write protection
+are checked before partitioning. After the existing erase confirmation, vold
+releases only this card's volumes; remaining mounts abort before GPT changes.
+Seven mocked failure tests pass; no existing SD root was erased for testing.
+
+The Debian multi-system installer checks the complete 32 MiB registry plus
+4096 MiB x 2 allocation with read-only `e5-gpt plan` before any card write.
+Both GPT copies, overlaps, alignment, available entries and fragmented gaps
+are checked using the actual allocator. Failure reports required size, largest
+gap and remaining unallocated space; filesystem free space does not count.
+`--check` prints the plan without installing. Six synthetic GPT cases passed
+with unchanged metadata. Six real stream-writer tests on disposable files
+passed: good image, bad CRC, HTTP failure, one-byte/large oversize, and failed
+destination write. Prefix/suffix contents were unchanged in every case.
+
+The USB IPv6-only report had a concrete DHCP cause: the USB host's fixed MAC
+received an empty option 3 (IPv4 router), while IPv6 RA still advertised the
+device. The Mac's actual DHCP ACK showed IP 192.168.9.2 and DNS 192.168.9.1,
+but no router. Debian now advertises gateway/DNS 192.168.9.1 for the USB tag.
+OpenWrt no longer creates the empty option, and uci-defaults 96 removes only
+the legacy `3` list item from kept configurations. Migration tests preserved
+custom gateway/DNS options and changed nothing where the legacy item was absent.
+
+Live Debian verification used a temporary netns/veth client with a distinct
+MAC/IP (192.168.9.3) and the same usbhost tag. DHCP supplied the correct router
+and DNS; IPv4 ping through mobile NAT answered, and IPv4 HTTPS to www.baidu.com
+returned HTTP 200. The 1.1.1.1 HTTPS endpoint timed out on this carrier, so it
+was not used as the sole connectivity criterion. The temporary client/config
+were removed; the Mac's own route/service order was not changed. Existing
+computer leases need renewal/reconnection to receive the new gateway.
+After the Android comparison reboot, the Mac's real USB DHCP ACK also contained
+`router={192.168.9.1}`, confirming the fix for the actual gadget host MAC.
+
+## 57. Debian Bluetooth scanning and headset setup (2026-10-02)
+
+The user reported no scan results and then a pairing-code dialog/failing
+headset setup. This was two concrete issues, followed by a gap in the older
+SDP workaround. BlueZ, rfkill, btattach, GNOME Bluetooth and both unit-specific
+configuration payloads were installed; the controller had the factory address
+and manufacturer 0x01ec. Missing RF/pskey firmware was not the cause.
+
+### Vendor transport block restored after HCI attachment
+
+The vendor `bluetooth` rfkill was soft-blocked while hci0 was unblocked and
+BlueZ said Powered=yes. A saved platform switch value 1 was restored by
+systemd-rfkill after btattach had already configured the controller. The
+transport then dropped HCI commands because MARLIN_BLUETOOTH was physically
+off. btmon showed LE scan commands timing out and MGMT returning
+Authentication Failed (0x05), without a peer authentication exchange.
+Releasing the transport block and reattaching restored real scan results.
+
+`e5-bt-attach.service` now waits for systemd-rfkill and runs
+`/opt/e5/e5-bt-transport-ready` before attach. The helper releases only the
+vendor switch named bluetooth; it leaves hci0's logical switch and BlueZ
+preferences alone, and reports a hard block rather than ignoring it.
+
+A real reboot test deliberately put the old platform block value 1 back into
+its saved file. Journal ordering was restore at 08:56:10, helper release and
+attach at 08:56:11, then bluetoothd. All switches were unblocked, native pskey/
+RF/core-enable succeeded with the factory address, and no powered-off HCI
+drops or startup command timeouts appeared. Debian A and B have the new unit
+and helper. This validates the contradictory saved-state case, not every
+radio-off/on or autostart-disabled policy combination.
+
+### Bonding succeeded; SDP setup and reconnect needed fixes
+
+The user-selected Redmi Buds 6 Youth headset was Paired=yes/Bonded=yes even
+while GNOME Settings reported setup timeout and then AlreadyExists. It had
+stored a key; the failure did not establish a wrong pairing code. GNOME's
+standard agent advertises DisplayYesNo and can request local confirmation.
+The selected headset was trusted; global pairing confirmation was not disabled.
+
+The kernel dropped its 679-byte SDP response on a default 672-byte receive
+MTU. Debian had BlueZ 5.82-1.1, so the existing `bluez-01-sdp-large-mtu.patch`
+had never been installed by the Debian image builder. The builder now requires
+patched bluez/libbluetooth3 and holds them like its other E5 packages.
+
+Reconnection exposed a second path: src/profile.c opens profile-specific SDP
+searches with flags=0. Such a search can cache a 672-byte session before the
+device-wide browse requests SDP_LARGE_MTU; merely patching get_sdp_flags() was
+insufficient. New patch bluez-02 applies SDP_LARGE_MTU centrally in
+create_search_context(), so all new client sessions, including profile queries,
+use 1013 bytes before entering the cache. OpenWrt's build script also consumes
+this patch list, but its live image was not rebuilt in this session.
+
+Both patches applied and BlueZ built as 5.82-1.1+e5.2. On-device HCI capture
+then showed an explicit MTU 1013 offer, the full 679-byte reply and its
+continuation received, and ServicesResolved=yes. The headset connected,
+remained bonded/trusted, retained its name and appeared as a PipeWire audio
+output. No new L2CAP overflow appeared in the final connection window.
+The user confirmed their headset test worked before this additional reconnect
+fix. Both Debian slots now have bluez/libbluetooth3 +e5.2 on hold; their pairing
+stores remain separate. Userdata stayed read-only.
+
+Evidence is private under `work/bluetooth-debian-20261002/` and the similarly
+named health/build/boot/runtime logs in `work/`. Native Bluetooth service
+start is asynchronous; a connection issued immediately after restarting
+bluetoothd returned NotReady until adapter initialization completed. The
+successful checks waited for an available powered adapter.
+
+Remaining: the E5 cellular voice adapter routes only to receiver/speaker.
+Bluetooth media/HFP registration does not implement the CP-to-SCO call route;
+the user explicitly has not tested Bluetooth telephone audio. No call was
+initiated here. AVRCP also logged missing uinput; CONFIG_INPUT_UINPUT is not
+enabled in this kernel, so remote media-button handling needs separate work.
+
+## 58. Bluetooth headset microphone investigation: still no valid audio (2026-10-02)
+
+This was the initial investigation result. The subsequent controlled PCM
+tests in §59 identify two missing operations and obtain nonzero audio; the
+normal desktop input and Bluetooth cellular-call route are still unfinished.
+
+The user reported no headset microphone sound and provided spoken test
+feedback. The earlier scanning/bonding/SDP/media fixes remain verified; this
+investigation did not establish a working microphone or Bluetooth telephone
+audio. All PSTN calls continued to be user-operated.
+
+The 09:21 user call's E5 CallAudio log selected the receiver. The service has
+no Bluetooth CP/SCO route; S_VOICE_P_BT was off after the call. Thus a connected
+Bluetooth headset is not proof that the cellular audio uses it.
+
+PipeWire initially selected A2DP/SBC. It had a smart Bluetooth input proxy
+(`bluez_input.<address>`) as the default source; the initial commentary that
+the default was the internal mic was inaccurate. A2DP had no underlying
+microphone capture node. Selecting HFP/mSBC created an actual input, but an
+8-second 16 kHz recording produced 126265 samples, all zero. HCI showed a
+successful eSCO connection (60-byte packets, transparent air mode) with no
+received SCO payloads. A duplex test added silent playback: 1187 SCO TX
+packets, zero RX, and another all-zero recording. This is more than a missing
+desktop input selection or a pairing-code problem.
+
+### Bounded controller-mode probes, not a deployed firmware fix
+
+The unit's stock PSKey has g_sys_sco_transmit_mode=0. Its self-describing INI
+places this one-byte field at offset 76 in the 176-byte payload. Two volatile
+setup probes changed only that byte, retaining the full original blob:
+
+| Value | Observed result |
+|---|---|
+| 0 (original) | HFP link succeeds; no HCI SCO RX data; capture all zero |
+| 1 | SCO RX appears (1835 packets in one monitor); mSBC yields 240-byte all-zero payloads, CVSD 120-byte all-zero payloads; recordings/meter remain zero |
+| 2 | No SCO RX; recording remains zero |
+
+The probes do not define the undocumented field's semantics. Value 1 is not
+a verified HCI microphone fix merely because packets appeared. A 45-second
+numeric-only level meter also remained zero; no voice transcription was made.
+The stock blob was restored byte-for-byte and the controller reinitialized.
+
+The unit's own ODM image was read from its checked super metadata and
+extracted privately. In odm/lib64/libbt-vendor.so, the SCO_CFG operation
+invokes its success callback without sending a further HCI command; the
+SET_AUDIO_STATE operation returns -1. This did not support the hypothesis
+that the Linux setup had simply omitted an extra vendor SCO initialization
+command. No vendor library, radio firmware or modem NV was modified.
+
+### Stock DSP/IIS capture path also not working yet
+
+Android's audio XML selects IIS3 for Bluetooth, and FE_ST_CAPTURE_BTSCO_DSP
+for 48 kHz mono recording. On this kernel the FE is hw:0,14, scene 15/ADC2.
+Temporary mixer probes enabled its BT backend, IIS3 ADC port selection,
+16-bit input width and master controls while keeping the HFP link active.
+They returned `arecord: read error: Input/output error` with zero frames.
+Waiting for SCO, using the stock 960/1920-frame period/buffer and starting
+both hostless BT voice directions with the BTHS/WB profile did not restore
+capture. Every probe closed its streams and restored the previous controls.
+
+Pointer debugging showed a valid initial DMA buffer address af725000 and
+offset 0 repeatedly, with no forward movement. The earlier hypothesis of an
+invalid pointer being mistaken for a buffer offset was not established.
+The remaining work is the actual SCO-to-DSP/IIS input and capture/DMA path;
+the precise missing clock/routing/driver condition has not yet been isolated.
+It cannot be reported as solved by installing a utility package or selecting
+HFP alone.
+
+Final state: original PSKey value 0, A2DP playback restored, headset still
+paired/bonded/trusted/connected, voice and BT capture PCMs closed, pointer
+debug disabled and no active Call objects. Both Debian slots retain BlueZ
+5.82-1.1+e5.2 and the boot/rfkill fixes. Diagnostic logs and own-unit ODM
+extraction are private under work/bluetooth-debian-20261002*.
+
+## 59. Bluetooth SCO PCM input: missing IIS matrix and post-open SRC setup (2026-10-02)
+
+Continued investigation obtained nonzero samples through the stock Bluetooth
+DSP capture front end. This is a working, bounded PCM experiment, not yet a
+deployed default desktop microphone or Bluetooth cellular-call implementation.
+The controller retained its original PSKey throughout these tests; no PSTN
+call was placed, answered or ended by the tooling.
+
+### The ALSA SYS_IIS control was reporting a switch that never happened
+
+The unit's route XML selects `SYS_IIS0=vbc_iis3` for both bt_sco and bt_mic.
+The running mainline kernel has CONFIG_PINCTRL unset, so the pinctrl consumer
+functions compile to successful no-ops. `sys_iis_sel_put()` updated its cache
+and reported success while the physical matrix stayed unchanged. This was
+missing from the earlier VBC-only routing experiments.
+
+The unit's vendor pin table identifies IIS_INF0_SYS_SEL as control register 5,
+bits 4:0, in the QogirN6Lite pin controller. Its live DT translates the base
+to 0x642e0000 and declares value 11 for vbc_iis3_0. A temporary module checked
+the compatible/resource, mapped only this register, saved the original field
+and restored that field on unload without overwriting neighboring bits.
+It allowed only the two selections declared by this unit's IIS0 states.
+
+The actual register changed from 0x02904080 to 0x0290408b and back. Controlled
+capture with the original selection 0 still failed with EIO and yielded no
+samples; selection 11 produced nonzero PCM. The stock mode-0 controller thus
+does have a working PCM input path, even though PipeWire's ordinary HCI SCO
+source remains silent. AP capture hw:0,17 still timed out and is not the
+validated input.
+
+Read-only MCDT status also showed ADC4 write and read positions advancing,
+with DMA request 14 and the configured 320-word watermark. A larger capture
+buffer exposed the movement that the earlier short EIO probes missed. This
+does not require an invalid-pointer workaround or a speculative DMA patch.
+
+### BT SRC must be applied again after the capture scene starts
+
+With the IIS matrix corrected, requesting 96000 mono S16 frames at 48 kHz
+took about 6.096 seconds on mSBC. A request at 16 kHz was similarly slow.
+Internal DSP microphone capture still completed its 2-second/48-kHz test in
+about 2.15 seconds, so this was specific to the Bluetooth scene.
+
+The existing local HAL reference opens the input PCM before its final device
+selection, which reapplies VBC_SRC_BT_DAC and VBC_SRC_BT_ADC. Reapplying those
+controls after the experimental PCM reached RUNNING corrected the timing:
+
+| Codec | BT SRC reapplied | Captured frames/rate | Measured wall time |
+|---|---|---|---|
+| mSBC | 16000 | 96000 / 48000 Hz | 2.070 s |
+| CVSD | 8000 | 96000 / 48000 Hz | 2.067 s |
+
+Both completed normally with nonzero samples. Setting BT SRC or ADC2 SRC
+only before opening the PCM did not correct the timing. A permanent capture
+route needs this ordering on every new scene; declaring a different sample
+rate for the incorrectly timed data is not the final solution.
+
+A temporary PipeWire source fed the corrected 48-kHz PCM into pw-cat and
+resampled normally for a 16-kHz recording client. The final 9-second bounded
+test returned 143331 frames with nonzero data and no overrun. An earlier
+prototype waited two seconds before attaching its client and overran; the
+final prototype waits for node registration and attaches immediately.
+The virtual source was removed afterward. The default BlueZ input proxy has
+not been redirected to this path. The live numeric meter showed large level
+changes, but the user's spoken-test reply arrived after its bounded window;
+do not describe that as a synchronized speech validation of the final bridge.
+
+WirePlumber's intended hardware SCO integration uses platform routing with
+its offload loopback nodes; the relevant primary reference is its
+[0.5.8 BlueZ monitor](https://raw.githubusercontent.com/PipeWire/wireplumber/0.5.8/src/scripts/monitors/bluez.lua)
+and [platform example](https://raw.githubusercontent.com/PipeWire/wireplumber/0.5.8/tests/examples/bt-pinephone.lua).
+That integration, playback/CP routing and transitions back to media remain
+separate from the successful local capture experiment.
+
+### Kernel commits and deployment boundary
+
+The kernel repository now has three separate commits:
+
+* `459f49dd3`: wider control-index packing and per-SoC pad offsets/pull layout,
+  preserving the existing SC9860 probe behavior.
+* `94822e4e0`: the GPL QogirN6Lite pin/matrix table from the local vendor tree.
+* `d7484f958`: SYS_IIS rejects disabled pinctrl, propagates lookup/selection
+  errors and updates its cache only after a successful switch.
+
+A full Image/modules build enabled QogirN6Lite and also compiled SC9860;
+the VBC object separately compiled with the original PINCTRL-disabled config.
+The clean committed candidate is 6.18.54-e5-00067-gd7484f958a3f, retained with
+its config and modules under out/bluetooth-pinctrl-20261002. It has not been
+booted or deployed to the shared SD kernel. The live release remains
+6.18.54-e5-00064-gc1bb703f034c, and the normal build config still leaves
+pinctrl disabled pending that boot validation. Existing SD roots, registry
+and userdata were not changed.
+
+Evidence and temporary probe sources are private under
+work/bluetooth-debian-20261002; HTTP-served Python probes are under
+work/voice-20261001/serve. Tests restored mixer state, unloaded the register
+probe and closed their PCMs. Final cleanup restores A2DP and removes temporary
+audio recordings. No controller mode change or experimental background
+capture service is a deployed fix.
+
+## 60. Connection-switch testing needs exclusive microphone capture (2026-10-02)
+
+The requested behavior is routing that follows headset connection/use and
+returns to the device afterward, rather than permanently choosing Bluetooth.
+Preparing an interactive test exposed another integration requirement:
+FE_ST_CAPTURE_DSP (internal microphone, hw:0,2) and
+FE_ST_CAPTURE_BTSCO_DSP (hw:0,14) both use MCDT_CHAN4. The vendor FE header
+explicitly declares this sharing. GNOME Settings had multiple live capture
+streams and held the internal PCM open when Bluetooth capture was attempted.
+That attempt failed hw_params, followed by a DSP error with dsp_ready=0.
+Recovery was followed by a reboot; its precise reboot cause was not captured.
+The device returned to the existing 00064 kernel and audio service.
+
+A switching implementation must release the previous physical capture before
+opening the next scene. A successful virtual recording alone is insufficient:
+a client can fall back to the internal microphone when its target disappears.
+The temporary interactive test therefore checks that hw:0,2 is closed before
+opening hw:0,14 and stops on a failed recorder. It holds the headset SCO
+transport through Bluetooth offload acquisition instead of a recording of
+the smart BlueZ proxy that could activate the internal source. It reapplies
+BT SRC after the actual PCM is RUNNING.
+
+The recovered test showed hw:0,2 closed, hw:0,14 RUNNING with its pointer
+advancing, and the recording client's link explicitly connected to
+`E5 蓝牙耳机麦克风测试`. Numeric levels included peak 6738/RMS 1297.45;
+there was no concurrent internal-mic stream. This is stronger input-source
+evidence than merely seeing nonzero data from a recording client.
+
+The private bt-pw-user-test.py is a 15-minute test, not an installed service.
+It temporarily selects its input, watches disconnection/call objects, and
+restores the prior input preference only while its own preference is still
+selected. Cleanup frees the physical capture and restores mixers before
+removing the published source or moving clients back to the internal mic.
+Speech feedback and physical disconnection recovery are requested from the
+user. General reconnect policy, capture arbitration and cellular-call
+handover remain unfinished. No PSTN call was initiated, answered or ended.
+
+Evidence is under work/bluetooth-debian-20261002/user-test*, and the prototype
+is under work/voice-20261001/serve/bt-pw-user-test.py. The controller firmware,
+SD roots/registry and shared boot image were not modified.
+
+### Synchronized speech and software disconnect/reconnect result
+
+The user then replied “说过了” while the test was still running. The matching
+13:05–13:06 window contained pronounced speech-level changes, including peak
+23161/RMS 5888.8, followed by near-zero quiet intervals. hw:0,14 was RUNNING
+and hw:0,2 was closed. The recording client's link to the test source had
+already been checked explicitly, so this feedback validates the temporary
+headset microphone input rather than an internal-mic fallback.
+
+A software Bluetooth disconnect removed the headset transport. The test
+released the capture channel, removed its source and register probe, and
+PipeWire selected Internal Microphone. A subsequent 2-second internal-mic
+capture completed with rc=0 in 2.229 seconds, confirming the channel and DSP
+were usable afterward. Both capture PCMs were closed at completion.
+
+Disconnect produced an expected low-level arecord I/O error when SCO ended
+and a stale-device RPC diagnostic after BlueZ removed its device global.
+The prototype was adjusted to skip that RPC and profile selection when the
+device is gone. Its teardown had nevertheless completed; this was not a
+new DSP failure. Reconnecting succeeded with the bond/trust retained, and
+A2DP was explicitly restored afterward. Physical headset power-off, general
+automatic reconnect/capture policy and Bluetooth telephone audio are still
+unverified or unfinished. No call-control operation was performed.
+
+Evidence: user-speech-feedback.txt, user-test-disconnect.txt,
+user-test-reconnect.txt and user-test-media-restored.txt under the same
+private work directory. The interactive test has ended; no test microphone
+service remains active.
+
+## 61. SCO switching release bundle (2026-10-02)
+
+The capture ownership fix is now in the mainline kernel commits `af3bdc64e`
+and `20f1a47fc`. The latter rejects a competing DSP capture scene before
+firmware startup; the former clears stale FE DMA ownership after failed setup.
+The release build is `6.18.54-e5-00069-g20f1a47fc2cb`, with QogirN6Lite
+pinctrl enabled so `SYS_IIS0=vbc_iis3` performs a physical matrix switch.
+
+Debian’s rootfs now contains an exclusive per-user capture broker. It publishes
+one `e5_microphone` source through PipeWire, opens the internal or HFP SCO FE
+only while a client is using that source, takes the BlueZ SCO offload lease for
+HFP, reapplies the negotiated BT SRC after the PCM reaches RUNNING, and releases
+the old FE before switching. The internal ALSA microphone node is disabled from
+the desktop graph to prevent two clients from claiming MCDT ADC4. CallAudio
+remains the CP voice adapter and does not silently route cellular calls through
+Bluetooth.
+
+The one-click SD test package is private at
+`out/e5-debian-sco-switch-20261002.tar.gz` (913 MiB). `flash-sd.sh` selects the
+existing OpenWrt slot, serves the 4 GiB Debian image and shared boot image over
+the USB LAN, runs the installer’s GPT/free-space/checksum preflight, registers
+Debian A/B, flashes `boot_b`, and arms one trial boot. It never formats an
+existing registered card and does not initiate a phone call. The package
+contains the new kernel release, boot image, compressed rootfs, registry tools,
+and SHA-256 manifest.
+
+The UFI-TOOLS main repository has separate commits removing both TG group and
+TG channel links and replacing the external donation QR with the user-provided
+`donate.jpg` byte-for-byte. The mirrored Debian overlay carries the same assets.
+
+## 62. T551M 自动工作模式固定采用原厂 152 (2026-10-10)
+
+用户确认当前方案保持设备适配配置：**T551M 的自动模式默认固定为 152，
+E5 继续使用 134**。暂不增加运行时能力探测或自动选择工作模式的机制；
+不能因为 SoC 相同，就把此默认值推广到其他设备。
+
+原厂依据：T551M Android 属性中的基带能力/配置为
+`NR_TL_LF_W,NR_TL_LF_W`，历史工作模式快照为 `152,134`、主卡索引 0。
+本机原厂 `libimpl-ril.so` 的 `getMultiMode` 反汇编确认
+`NR_TL_LF_W`（NR/LTE/WCDMA）映射 152，`NR_TL_LF_W_G`
+（另含 GSM）映射 134。E5 原厂配置包含 `_G`，因此保留其 134 默认值。
+这些数值是原厂工作模式编码，不是速率、射频功率或 NV 校准参数。
+
+T551M 双卡 5G SA + LTE 的固定 IP 对照中，152 连续三分钟 180 包全部
+收到，平均 62.96 ms；恢复 134 的两轮平均分别为 180.59 / 135.16 ms。
+但 134 也出现过平均 65.04 ms 的正常一轮；切模式会重拨，部分轮次的小区
+或网络路径不同，不能据此断言 GSM 搜网或某个双卡调度机制就是根因。
+持久部署后普通重启读回 `152,3,0,20,3,1`，两卡注册正常，90 包全部收到，
+三轮平均 85.25 / 72.10 / 65.72 ms，仍有偶发尖峰。该调整有兼容性依据
+和实测改善，但不代表消除了所有蜂窝延迟波动。
+
+实现提交：`4c02751`。T551M 构建/安装通过
+`unisoc_modem.main.auto_work_mode=152` 指定默认值，显式配置仍保留；
+共用 `lock-control` 支持 134/152，未配置或非法值回退 134，并将两者识别
+为“自动”。网页和屏幕共用后端，继续使用 AT 就绪、拨号前的原有开机回放。
+此决定不强制两张卡都设为 152：实机保存的 SIM1 自动、SIM2 4G 分别映射
+为 152、3；手动 4G、SA、NSA 等选择及频段/小区锁定不变。
+
+源码、T551M 实机及离线 rootfs 已同步，42 项相关测试通过，重启后配置
+验证及原始 NV 只读一致性检查通过；未改物理 NV、CPU 设置或 TF 启动。
+需要回退时，将 `unisoc_modem.main.auto_work_mode` 显式设为 134 并提交
+UCI，再对主卡应用“自动”或重启即可。
+
+完整测试过程、限制及数据见
+[蜂窝延迟调查记录](CELLULAR-LATENCY-20261010.zh-CN.md)。
+
+## 63. OTG 主机初始化、重复注册与根集线器休眠冲突 (2026-10-10)
+
+T551M 实物插拔确认 Type-C/OTG 供电已切到主机，但外设不能完成枚举；
+控制器同时出现每秒约三万次 `trying to suspend as a_idle while active`。
+不能把屏幕不提示、网卡无 DHCP 直接当作界面或 LAN 热插拔配置的问题。
+
+共用移植代码的 `hops.host_start` 为空；注册 HCD 后仅开启 SESSION/HOST 位，
+没有恢复核心 POWER 和中断。双角色配置的 root hub POWER 路径也不会代为
+调用 `musb_start()`。现补齐主机模式下的核心初始化，并唤醒 root hub；
+不通过关闭全局 USB 省电来规避。但 OTG8 实物复测仅偶尔成功，不能视为修复。
+进一步发现 probe 和角色 worker 重复注册同一个 HCD，旧 root hub 泄漏；
+实机 `usb1` 的 BUSNUM 却变成 2。OTG9 / E5 mobile3 将 SPRD 双角色的 HCD
+注册统一交给角色 worker，并防止重复注册/清理；生命周期回归测试通过，
+OTG9 实物复测仍失败：重复注册已消失，但等待连接时的挂起重试和 hub 枚举
+失败仍存在。随后临时禁用 USB autosuspend 做对照，用户反馈正常，日志中
+三轮均识别 hub/r8152 并建立链路，且有电脑 DHCPACK。已恢复全局默认参数。
+
+OTG10 / E5 mobile4 将该修正收敛到 SPRD 根集线器：HCD 注册成功后仅禁止
+root hub 自动挂起，避免默认零延迟重试和提前写入 SUSPENDM；下游设备 PM
+保持不变。原有角色 worker 仍在 host 期间持有控制器 PM 引用，拔出时注销
+HCD、关供电并释放引用。两种构建、生命周期及充电转换测试通过。T551M
+OTG10 已正常启动，全局 autosuspend=2；三轮实物插拔均完成网卡枚举、carrier
+及电脑 DHCPACK，用户确认正常，挂起风暴计数为 0。根 hub 为 on，外接 hub
+仍为 auto；返回电脑后不残留主机总线，NCM / WAN 正常。正式 T551M 镜像、
+匹配模块及离线 rootfs 已同步。E5 mobile4 随第 64 节更新部署，三轮实物
+插拔也均完成网卡枚举、carrier 和电脑 DHCPACK，挂起风暴计数为 0。
+
+此次重启另暴露 userdata F2FS 的 SIT/节点计数损坏，离线修复及只读复查
+通过；内部 OpenWrt ext4 五阶段检查正常，无需修复。原始 NV 未修改，
+九分区及隔离工作设备验证通过。F2FS 反复损坏的根因仍未解决。
+详见 [OTG 调查和恢复记录](USB-OTG-20261010.zh-CN.md)。
+
+## 64. userdata 挂载失败恢复与供电边沿亮屏 (2026-10-10)
+
+按用户要求，TF 启动默认跳过 F2FS 自动修复；正常 userdata 启动先直接挂载，
+成功时不运行 fsck，也没有新增扫描或等待。仅 userdata 根系统挂载失败时，
+验证分区身份、未挂载及无 holders 后，以块设备只读保护进行 dry-run，
+确认文件系统错误才修复，再只读复查。通过后重启一次恢复早期固件加载；
+失败保留救援/回退。不会格式化或修改物理 NV。每次启动只尝试一次，启动
+保护计时器不会在修复途中重启。
+
+真实 ARM64 fsck 工具在 E5 `/tmp` 的人工损坏 F2FS 文件上完成 1→1→0
+检查/修复/复查，dry-run 不改变镜像哈希；未破坏实机分区。BusyBox shell
+策略与早期固件/WCN 共 19 项测试通过。此功能是故障恢复，不代表底层反复
+损坏原因已解决。initramfs 增加约 0.56 MiB 工具包，正常启动不扫描。
+
+共享屏幕 UI 使用已有 battery.online 状态边沿唤醒锁屏，插入和拔出均触发，
+首个样本和充电状态/电流波动不触发；保留锁屏及用户禁用触控设置。专项
+浏览器测试通过，不增加轮询或充电器连接提示。
+
+E5 已安装 mobile4 OTG 内核、匹配模块、新 initramfs 和 mobile.js；正常从
+TF 启动，userdata 只读，/run 没有修复记录。启动日志 15.26 秒 switch-root，
+USB NCM、热点和 WAN 正常。三次 OTG 插拔均获取 IP，用户确认充电器插入、
+拔出均能唤醒并保持锁屏。默认 Android 选择保留。
+
+随后 T551M 也完成部署与重启校验，保留原 OTG10 内核和默认 Linux 启动。
+userdata checkpoint 为 clean-unmount，10.47 秒直接挂载成功，16.33 秒
+switch-root，没有执行 fsck。USB DHCP/SSH、蜂窝 WAN、热点 AP、屏幕 API
+和 cog 进程正常，boot_b 与新 mobile.js 校验通过。正式镜像、离线 rootfs
+及校验文件已同步；本轮没有重新进行 T551M 物理插拔测试。
+
+详见 [恢复与插拔亮屏记录](F2FS-RECOVERY-AND-CHARGER-WAKE-20261010.zh-CN.md)。
+
+## 65. IMS 通知混入拨号响应，导致通话界面退回键盘 (2026-10-10)
+
+E5 实机日志抓到 `SPIMSPDPINFO: 17,0,1,0` 混进 ATD 响应，ModemManager
+报 Unhandled response，把刚建立的拨号对象从 dialing 改为 terminated；
+同时 CLCC 仍报告 SIM2 有通话。屏幕因不再收到 live 对象退回拨号键盘。
+
+现将该 IMS PDN 异步通知加入共用 Unisoc vendor URC 完整行解析，保留真实
+忙线、挂断、CME ERROR 和查询正文。不用屏幕延时掩盖通话状态，也不自动重拨。
+9 个 GLib 正则回归样本、双卡通话匹配和 SIM 上电计划测试通过，E5 daemon
+及离线 rootfs 已更新。r11 修正了这条通知，但用户随后仍复现回退，不能
+将最初的“正常”反馈记为整个问题通过。
+
+第二次日志明确：call3 已被 CLCC 查到，短暂一次空列表就被标为 terminated；
+同秒及随后两次查询仍有 active 外呼，却作为 unexpected outgoing 丢弃。
+用户再次拨号后 call4 才重新关联。r12 对已有通话的空列表在 250 毫秒后
+按原槽位复查一次，并可从完整 CLCC 恢复未跟踪的已有外呼，不发送 ATD。
+正常轮询不变，连续空和显式挂断仍结束通话。新增生产函数回归和干净补丁
+栈校验通过；r12 已应用到 E5，用户确认未再回退，实际日志也捕获空列表复查恢复。
+
+随后 r12 日志暴露主动挂断后的旧 CLCC 可能重新创建通话对象。r13 在挂断中
+禁止重复控制，挂断完成后留出 2 秒再允许拨出，并过滤挂断前/收尾期的外呼
+恢复快照；屏幕同步拨号冷却提示，接听和结束当前通话不受冷却影响。
+生产代码回归、完整补丁栈及屏幕浏览器测试通过。r13 已部署 T551M 实机并同步
+离线根镜像，WAN、电话 API、音频服务正常，默认 Linux 保持。用户明确不再
+进行 T551M 实際通话复测。E5 实机与离线 rootfs 仍为 r12。
+
+完整证据与构建、回退信息见 [拨号状态误判记录](VOICE-IMS-URC-20261010.zh-CN.md)。
+
+
+## 2026-10-12: M8 built-in ringtone corruption during staging
+
+M8's uploaded ringtone played correctly, while the built-in call/beep sounds
+produced digital tearing. Their installed WAV files were each exactly one byte
+short: call 180523 versus 180524 bytes, beep 88363 versus 88364. Both installed
+files matched `source.replace(b"\r\n", b"\n")` byte-for-byte. The M8 root
+staging loop treated WAV as text, deleting a byte inside PCM16 and shifting
+all following samples. The header retained the original length. Ding was
+unchanged because its payload did not contain CRLF.
+
+The shared staging reader now preserves binary assets (NUL-containing or
+non-UTF-8 data). M8 root creation, E5's copy helper and shared UI asset copying
+use it. Shared screen updates also restore all three built-in WAVs verbatim.
+Tests check byte identity and complete PCM frame length on the actual assets,
+and retain LF normalization for scripts. The live M8 assets now match source
+SHA256; the user confirmed both affected sounds are normal. Uploaded audio
+and the saved volume were preserved.
+
+A temporary PulseAudio `mmap=0` comparison did not resolve the noise and was
+reverted. No DMA, DSP profile or amplifier gain change was needed for this bug.
+Separately, cold speaker silent preroll in `e5-volume prepare` no longer uses
+an E5/T551M model allowlist: it follows the shared speaker sink's suspended
+state, retaining idle suspend and avoiding preroll on Bluetooth or warm playback.
+
+
+## 2026-10-12: M8 shared receiver and call-volume range
+
+The user confirmed that M8 uses one physical speaker for both phone and
+handsfree. Routing phone audio to EAR_HPL was silent. The shared voice backend
+now reads `receiver-output=speaker` on M8, retaining the logical phone mode's
+Handset DSP profile while wiring the real speaker and using its codec gains.
+Using Handsfree DSP parameters for both modes was too loud and was corrected.
+
+The user clarified that media could be quiet but the lowest call volume was
+still loud. Native call gain tuning, independent of PulseAudio media volume,
+resolved this in an acoustic test. `e5_call_profiles.py` reads this unit's
+original audio_structure and adjusts only the local-call downlink gain fields
+in DSP RAM through vbc_turning0. Additional attenuation tapers from 30 dB at
+the lowest native step to zero at the existing highest step. The original
+firmware file, NV, uplink, DTMF and Bluetooth parameters stay unchanged.
+M8 enables this via call-low-volume-attenuation-db; other boards retain their
+existing behavior. The helper validates allocation/layout and complete readback,
+and does not compound attenuation on restart or add idle polling.
+
+M8's receiver-volume-ceiling=5 maps the phone volume slider's maximum to the
+previous UI level 5, preserving full speaker/Bluetooth range. This is not native
+DSP step 5: the verified WB maxima are native step 3 for phone and 7 for speaker.
+Reloading the original profile and restarting the voice service reproduced the
+adjusted RAM profile automatically. Factory SHA256 was unchanged; tests cover
+byte-level scope, native maximum, restart idempotence and route-specific caps.
+# M8 Type-C/OTG 修复（2026-10-12，probe9–11）
+
+- probe8 仅 gadget 模式；原厂父节点 extcon/VBUS supply 未与 DWC3 相连。
+  有 CC attached-source 日志而 VBUS regulator 未开启，吻合 OTG 无电现象。
+- M8 的实际组合 PHY 位于 usb-phy[1]，第 0 项是 dummy，不能照搬只调用
+  usb2 PHY 的主机切换。probe9 增加 dual-role/XHCI 和事件驱动的角色/供电衔接，
+  进入主机前停止 sink 检测，退出时先关闭自身升压再恢复充电检测。
+- 连续插拔另有两处软件缺陷：Type-C 500 ms 计数过滤会丢有效 attach；
+  BC1.2 只保存最终状态，快速 absent→present 可能未清上一次充电类型。
+  已修正这两处及同时 attach/detach 的处理，并立即交回 D+/D- 检测路径。
+- 本轮不提高充电电流/电压，不修改原厂 DT 分区、NV 或音频配置。
+  完整编译和匹配模块检查通过，C-C/OTG 物理效果需要部署后实测。
+- probe9 第一次验证仍失败，原因是误把父节点第一个 extcon 当作 Type-C：
+  真实顺序为 GPIO VBUS、Type-C。probe10 按 provider compatible 选择后，
+  用户确认充电正常。实机日志确认 boost 开启、XHCI 主机运行，以及集线器、
+  千兆网卡、读卡器枚举；拔出后关闭 boost 并恢复电脑 USB 网络。
+- 网卡尚不能联网的剩余缺项是早期 kernel 没有 USB 网卡/存储类驱动。
+  probe11 补 RTL8152/ASIX/CDC/NCM/RNDIS/SMSC、storage/UAS/HID；本机已有
+  RTL8153/8156 固件，已有基于 net 热插拔的自动加入 LAN。
+- **probe11 / trial7 已部署，用户确认完全工作正常。** 日志交叉确认 r8152
+  创建 eth0、自动加入 br-lan、链路建立、DHCP ACK 与双向收发（采样错误计数 0）；
+  拔出后 host/boost 正常关闭，回接电脑后 NCM/SSH 恢复。上轮带电流表的 C-C
+  充电也已获用户正常反馈。记录见 `out/m8/probe11-plug.log` 与
+  `out/m8/probe11-plug-state.log`，临时采集完成后停止，不增加日常轮询。
+
+## 2026-10-12: M8 热点 IPv6 与公共中文 SSID 核查
+
+热点客户端没有 IPv6 的原因是 `devices/m8/prepare-trial-root.py` 为避免开发
+电脑改变上网路径，误把整个 LAN 的 RA 和 DHCPv6 都禁用了。实机 `wan_6`
+已经通过 extendprefix 获得联通 /64，并分配到 br-lan；路由器直连 IPv6
+外网三次 ping 均成功，不是基带、APN 或无线驱动缺少 IPv6。
+
+试运行配置恢复 `dhcp.lan.ra=server`、`dhcp.lan.dhcpv6=server`，与公共
+90-e5 默认行为一致，保留 ndp=disabled，避免对 raw-IP sipa_eth0 使用 NDP
+中继。实机已提交 DHCP 配置并重启 odhcpd，无需重启热点或蜂窝。随后已关联的
+无线客户端获得同一公网 /64 下的 SLAAC 地址，路由器向该地址 ping 三次成功。
+25 秒被动采集时手机没有 IPv6 外网流量，该采集本身未验证外网链路；随后用户
+完成手机端测试并反馈“ok没毛病”，补齐热点客户端 IPv6 外网验证。
+诊断记录为 `out/m8/ipv6-{initial,detail,after}.txt`。
+
+开发电脑的 M8 USB 网卡（本轮 ifIndex 137）仅在 ActiveStore 禁用 IPv6 Router
+Discovery，防止它接收新的默认路由；没有连接热点，也没有关闭 LAN IPv6。
+现有只针对开发电脑 DHCP 标签的 IPv4 网关/DNS 抑制保留。新的试运行实例也应
+在测试电脑自己的对应适配器处理此限制，而非关闭所有热点客户端的 IPv6。
+
+用户澄清中文 SSID 仅是听说难设置，本机实际显示和连接都正常。公共 LuCI 的
+maxlength(32) 使用 Blob 字节长度，hostapd 默认 utf8_ssid=1；实机 UCI、运行时
+hostapd get_status 的中文名称一致，AP 为 ENABLED。无需机型特判、转码或改变
+当前名称，也不应把协议限制放宽到 32 个汉字：SSID 上限为 32 UTF-8 字节，
+普通汉字通常每字 3 字节。这轮未修改正常的公共无线配置链路。
+
+## 2026-10-12: M8 改为持久 OpenWrt 启动
+
+用户明确要求默认启动 OpenWrt。原 trial7 在 initramfs 中选择 M8 专用根镜像时
+同时启用 e5_trial，公共试运行逻辑每次都覆盖 default-boot=android；单独修改
+根文件系统配置无法持久生效。make-trial.py 新增显式 --persistent，保留 CID
+校验、专用镜像选择、早期恢复 Android A 和成功启动后由 e5-boot-ok 重设 B 槽，
+仅移除强制覆盖用户启动偏好的语句。不带该参数仍保持试运行回退策略。
+
+已确认实机型号/CID 与备份一致，基于原 probe11 内核制作 persistent1 启动包；
+内核及模块未变。保留现有 openwrt-m8.ext4 的全部配置，将 default-boot 设为
+linux，并移除 S99m8-trial 链接，停止 8 分钟自动回退重启。刷入前检查原 B 槽
+与 trial7 匹配，刷入后核对完整启动镜像与 boot-control 字节；不改 Android A、
+NV 或校准分区。启动包 SHA256：
+`17c65b9c140dadf426feb3645ca5eb78fcff3ca6fe0ee0ecc801c1381b2ae800`。
+
+实机首次启动后 default/next 均为 linux，随后主动重启验证：boot_id 已变化，
+再次进入 M8 OpenWrt，default/next 仍为 linux、B 槽重新 armed，试运行计时器
+未启用，蜂窝 WAN 自动上线，LAN RA=server 保持。确认不是一次性启动。
+
+## 2026-10-12: M8 首次 PDP 激活失败后停止拨号
+
+用户从 Android 再次切回 OpenWrt 后无外网。实机基带已被 MM 识别并注册，
+首次 simple-connect 激活 PDP context 1 返回 `Unknown mobile equipment error: 28`。
+原 netifd 协议脚本将其记为 MM_CONNECT_FAILED，调用 proto_block_restart，随后
+teardown 禁用 modem；WAN 因而一直保持 down/autostart=false，没有默认路由。
+本次不是热点转发、DNS 或默认启动设置的问题。
+
+手动 ifup wan 一次即成功，IPv4/IPv6 外网 ping 各三次全部通过，本地 DNS 正常。
+不能仅由错误 28 推断为特定固件根因，但证据说明本次失败重试后可恢复。
+公共 network-startup.py 为 unisoc-sipc 的这条特定 PDP 激活错误增加最多两次
+重试，分别等待 5、10 秒，在同一次 setup 中重试，不额外禁用无线电或切卡。
+正常成功路径不等待，不增加后台轮询；SIM/PIN、认证、其他错误和其他 modem
+仍沿用原流程，重试耗尽后保留原错误处理。MM 每次调用原有 120 秒超时未改变。
+
+已部署 M8 的共享补丁安装器及 netifd 脚本并核对 SHA256，未断开刚恢复的网络。
+7 项启动测试通过，新增用例覆盖首次成功、第一/第二次重试恢复、重试耗尽、
+SIM 错误、错误 29 和其他 modem 不重试。实机错误重试分支仍需未来故障复现
+验证，不能把模拟测试视为再次复现成功。默认/下次启动仍为 linux。
+
+用户要求通用于全部机型：已核对 E5、T551M、M8 的 staging 均调用共享 ui.py /
+network-startup.py，新构建及 UI 更新包都携带此补丁；uci-defaults 在旧版本迁移
+标记检查之前运行 patch_root，因此已迁移过的机器更新时也会应用新重试逻辑。
+脚本路径的 t551m 是兼容旧安装器的历史名称，不是重试逻辑的机型限制。
+增加三个 profile 的真实补丁生成、幂等及重试行为测试，8 项测试通过。最初部署
+M8 后，用户接入 E5；核对 profile=e5、内核 e5-mobile4 后，将相同重试逻辑及
+共享补丁安装器部署到 E5，脚本语法和 SHA256 校验通过。E5 现有 WAN 连接未中断，
+IPv4/IPv6 外网各三次 ping 全通、本地 DNS 正常。新逻辑在后续拨号时使用，未为
+测试而重启或切断现有网络。T551M 实机以及以前导出的镜像文件本次尚未更新。
+
+## 2026-10-12: M8 约 1.5A 充电排查（待插拔对照）
+
+已回读接电脑前的 DCP 充电记录：输入限流 2500mA，电池充电设置回读 1955mA
+（目标 2000mA，原厂 A6 编码取整），实际电池净流入 1290–1486mA，VBUS 为
+4553–4579mV，电池约 40.7–42.5°C。软件 JEITA 目标仍为 2A、thm_cur=0，
+没有证据表明这一段被软件设成 1.5A 或温控减档。用户说的 1.5A 是 USB 表还是
+电池读数，尚待澄清；不能将两者直接等同。
+
+同期 REG00=0x18（2.5A 输入限流）、REG06=0x67（当前驱动编码对应 4.6V
+VINDPM 门限）、REG0A=0xc0。按驱动寄存器布局及兼容 BQ25601 文档，bit6
+为 VINDPM_STAT，bit5 的 IINDPM_STAT 未置位；结合 VBUS 电压，首先怀疑输入
+电压调节在压低电流。实际是原厂 A6 扩展寄存器芯片，不能把 TI 标准器件全部
+参数照搬。暂不能从这些记录区分充电器、线材、电流表和板内路径压降，未修改
+充电限流、VINDPM 或温控。
+
+日志保存在 out/m8/charge-1500-{initial.txt,full.log,dmesg.log}。已启动 15 分钟
+临时内存日志 /tmp/m8-charge-check.log 和 -state.jsonl（2 秒采样、自动停止），
+请求同一充电器/线材带表 60 秒与绕表直连 60 秒的对照，再回电脑读取。
+寄存器语义参考 https://www.ti.com/cn/lit/ds/symlink/bq25601.pdf。
+
+用户回复“看吧”后取回 /tmp 临时日志，保存为 out/m8/charge-1500-compare.log
+和 .jsonl。本轮只有一段 DCP（uptime 205.35–217.76 秒），约 12 秒，并非两段
+各 60 秒的带表/直连对照。输入限流 2.5A、电池设置 1.955A，6 个稳定采样的
+电池净电流为 1.286–1.325A，温度约 40.2°C。唯一 DCP VBUS 采样在刚接入时
+为 4.593V，不能当作这一轮稳定阶段 VBUS；没有抓到稳定阶段的 REG0A 快照。
+因此本轮仍未定位具体压降环节，也未证实 USB 侧实际 1.5A。已询问该段连接
+是否带表、1.5A 的测量位置，暂不改变电流或保护门限。
+
+用户随后明确 1.58A 是 USB 电流表读数，并决定暂停这项排查、保持参数现状。
+压降具体来源尚未确定，不能写成已排除线材/电流表或已修复硬件问题。
+
+## 2026-10-12: M8 主机名与显示型号
+
+初期干净根镜像保留 hostname=OpenWrt，原厂设备树 model 为通用的
+Spreadtrum UMS9620 SoC，导致看板顶栏和型号都没有 M8 品牌信息。
+M8 stage 现在写入 device-model=VIPME M8、device-hostname=VIPME-M8；共享
+e5-board-identity 启动钩子从这些元数据设置 /tmp/sysinfo/model，并仅更新
+/etc/board.json 的 model.name。保留 board id、网络和无线数据，不改变设备树
+compatible 或驱动匹配。元数据不变时不重写 board.json，无常驻进程。
+
+主机名默认迁移只处理 OpenWrt，占用的自定义主机名保持不动，uci-defaults 成功
+后由标准流程删除；新 M8 镜像也默认 VIPME-M8。实机已更新 UCI、内核 hostname
+和显示型号，ubus system board 及 dashboard-info 返回 VIPME-M8 / VIPME M8，
+启动钩子已启用；无需重新刷内核或重启网络。系统发行版仍正确显示 OpenWrt。
+
+## 2026-10-12: 公共 F2FS 恢复被孤立节点交互询问中断
+
+T551M 用户感知的慢开机实际为 userdata SIT/NAT 损坏后停在救援系统。
+fsck.f2fs 1.16.0 即使使用 `-f --dry-run` 或 `-y`，仍会询问是否把孤立
+节点导出到当前目录的 lost_found；原 `/dev/null` 输入触发 scanf EOF 断言，
+返回 255，未进入写修复。公共脚本现在给检查、修复、复查各提供一次 `n`，
+只拒绝可选导出；没有扩大允许修复的返回码，意外第二次询问仍失败退出。
+健康启动不检查、TF 启动跳过、仅未挂载 userdata 可修复的规则保持。
+
+8 项边界回归通过。保存完整故障分区压缩快照及启动镜像后，T551M 实际恢复
+返回 1→1→0（约 9.12 秒）；原 OpenWrt 根镜像只读 e2fsck 五阶段检查返回 0。
+更新 boot_b 并回读校验后，9.79 秒挂载 userdata、15.75 秒 switch-root，
+没有再执行 fsck；USB、热点、屏幕服务和蜂窝外网检查通过。NV 未改动。
+E5、M8 修正版离线启动镜像已构建，只改公共恢复脚本，尚未部署到两台实机。
+这修复的是恢复分支，原始 F2FS 损坏根因仍未确定，不能声称文件内容全部无损。
+详见 [恢复记录](F2FS-RECOVERY-AND-CHARGER-WAKE-20261010.zh-CN.md)。
+
+## 2026-10-12: MU300 上游六项公共修复适配
+
+将用户选定的 Wi-Fi 初始化失败回收、卸载定时器同步关闭、日常日志降噪、
+看板请求隔离、升级互斥、客户端指标补查与 DFS 能力过滤适配到 E5/T551M/M8。
+保持当前 SDIO 驱动及独立 AT 实现；未引入 PCIe 恢复看门狗、额外常驻轮询或
+自动重启。看板状态最低 2 秒、网速 1 秒保持，写请求不做自动重试。
+
+升级锁覆盖 userdata/TF 镜像与 Debian 目录安装；客户端指标只对缺失值做有
+总耗时限制的后台补查；按用户最终要求，手选不可用 DFS 时固定回退到 36，
+原样保留带宽，不再搜索候选信道或缩小带宽，hostapd/nl80211 原有监管校验保持。
+已有旧策略的根目录也会更新。三个机型 Wi-Fi 模块编译及故障注入、并发升级、实际 ucode、
+浏览器慢 AT/刷新/SIM 回归通过。后续已部署到 T551M 并重启，运行驱动 build-id、
+文件及 boot_b 回读校验一致，热点、USB SSH、蜂窝/DNS、网速和屏幕服务正常。
+保留原 149/VHT80 配置；E5/M8 实机及完整包仍待更新，不能据此断言
+先前多客户端吞吐问题已解决。来源、行为和测试见
+[公共修复记录](UPSTREAM-SHARED-FIXES-20261012.zh-CN.md)。
+
+## 2026-10-12: 公共充电插拔亮屏改用内核事件，部署 M8
+
+M8 原 mobile.js 与仓库一致，已有插拔亮屏，但息屏时 5 秒状态轮询存在快速
+拔插漏检路径。公共屏幕 RPC 现在订阅内核电源事件，经已有 WebSocket 唤醒
+屏幕，保留锁屏及用户触控开关，不增加定时轮询。E5/T551M/M8 共用实现，
+初始/重复/充电状态变化不触发；浏览器、事件分类和三个 profile 构建检查通过。
+M8 运行服务的内核订阅和文件校验已确认；用户实测反馈好用，已要求停止临时采集。
+
+同时核对 138 个公共用户态程序/资源，补齐最近看板隔离、客户端指标和 DFS
+固定 36/保留带宽代码后，唯一差异为应保留的 M8 ADAPTATION 标记。未重刷内核，
+不能据此声称 M8 的启动镜像和所有驱动已同步。详见
+[事件唤醒与部署记录](SCREEN-POWER-EVENTS-20261012.zh-CN.md)。
+
+随后同一事件唤醒修复已部署到 T551M；4 个文件及实际提供的 JS 校验一致，
+屏幕服务和内核事件订阅正常，没有开启临时日志采集。E5 实机尚未同步此修复。
+
+## 2026-10-12: T551M 补齐全部公共更新
+
+只同步亮屏事件的 4 个文件遗漏了其他公共更新。重新按公共 overlay、共享 UI、
+T551M 板级变换和已补丁的包文件核对，发现并补齐另 10 个文件，包括 PDP
+错误 28 重试、屏幕 RPC 提前启动、公共音频及配套模块、CPU 能力和隔离副本
+启动恢复脚本。未执行 NV 准备/刷新，也未写 NV 数据。
+
+补齐后 212 个程序/资源无差异，157 个模块与主机构建清单一致；当前启动镜像
+和运行 Wi-Fi build-id 已是最新，无需重刷。用户配置校验不变，WAN 保持在线，
+热点、屏幕、音频服务和 CPU/电压读取正常。详见
+[T551M 全量同步记录](T551M-FULL-SYNC-20261012.zh-CN.md)。
+
+## 2026-10-12: E5 全量同步完成
+
+E5 补齐 18 个公共程序文件，并更新此前未部署的 Wi-Fi 模块和 F2FS 自动恢复
+询问修正。启动镜像只变化这两个文件，其他内核/模块/init 不变；boot_b
+前 56 MiB 回读一致，尾部保留。重启后仍从 TF 卡启动、默认 OpenWrt，TF
+路径跳过 F2FS 修复，原始 NV 分区未改写。
+
+213 个程序/资源、158 个模块均核对一致，运行 Wi-Fi build-id 匹配新模块。
+屏幕、电源事件订阅、热点、USB SSH、蜂窝和 CPU/音频状态正常，外网 ping
+3/3 成功。用户配置部署和重启后校验未变。同步修正 E5 stage 的 vendor-ready
+检查周期为实机原有的 100 ms，保持约 12 s 上限，避免打包倒退启动延迟。
+详见 [E5 全量同步记录](E5-FULL-SYNC-20261012.zh-CN.md)。
+
+## 2026-10-13: 公共 Unisoc 移动续租与 T551M 验证
+
+ModemManager 原先忽略 NW MODIFY，netifd 只在连接建立时读取静态地址。
+T551M 原厂 RIL 二进制确认原因码 8 会调度数据连接列表刷新。本次增加
+非阻塞 CGEV/SPPCODATA 通知、由 netifd 管理的原地 IPv4/DNS 更新、低频
+一致性检查和 AT 失败隔离；兼容缺少第三字段的 NW ACT 11,17/18。
+Unisoc 注册短暂丢失保护改为 45 秒，真实上下文失活仍走既有恢复流程。
+
+APK 升级原来绕过公共 rootfs stager，会覆盖 APN、EPS 保留、回放、端口
+补报及错误 28 重试，已把公共变换接入包构建并纳入输入校验。
+T551M 新代码下成功恢复 CID 1、IPv4/IPv6，模拟续租不重拨。
+隔离网口上的真实 netifd 两次换地址测试确认旧 IP/DNS 被替换，默认路由
+禁用配置生效。户外跨基站效果尚待用户复测，不能用室内 ping 代替。
+MU300 仅补齐其既有事件触发器，未部署 MU300 实机。
+详见 [移动续租记录](CELLULAR-MOBILITY-20261013.zh-CN.md)。
+
+## 2026-10-13: T551M 大流量后热点消失与公共复位恢复
+
+现场确认客户端离线后残留包触发三条逐包错误输出，约 23 ms/包；随后
+CMD_SET_IE 超时、WCN 复位，hif->exit 长期残留。旧 TX 调度修复确已加载。
+公共驱动降低正常丢弃诊断级别并限制 TX 错误日志；首次复位报告额外产生
+ieee80211 uevent，由公共 hotplug 脚本按 PHY 路径重开对应 radio。
+无常驻轮询，保留禁用配置，互斥且限制重复恢复。
+
+T551M 已热加载并同步启动镜像，实际恢复事件测试通过，5,000 个不存在客户端
+的本地包在约 0.080 秒处理完成、未新增命令超时。用户随后真实下载连续接入
+超过 3 分钟、热点累计发送约 3.26 GB，未出现新的超时、复位或客户端离线，
+也未触发自动重开；最后 40 秒平均约 163.4 Mbit/s。
+首个客户端离线的原因不能仅凭事后日志断定。E5、M8 共用源码和安装入口，
+这次未部署它们的实机。详见
+[大流量与复位恢复记录](WIFI-DOWNLOAD-RECOVERY-20261013.zh-CN.md)。
+
+## 2026-10-13: T551M 户外移动抓取结果
+
+19:27:22–19:45:31 抓取 18 分 9 秒，用户确认无自主断网；Wi-Fi 离开与
+n1 低速后锁 n78 都为手动操作。只有约 19:35 一次禁用/启用后的承载重建，
+IPv4/默认路由约 6.73 秒恢复，IPv6 随后恢复，其他时段无承载/IP 重配。
+热点累计发送约 4.42 GB，无新的 CMD 超时、WCN 复位或自动重开。
+仍有 27 次 CMD_TX_DATA 返回通用错误，报文类型未知，未发展为卡死。
+
+本轮未捕获 active PDP 地址被网络修改，不能把稳定体验当作该分支已实测。
+发现并修复临时抓取的 syslog 多选过滤漏采，D-Bus/路由/内核记录不受影响。
+抓取及验证进程已停止、探针清理；结果与限制见
+[户外抓取记录](FIELD-CAPTURE-20261013.zh-CN.md)。
+
+## 2026-10-13: 公共 SC2355 接入组播重复转发修复
+
+首次接入诊断发现 RX 分支把网络字节序 h_proto 与主机字节序 ETH_P_IP /
+ETH_P_IPV6 直接比较，误为 IPv4/IPv6 组播创建额外无线转发副本，随后
+桥接 hairpin 又转发原包。公共准备脚本改用 htons，保留非 IP、单播
+W2W、桥接和 IPv6 功能；实际 C 分支旧代码复现和修正版测试通过。
+
+T551M 已热加载并写入启动镜像，前 56 MiB 回读验证，重启后保留修复。
+180 秒复测记录一次关联、无离线；282 次 CMD_TX_DATA 全部成功。
+116 个 IPv6 mDNS 入包对应 116 个出包，校验和均有效，没有旧轮次的
+成对重复 mDNS 头部。临时抓取和探针已停止清理，无新增常驻轮询。
+E5/M8 公共代码同步且对应模块编译通过，未部署两款实机。
+
+失败 mDNS 旧样本没有取得完整校验和信息，不断言它们有效或无效；
+短时间无报错也不能证明所有通用错误和初连卡顿仅由这个问题造成。
+详见 [Wi-Fi 接入跟进](WIFI-DOWNLOAD-RECOVERY-20261013.zh-CN.md)。
+
+## 2026-10-14：双卡短信隔离、默认启动提示与公共 eMMC 策略
+
+修正 CMTI 索引没有卡槽归属却被通用 MM 当作数据卡索引读取的公共缺陷；
+安装双卡接收器时只走逐卡存储读取，卡槽限定短信操作完成后恢复 AT 上下文。
+MM r928 已构建与回归，尚未进行混合物联卡组合的实机验收，不能据此认定
+“无模组”已根治或一定由缺少 IMS 引起。
+
+两仓库看板及 E5/T551M/M8 共享屏幕新增临时启动提示，确认后保存默认启动、
+校验 misc 回读；失败回退并与 rearm 互斥。V50 网页已热部署，未改变启动选择。
+
+公共内核准备禁用 eMMC runtime/system sleep 与 CLK_AUTO，保留 TF/SDIO 策略；
+MU300 补齐 FUA 刷缓存兼容。E5 主线和 MU300 6.18/7.2 Image/modules 编译通过，
+新内核未部署，待机功耗未测。V50 旧 #17 无新增 EXT4 错误，但根因仍未唯一定位。
+完整证据和验证边界见 [双卡与 eMMC 报告](DUAL-SIM-BOOT-EMMC-20261014.zh-CN.md)。
+
+后续按用户要求撤销 eMMC 运行时常驻及 CLK_AUTO 禁用，两仓库同步清理旧构建缓存。
+系统休眠保护移到专用回调，避免其共用函数继续拦截 aggressive runtime suspend；
+FUA 兼容与其余功能保留。实机内核未改，V50 仍是旧 #17，不能称实机已恢复省电。
+
+## 2026-10-14：公共屏幕未读短信状态图标
+
+共享屏幕在信号条左侧使用随主题变色的 SVG 信封表示两卡未读短信，复用公共
+收件箱和现有状态刷新，网页按条已读后同步。保留进入屏幕短信列表即全部已读
+的原有行为；等待保存确认后清除图标，保存失败或锁屏后台通知保留未读提示。
+不增加轮询、AT 请求或常驻进程。公共短信 20 项、分段 14 项及实际屏幕浏览器
+测试通过；E5 已热部署，T551M/M8 待部署。详见
+[短信状态图标](SMS-UNREAD-STATUS.zh-CN.md)。
+
+## 2026-10-14：公共安装包整理与原生 Magisk TF 部署
+
+此前 E5 包只改入口名，快捷脚本仍在顶层，独立 `e5-linux-switch` 只负责切换系统。
+现将快捷脚本移入 `launchers/`，校验清单与构建记录收入 `files/`，说明与许可证收入
+`docs/`，可选切换插件放 `extras/`。顶层保留一个 EXE、一个 PY、详细 `START-HERE.md`
+和 Magisk 必需文件，E5/T551M/M8 的两个打包入口共用同一组装/归档函数。
+
+完整 ZIP 新增原生 Magisk TF 首次部署：先校验型号、包、容量和启动链，在临时镜像内
+运行公共 Python 固件转换器，提取目标设备自己的 vendor 运行库、音频/蓝牙/Wi-Fi 固件。
+释放 TF 并确认没有直接挂载或 device-mapper holders 后，才重建卡的 GPT 和写系统；
+根与固件卸载后只读回验、boot 回读通过，才写本机 misc 的 32 字节启动控制。
+启动链和原 boot 留备份，不自动重启，无常驻服务，成功后禁用部署模块。
+两入口共用一份根镜像；保留 E5 的 TF 更新空间与 Android A / OpenWrt B 约定。
+
+电脑菜单补入 userdata 镜像入口，修复打包缺少 `userdata-image.sh` 的遗漏，
+镜像方式在加密、映射或不能确定为未加密的 data 上提前拒绝。
+EXE 增加退出结果与暂停，CMD 只保留一次暂停；纯离线 `--verify-package` 不访问设备。
+新增全局参数不会绕过菜单意外进入 TF 安装，相关行为已覆盖。
+
+离线验证覆盖三机型包结构、共享镜像、根部 Magisk 入口、哈希损坏、固件转换、
+中文热点导入、各阶段失败阻断后续写入、卡挂载/映射占用、Windows/Linux 入口，
+并复跑分区续装、发布检查和原有 boot-control 常规文件测试。
+本轮 52 项 Python 离线测试通过，另通过原 boot-control C 测试和 Windows 入口验证。
+目前未编译新版 EXE、未打发行包、未实机验证新 Magisk TF 流程；
+详见 [使用指南模板](../openwrt/bundle/START-HERE.md) 与 [发布说明](RELEASE.md)。
+
+## 2026-10-14：六项上游修复的公共适配
+
+按 #199 / #184 / #217 / #190 / #211 / #228 移植权限、TF 检测、升级锁、温控保护、转发结果及内核/打包检查。保留机型边界和现有双卡后端；E5 无相同升级保活链路，因此不引入 MU300 更新器。E5/T551M 原厂虚拟温区同类提前返回问题也纳入公共修正，M8 同步。正常导入树不重复改权限；不预装 Docker，不增加常驻 AT/温控轮询。详见 [范围与验证](UPSTREAM-BACKPORT-20261014.zh-CN.md)。尚未统一构建安装包或部署实机。
+
+## 2026-10-14：TF 不再预留 OTA 根分区
+
+按用户要求，新版三机型公共 TF 安装使用已有第一分区的全部容量；无任何分区时才使用整卡，
+不修改 GPT、不新建备用根。电脑与 Magisk 共用目标检查、包内 ext4 工具和实际容量验证。
+TF 更新统一由电脑安装器经 SSH 发起，复用 initramfs 离线更新：保全配置与固件、全部载荷入 RAM
+并校验后才卸载重写原目标，恢复原容量。旧多根卡仍能启动，保留当前根代数，不自动合并分区。
+旧设备端 TF 更新入口改为拒绝执行、提示用电脑安装器。无第二根自动回退；额外软件包和备份范围外
+的用户文件不迁移。源码与隔离测试完成，尚未重建发行包或实物刷卡，详见
+[布局、更新流程及验证](TF-SINGLE-ROOT-20261014.zh-CN.md)。
+
+
+## 2026-10-14：eMMC DMA/MMIO 排序与 E5、V50 实机验证
+
+公共 SDHCI 适配器改用有序 MMIO 访问器，修补 ADMA 描述符提交与完成读取之间的排序缺口；保留寄存器特殊处理、HS400 和运行时省电。E5 的修复前块记录存在另一 inode 表的完整内容，E5/V50 旧驱动普通文件测试均曾触发 ADMA 错误，不能仅按断电未刷盘解释。
+
+E5 完成 896 MiB 写入及等量直接读回、3584 次元数据更新、重启后 224 MiB 校验和两遍离线只读 fsck。V50 按用户要求重装现有 8 GiB OpenWrt 分区、重新提取本机固件，完整系统两轮 256 MiB 写读、1024 次元数据更新、重启后 64 MiB 校验通过。两机保持 HS400/200 MHz，错误计数为 0、运行时休眠启用；不把有界测试宣布为所有硬件永久可靠。V50 曾有本次部署漏同步模块导致的 BTF 不匹配，以及旧根目录脱落导致基础程序缺失，已在报告中分别记录。详见 [证据、范围及限制](EMMC-DMA-ORDERING-20261014.zh-CN.md)。未统一构建发行包，T551M/M8 未实机部署本次内核。
+
+
+2026-10-14 补齐排序修复覆盖：E5/T551M/M8 的三个机型内核入口及公共 Docker/本机交叉编译、MU300/F50/V50/U30 Air 两条主线版本均接入公共适配器；另补入两仓库旧 5.4 补丁链，不带入主线专属 PM/FUA 改动。发布 CI 增加实际访问器 C 编译执行检查。实际 6.18、7.2、原厂 5.4 参考驱动测试通过；尚未逐个重编和升级全部机型，详见同一调查报告的构建覆盖表。
