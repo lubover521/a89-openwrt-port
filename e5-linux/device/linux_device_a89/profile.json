@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "system": "linux",
+  "model": "a89",
+  "repository": "local scaffold; derived from https://github.com/sprd-linux-devs/linux_device_m8.git",
+  "status": "scaffold",
+  "note": "Adapted for Baihe A89 (Unisoc T157 / UMS9157, qogirn6pro). Identity values are not hardcoded: collect.py records the unit's own identity into identity.json and every downstream tool enforces it."
+}

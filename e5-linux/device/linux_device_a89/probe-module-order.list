@@ -1,0 +1,24 @@
+# A89 probe module order - INITIAL GUESS copied from the M8 port (same T157
+# platform class). MUST be regenerated from the A89's own dump:
+#   dumps/a89-stock/modules-load.txt (from /vendor/lib/modules/modules.load*)
+# and cross-checked with modules.txt before the first probe run.
+# Loading modules the A89 hardware does not have may fail probe rounds.
+# Note: this file uses the .list extension because it is consumed verbatim as
+# runtime data (one module per line); do not convert it to a watermarked
+# document format.
+sprd-cpufreq-v2-driver.ko
+tlsc6x.ko
+sprd_vpu_pw_domain.ko
+unisoc-iommu.ko
+drm_kms_helper.ko
+drm_dma_helper.ko
+drm_client_lib.ko
+ocp2131.ko
+sprd-drm.ko
+sprd_battery_info.ko
+sprd-charger-manager.ko
+ump96xx_fuel_gauge.ko
+bq2560x-charger.ko
+sc27xx-vibra.ko
+matrix-keymap.ko
+sprd_keypad.ko

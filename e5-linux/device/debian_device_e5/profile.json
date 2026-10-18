@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "system": "debian",
+  "model": "e5",
+  "repository": "https://github.com/sprd-linux-devs/debian_device_e5.git"
+}

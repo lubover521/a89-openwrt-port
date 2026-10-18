@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "system": "openwrt",
+  "model": "a89",
+  "repository": "local scaffold; derived from https://github.com/sprd-linux-devs/openwrt_device_m8.git",
+  "status": "scaffold"
+}

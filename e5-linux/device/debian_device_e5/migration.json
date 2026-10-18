@@ -1,0 +1,82 @@
+{
+  "source_repository": "sprd-linux-devs/e5-linux",
+  "source_commit": "b7282af",
+  "files": {
+    "rootfs/overlay/etc/e5/keypad-call-keys": {
+      "path": "overlay/etc/e5/keypad-call-keys",
+      "source_sha256": "f10ded6f22e6758a2280d5ae88f34ed6eac1e127658388dc7c56d63d77d2ea7b"
+    },
+    "rootfs/overlay/etc/hostname": {
+      "path": "overlay/etc/hostname",
+      "source_sha256": "1fcefb2ce92ba6450591ed53d3f542c857156a1baadbf491827b50b125e28576"
+    },
+    "rootfs/overlay/etc/hosts": {
+      "path": "overlay/etc/hosts",
+      "source_sha256": "e37e1a473739e6c269e3c287ee2370e629f973d778fb25b856a0df8b22a97456"
+    },
+    "rootfs/overlay/etc/machine-info": {
+      "path": "overlay/etc/machine-info",
+      "source_sha256": "5cf87660e55c1186f4bdf7e86d1b0d5a90d74ff53fc6b23bbbbe0a04c5c97a52"
+    },
+    "rootfs/overlay/etc/phosh/phoc.ini": {
+      "path": "overlay/etc/phosh/phoc.ini",
+      "source_sha256": "294b43abe3dd205deb3fb9870a0ed39aedfb97d273fd23baf0e07d408c2995f7"
+    },
+    "rootfs/overlay/etc/pipewire/pipewire.conf.d/51-e5-capture.conf": {
+      "path": "overlay/etc/pipewire/pipewire.conf.d/51-e5-capture.conf",
+      "source_sha256": "6bc2072cf9683cd5059801f20c186c8743e672d7f3b40fd1f125d727aa2d320b"
+    },
+    "rootfs/overlay/etc/sddm.conf": {
+      "path": "overlay/etc/sddm.conf",
+      "source_sha256": "d2ae292f6cb213374295e3f8388e7e63c82a03969627bea1a6ac28933d838984"
+    },
+    "rootfs/overlay/etc/sddm.conf.d/10-e5.conf": {
+      "path": "overlay/etc/sddm.conf.d/10-e5.conf",
+      "source_sha256": "4cabfe75b72d08bd4b8ef44044c5286cc8ec5f391f7b4a0d310e22ccebf330b1"
+    },
+    "rootfs/overlay/etc/systemd/logind.conf.d/20-e5-pwrkey.conf": {
+      "path": "overlay/etc/systemd/logind.conf.d/20-e5-pwrkey.conf",
+      "source_sha256": "0118cdbba3043b567da66a1c63478cb85dd0bec99ef1926208f6f33d6181eac7"
+    },
+    "rootfs/overlay/etc/systemd/system/e5-zram.service.d/10-e5-4g.conf": {
+      "path": "overlay/etc/systemd/system/e5-zram.service.d/10-e5-4g.conf",
+      "source_sha256": "845c30e881591fcf75657dc7b5d2ebd38c5cb2253c8a1da9f17f7face38a2086"
+    },
+    "rootfs/overlay/etc/systemd/system/unisoc-cpd-soak.service": {
+      "path": "overlay/etc/systemd/system/unisoc-cpd-soak.service",
+      "source_sha256": "a3493b48c53ad3488d9aeac6a3bbad7c1a3b4aa9a5faff9b18453372ebf10bb4"
+    },
+    "rootfs/overlay/etc/systemd/system/unisoc-cpd-soak.timer": {
+      "path": "overlay/etc/systemd/system/unisoc-cpd-soak.timer",
+      "source_sha256": "4449ee401f7486a20adb9647972615155c20bf6fda50760aee374a8f2c90e0f8"
+    },
+    "rootfs/overlay/etc/systemd/system/unisoc-cpd-web.service": {
+      "path": "overlay/etc/systemd/system/unisoc-cpd-web.service",
+      "source_sha256": "bb71963e5dbad93d080081c5d061ceadf8abfc09f150a604745fc5150f6c97f0"
+    },
+    "rootfs/overlay/etc/systemd/system/unisoc-cpd.service": {
+      "path": "overlay/etc/systemd/system/unisoc-cpd.service",
+      "source_sha256": "67b3dc9b8129d635ffa4b61e1ddb0772712aac42e2a08a779e7ad14971a94a53"
+    },
+    "rootfs/overlay/etc/udev/hwdb.d/61-e5-keypad.hwdb": {
+      "path": "overlay/etc/udev/hwdb.d/61-e5-keypad.hwdb",
+      "source_sha256": "333bdaec25474330f6adddd87705b07c4938f28a5ed3d0e296c5ef65289e5e96"
+    },
+    "rootfs/overlay/etc/unisoc-cpd/e5.toml": {
+      "path": "overlay/etc/unisoc-cpd/e5.toml",
+      "source_sha256": "1088e40c5836a20ce94c564d1a36ad6ca0c6036355ed0334478d1df0d6a6682b"
+    },
+    "rootfs/overlay/etc/wireplumber/wireplumber.conf.d/50-e5-sprdphone.conf": {
+      "path": "overlay/etc/wireplumber/wireplumber.conf.d/50-e5-sprdphone.conf",
+      "source_sha256": "ca602e391c56ac9048e3d469666ef03457f373d036d89503bf52c6cf9a1814dd"
+    },
+    "rootfs/overlay/usr/lib/NetworkManager/system-connections/Hotspot.nmconnection": {
+      "path": "overlay/usr/lib/NetworkManager/system-connections/Hotspot.nmconnection",
+      "source_sha256": "3ab9ec0c4368c830ebb49c640274c2fd6f00d2177736cbf80ecfe94f7e63f526"
+    },
+    "rootfs/overlay/usr/share/wayland-sessions/phosh.desktop": {
+      "path": "overlay/usr/share/wayland-sessions/phosh.desktop",
+      "source_sha256": "04fdb606c833193041d7e8a2f75c8e373ba5d98df756bd35a5fb5dcdd7861687"
+    }
+  }
+}
