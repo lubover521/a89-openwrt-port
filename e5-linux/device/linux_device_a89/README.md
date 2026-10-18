@@ -3,10 +3,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: '17b36fe7-8dfb-4de2-a33b-26fdcfe5ad39'
-  PropagateID: '17b36fe7-8dfb-4de2-a33b-26fdcfe5ad39'
-  ReservedCode1: '2f5e84a0-0cea-4760-8233-83f0ab817b4d'
-  ReservedCode2: '2f5e84a0-0cea-4760-8233-83f0ab817b4d'
+  ProduceID: '086b2dd3-9a4d-47ef-b45d-e2732f2210a9'
+  PropagateID: '086b2dd3-9a4d-47ef-b45d-e2732f2210a9'
+  ReservedCode1: '8a682600-e0dd-4391-b389-5a51a46daa8c'
+  ReservedCode2: '8a682600-e0dd-4391-b389-5a51a46daa8c'
 ---
 
 # 百合 A89（Unisoc T157 / UMS9157）Linux/OpenWrt 移植 — 脚手架
@@ -47,6 +47,10 @@ AIGC:
 4. **prepare-kernel.py / package-kernel.py**：直接复制自 M8（平台级内核接口
    适配器）。若 A89 的 live.dtb 与 M8 的 DT 存在差异（背光、面板初始化、
    按键矩阵），需要在这里追加设备树补丁。
+   同时依赖的平台文件也一并来自 M8（同为 T157 平台共享）：`port/`
+   （UMS9620 时钟、qogirn6pro pinctrl、BQ2560x、SSPHY 等固定源码+完整性清单）、
+   `charger.py / usb.py / usb-role.py / audio.py / gpu.py / display.py / wifi.py`
+   （各子系统补丁运行器）、`sprd_virtual_thermal.c`、`dwc3-role.h`。
 5. **固件**：WCN 无线固件、AGDSP 音频镜像等**只能从你自己的 A89 上提取**
    （collect-files.py），不能用 M8 或任何其他机器的。
 
