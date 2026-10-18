@@ -1,0 +1,29 @@
+#!/usr/bin/ucode
+// Private helper: resolve may contain credentials, never register it with rpcd.
+import * as fs from 'fs';
+import { cursor } from 'uci';
+import { connect, error } from 'ubus';
+import * as apn from './apn.uc';
+let c=cursor(), request=json(fs.readfile('/dev/stdin') || '{}');
+let identity=request.identity || {}, action=ARGV[0] || 'get', result;
+let iface=c.get('unisoc_modem','main','data_interface') || 'wan';
+if(action=='resolve') {
+    result=apn.resolve(c,identity,apn.network_options(c,iface));
+    // Preserve legacy automatic selection, but never override a per-SIM choice.
+    if(result.source=='network' && c.get('network',iface,'apn_auto')=='1') {
+        let s=apn.automatic(identity.imsi);
+        if(s)result={ok:1,source:'auto',settings:s};
+    }
+} else if(action=='status') {
+    result=apn.status(c,identity);
+} else if(action=='get') {
+    result=apn.get(c,identity);
+    let bus=connect(null,2), status=result.ok?bus?.call('network.interface.'+iface,'status',{}):null;
+    result.connected=status?.up===true;result.connecting=status?.pending===true;
+} else {
+    result=apn.change(c,action,request.payload || {},name=>apn.reconnect(connect(null,3),error,name),identity);
+    fs.chmod('/etc/config/unisoc_apn',384);
+    fs.chmod('/etc/config/network',384);
+}
+result.iface=iface;
+print(sprintf('%J\n',result));

@@ -1,0 +1,122 @@
+#!/usr/bin/python3
+"""Bind forwarding to the existing complete, dual-SIM inbox; never poll AT."""
+import fcntl
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
+
+BASE = Path(os.environ.get('MU300_FORWARD_DIR', '/etc/unisoc-modem/forward'))
+INBOX = Path(os.environ.get('E5_SMS_DATA', '/etc/e5-sms')) / 'inbox.json'
+
+
+def atomic(path, data):
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix='.forward-')
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(data); stream.flush(); os.fsync(stream.fileno())
+        os.replace(name, path)
+        fd = os.open(path.parent, os.O_RDONLY)
+        try: os.fsync(fd)
+        finally: os.close(fd)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def migrate(sections=None):
+    BASE.mkdir(parents=True, exist_ok=True); BASE.chmod(0o700)
+    with (BASE / 'state.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if (BASE / 'native-v1').exists():
+            return
+        if sections is None:
+            if '/sms-forward event' not in Path('/usr/libexec/e5-sms').read_text():
+                raise ValueError('Platform SMS dispatch must be updated before migration')
+            data = subprocess.check_output(['ubus', 'call', 'uci', 'get',
+                                           '{"config":"e5-notify"}'], timeout=10)
+            sections = json.loads(data)['values']
+        now = int(time.time())
+        # Keep the original UCI sections for rollback, including inactive slots.
+        atomic(BASE / 'legacy-e5-notify.json', json.dumps(sections, ensure_ascii=False))
+        for section, filename in [('forward', 'config.json'),
+                                  ('forward_sim1', 'config.sim0.json'),
+                                  ('forward_sim2', 'config.sim1.json')]:
+            old = sections.get(section, {})
+            headers = old.get('header', [])
+            if isinstance(headers, str): headers = [headers]
+            config = dict(enabled=int(old.get('enabled', '0') == '1'), method='webhook',
+                          template_language='zh', webhook_url=old.get('url', ''),
+                          webhook_method=old.get('method', 'POST'),
+                          webhook_content_type=old.get('content_type', 'application/json'),
+                          webhook_body=old.get('body', ''), webhook_headers='\n'.join(headers),
+                          webhook_timeout=int(old.get('timeout', '10')),
+                          power_forward_enabled=0)
+            if not (BASE / filename).exists():
+                atomic(BASE / filename, json.dumps(config, ensure_ascii=False))
+        mode = sections.get('forward', {}).get('mode', 'shared')
+        if mode not in ('shared', 'per_sim'): raise ValueError('Invalid forwarding mode')
+        if not (BASE / 'mode').exists(): atomic(BASE / 'mode', mode + '\n')
+        for name in ('state', 'state.sim1', 'state.power'):
+            if not (BASE / name).exists(): atomic(BASE / name, f'0|{now}|-1|none\n')
+        atomic(BASE / 'native-v1', str(now) + '\n')
+
+
+def message(identifier):
+    if not str(identifier).isdigit(): raise ValueError('Invalid message ID')
+    data = json.loads(INBOX.read_text())
+    if data.get('version') != 1: raise ValueError('Unsupported inbox')
+    item = next((m for m in data['messages'] if m['id'] == int(identifier)), None)
+    if (not item or item.get('deleted') or item.get('historical') or
+            item.get('direction') != 'in' or item.get('state') != 'received' or
+            item.get('card') not in (0, 1)):
+        raise ValueError('Not a new complete incoming message')
+    return item
+
+
+def claim(identifier, since):
+    # The shell worker holds state.lock throughout claim and transport. Native
+    # inbox files are atomically renamed by the receiver; we never modify them.
+    item = message(identifier)
+    if item.get('first_seen', 0) < max(int(since), int((BASE / 'native-v1').read_text())):
+        raise ValueError('Message predates forwarding configuration')
+    path = BASE / 'claimed-ids'
+    with path.open('a+', encoding='ascii') as ledger:
+        os.chmod(path, 0o600)
+        fcntl.flock(ledger, fcntl.LOCK_EX)
+        ledger.seek(0)
+        if str(identifier) in ledger.read().splitlines(): raise ValueError('Already attempted')
+        ledger.write(str(identifier) + '\n'); ledger.flush(); os.fsync(ledger.fileno())
+    return {key: item.get(key, '') for key in ('id', 'card', 'number', 'text', 'time')}
+
+
+def send(number, text):
+    card = os.environ.get('MU300_SIM_SLOT', '0')
+    if card not in ('0', '1'): raise ValueError('Invalid source SIM')
+    if not number.lstrip('+').isdigit() or not text: raise ValueError('Invalid SMS')
+    fd, name = tempfile.mkstemp(prefix='sms-forward-', dir='/tmp')
+    try:
+        with os.fdopen(fd, 'w') as file: file.write(text)
+        result = subprocess.run(['/usr/libexec/e5-sms', 'send', number, name, card],
+                                capture_output=True, text=True, timeout=90)
+        if result.returncode or not json.loads(result.stdout).get('ok'):
+            raise ValueError('SMS delivery failed')
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+if __name__ == '__main__':
+    try:
+        op = sys.argv[1]
+        if op == 'migrate': migrate(); result = {'ok': 1}
+        elif op == 'message': result = {'card': message(sys.argv[2])['card']}
+        elif op == 'claim': result = claim(sys.argv[2], sys.argv[3])
+        elif op == 'send': send(sys.argv[2], sys.argv[3]); result = {'ok': 1}
+        else: raise ValueError('Unknown operation')
+        print(json.dumps(result, ensure_ascii=False))
+    except (OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError):
+        # No message body, address, token or modem output in errors.
+        print('{"ok":0,"error":"source_unavailable"}')
+        sys.exit(1)

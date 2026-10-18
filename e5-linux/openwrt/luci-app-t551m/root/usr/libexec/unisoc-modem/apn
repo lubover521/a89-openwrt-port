@@ -1,0 +1,124 @@
+#!/usr/bin/python3
+"""Shared APN entrypoint. Only ModemManager reads AT; no direct serial access."""
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+RUN = Path('/run/unisoc-data-sim')
+CARD = Path('/sys/module/sipc_wwan/parameters/card')
+WORKER = Path(__file__).with_name('apn-worker')
+
+
+def mm(arguments):
+    return json.loads(subprocess.check_output(['mmcli', *arguments, '-J'],
+        text=True, timeout=4, stderr=subprocess.DEVNULL))
+
+
+def identity(device='unisoc-sipc'):
+    slot = CARD.read_text().strip()
+    if slot not in ('0', '1'):
+        raise ValueError('invalid card')
+    # MM's D-Bus properties are already cached. No new AT query or retry loop.
+    modem = mm(['-m', device]).get('modem', {})
+    sim = modem.get('generic', {}).get('sim', '')
+    if not re.fullmatch(r'/org/freedesktop/ModemManager1/SIM/[0-9]+', sim):
+        return dict(slot=slot)
+    properties = mm(['-i', sim]).get('sim', {}).get('properties', {})
+    if CARD.read_text().strip() != slot:
+        raise ValueError('card changed')
+    return dict(slot=slot, iccid=properties.get('iccid', ''), imsi=properties.get('imsi', ''))
+
+
+def invoke(action, who, payload=None):
+    raw = subprocess.check_output([str(WORKER), action], input=json.dumps(
+        dict(identity=who, payload=payload or {})), text=True,
+        stderr=subprocess.DEVNULL, timeout=20)
+    result = json.loads(raw)
+    if action == 'status':
+        return result
+    capable = auth_supported()
+    if action == 'get':
+        result['auth_supported'] = capable
+    # Detect old cached daemons instead of claiming credentials were applied.
+    if action == 'resolve' and result.get('ok') and result.get('settings', {}).get('auth', 'none') != 'none' and not capable:
+        return dict(ok=0, error='apn_auth_unsupported')
+    return result
+
+
+def auth_supported():
+    marker = b'Unisoc bearer authentication setup failed'
+    candidates = [Path('/usr/sbin/ModemManager')]
+    candidates.extend(Path('/usr/lib/ModemManager').glob('*unisoc*.so'))
+    for binary in candidates:
+        try:
+            if marker in binary.read_bytes():
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def main(action, payload=None, device='unisoc-sipc'):
+    if action not in ('get', 'status', 'resolve', 'save', 'delete', 'apply', 'auto'):
+        return dict(ok=0, error='apn_invalid')
+    RUN.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # Same flock as data-sim: an APN save/apply must not race a SIM switch.
+    # The private dial resolver is invoked *during* a SIM switch, so it must
+    # not recursively acquire that lock. netifd supplies the active modem.
+    if action in ('get', 'status', 'resolve'):
+        try:
+            who = identity(device)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            if action == 'status':
+                return dict(ok=0, error='apn_identity')
+            who = {}
+        return invoke(action, who)
+    with (RUN / 'switch.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return dict(ok=0, error='apn_busy')
+        if Path('/run/unisoc-modem-lock-apply').exists():
+            return dict(ok=0, error='apn_busy')
+        try:
+            who = identity(device)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            # Never fall back to a global apply when the selected card cannot
+            # be identified; otherwise another SIM's binding could be bypassed.
+            if action in ('apply', 'auto'):
+                return dict(ok=0, error='apn_identity')
+            who = {}
+        iccid = who.get('iccid', '')
+        if action in ('apply', 'auto') and (not isinstance(iccid, str) or not re.fullmatch(r'[A-Za-z0-9]{18,22}', iccid)):
+            return dict(ok=0, error='apn_identity')
+        if action in ('apply', 'auto') and 'data_sim' in (payload or {}):
+            expected = payload['data_sim']
+            if type(expected) is not int or expected not in (0, 1) or str(expected) != who.get('slot'):
+                return dict(ok=0, error='apn_sim_changed')
+        if action == 'apply' and not auth_supported():
+            state = invoke('get', who)
+            selected = next((p for p in state.get('profiles', []) if p.get('id') == (payload or {}).get('id')), {})
+            if selected.get('auth', 'none') != 'none':
+                return dict(ok=0, error='apn_auth_unsupported')
+        return invoke(action, who, payload)
+
+
+if __name__ == '__main__':
+    os.umask(0o077)
+    try:
+        action = sys.argv[1] if len(sys.argv) > 1 else 'get'
+        payload = None
+        if action not in ('get', 'status', 'resolve'):
+            raw = sys.stdin.read(4097)
+            if len(raw) > 4096:
+                raise ValueError('request too large')
+            payload = json.loads(raw or '{}')
+            if not isinstance(payload, dict):
+                raise ValueError('invalid request')
+        print(json.dumps(main(action, payload, sys.argv[2] if len(sys.argv) > 2 else 'unisoc-sipc')))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        print(json.dumps(dict(ok=0, error='apn_storage')))

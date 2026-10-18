@@ -1,0 +1,7 @@
+{
+  "e5-sounds": {
+    "description": "Call and SMS notification sounds",
+    "read": {"ubus": {"e5-sounds": ["status"]}},
+    "write": {"ubus": {"e5-sounds": ["configure", "upload", "finish", "reset", "preview", "stop"]}}
+  }
+}

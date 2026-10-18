@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""LuCI dashboard SMS contract backed by the existing E5 two-SIM inbox.
+
+No second AT reader, inbox or forwarding worker. Local-only deletion hides
+messages in this UI; explicit SIM deletion uses the existing identity checks.
+"""
+import fcntl
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+HIDDEN = Path('/etc/unisoc-modem/hidden-sms.json')
+TOOL = '/usr/libexec/e5-sms'
+RECEIVER = '/usr/libexec/e5-sms-receive'
+
+
+def run(argv, timeout=30):
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    try:
+        value = json.loads(result.stdout)
+    except ValueError:
+        raise RuntimeError(Path(argv[0]).name + ' returned no valid result')
+    if result.returncode or value.get('ok') is False:
+        raise RuntimeError(value.get('error') or 'SMS operation failed')
+    return value
+
+
+def hidden():
+    try:
+        return set(json.loads(HIDDEN.read_text()))
+    except FileNotFoundError:
+        return set()
+
+
+def hide(ids):
+    HIDDEN.parent.mkdir(parents=True, exist_ok=True)
+    with HIDDEN.with_suffix('.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        data = sorted(hidden() | set(ids))
+        fd, tmp = tempfile.mkstemp(dir=HIDDEN.parent, prefix='.hidden-')
+        try:
+            with os.fdopen(fd, 'w') as f:
+                json.dump(data, f); f.flush(); os.fsync(f.fileno())
+            os.replace(tmp, HIDDEN)
+        finally:
+            Path(tmp).unlink(missing_ok=True)
+
+
+def messages():
+    excluded = hidden()
+    return [m for m in run([TOOL, 'list'])['messages'] if m['id'] not in excluded]
+
+
+def main(op, args):
+    if op == 'list':
+        rows = messages()
+        page = max(1, int(args.get('page') or 1))
+        pages = max(1, (len(rows) + 9) // 10)
+        page = min(page, pages)
+        return dict(total=len(rows), unread=sum(bool(m.get('unread')) for m in rows),
+                    page=page, pages=pages, sim_used=-1, sim_total=0, sim_seen=0,
+                    msgs=[dict(id=str(m['id']), status='unread' if m.get('unread') else 'read',
+                               card=m.get('card'), sim=m.get('sim') or '',
+                               dir='mt' if m['direction'] == 'in' else 'mo', peer=m['number'],
+                               time=m.get('time') or '', preview=m.get('text', '')[:100])
+                          for m in rows[(page - 1) * 10:page * 10]])
+    if op == 'show':
+        identifier = int(args['id'])
+        m = next((m for m in messages() if m['id'] == identifier), None)
+        if m is None:
+            raise ValueError('No such message')
+        if identifier >= 1000000000:
+            run([RECEIVER, 'read', str(identifier)])
+        return dict(ok=1, text=f"from: {m['number']}\ntime: {m.get('time', '')}\n---\n{m.get('text', '')}")
+    if op == 'send':
+        number, text = str(args.get('num', '')), str(args.get('text', ''))
+        card = str(args.get('card', ''))
+        if card not in ('', '0', '1'):
+            raise ValueError('Invalid SIM card')
+        if not number.lstrip('+').isdigit() or not text or len(text) > 480:
+            raise ValueError('Invalid number or message length')
+        fd, tmp = tempfile.mkstemp(prefix='t551m-sms-', dir='/tmp')
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write(text)
+            run([TOOL, 'send', number, tmp] + ([card] if card else []), timeout=90)
+        finally:
+            Path(tmp).unlink(missing_ok=True)
+        return dict(ok=1, reply='sent')
+    if op == 'delete':
+        value = str(args['id'])
+        ids = [m['id'] for m in messages()] if value == 'all' else [int(value)]
+        if str(args.get('sim', '0')) == '1':
+            if value == 'all':
+                raise ValueError('Bulk SIM deletion is not supported')
+            run([TOOL, 'delete', str(ids[0])])
+            hide(ids)
+        else:
+            hide(ids)
+        return dict(ok=1)
+    if op == 'sync':
+        subprocess.Popen([RECEIVER, 'scan'], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True, close_fds=True)
+        return dict(ok=1, started=1)
+    raise ValueError('Unknown operation')
+
+
+if __name__ == '__main__':
+    try:
+        reply = main(sys.argv[1], json.loads(sys.stdin.read() or '{}'))
+    except (OSError, ValueError, KeyError, RuntimeError, subprocess.TimeoutExpired) as error:
+        reply = dict(ok=0, error=str(error))
+    print(json.dumps(reply, ensure_ascii=False))

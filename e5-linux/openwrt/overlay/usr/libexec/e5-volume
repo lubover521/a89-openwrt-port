@@ -1,0 +1,120 @@
+#!/bin/sh
+# E5: the speaker volume, 16 levels (0 mute - 15), kept in
+# /etc/config/e5-audio (main.volume). PulseAudio applies the level to both
+# speaker and Bluetooth sinks; the speaker hardware stays capped at 39.
+# Without PulseAudio use 'VBC DAC0 DG Set' (0-127, both channels). Level 15 is 39,
+# the gain the device's own Android plays media with (the UCM profile's
+# value, rootfs/overlay/usr/share/alsa/ucm2/sprdphone-sc273/HiFi.conf), and
+# each level below takes 2 off: 11 at level 1. Never louder than Android.
+#
+#   e5-volume                 the level, as JSON: {"level":N,"max":15,"card":true|false,"output":"speaker"|"bluetooth"}
+#   e5-volume set N | up | down
+#   During calls these keys/status control call volume; 'call' selects it explicitly.
+#   e5-volume apply           the saved level to the card (after e5-audio-dsp start)
+#   e5-volume prepare         wake the selected media sink, then apply its level
+#   e5-volume play FILE|beep   play a sound (not while one is playing)
+#
+# With PulseAudio running (/etc/init.d/e5-pulseaudio) a sound goes through it,
+# to its default sink: the Bluetooth headphones while they are connected,
+# the speaker otherwise. The speaker sink otherwise stays at unity even
+# when the cached DAC0 DG level changes; control the actual PCM path too.
+# Apply before playback too, so newly connected outputs use the saved level.
+MAX=15
+CTL='VBC DAC0 DG Set'
+
+card() { awk '/sprdphone/ {print $1; exit}' /proc/asound/cards 2>/dev/null; }
+pa() { pidof pulseaudio >/dev/null && PULSE_SERVER=unix:/var/run/pulse/native "$@"; }
+output_sinks() { pa pactl list short sinks 2>/dev/null | awk '$2 == "speaker" || $2 ~ /^bluez_sink/ {print $2}'; }
+level() {
+	local l
+	l=$(uci -q get e5-audio.main.volume)
+	case "$l" in ''|*[!0-9]*) l=10 ;; esac
+	[ "$l" -gt $MAX ] && l=$MAX
+	echo "$l"
+}
+gain() { [ "$1" -le 0 ] && echo 0 || echo $((39 - (MAX - $1) * 2)); }
+apply() {
+	local c g s speaker=0 applied=0
+	for s in $(output_sinks); do
+		# Attenuate PCM first, then restore the capped hardware gain. This
+		# avoids a full-volume transient when moving away from mute.
+		pa pactl set-sink-volume "$s" "$(($1 * 100 / MAX))%" >/dev/null 2>&1 || return 1
+		applied=1
+		[ "$s" = speaker ] && speaker=1
+	done
+	c=$(card); [ -n "$c" ] || { [ "$applied" = 1 ]; return; }
+	g=$(gain "$1")
+	# A single volume curve: do not attenuate a second time in the codec.
+	[ "$speaker" = 1 ] && [ "$1" -gt 0 ] && g=39
+	amixer -q -c "$c" cset "name=$CTL" "$g,$g" >/dev/null 2>&1
+}
+prepare() {
+	local sink state
+	# Shared FAST_P playback path: select by sink state, not board name.
+	# New devices using this speaker path need the same cold-start ordering.
+	# apply alone must remain passive: volume keys and startup must not keep
+	# the DSP awake. Playback needs a different order. Opening FAST_P after
+	# writing its gain can reinitialize the DSP path on the first sound.
+	if pidof pulseaudio >/dev/null; then
+		sink=$(pa pactl get-default-sink) || return 1
+		[ -n "$sink" ] || return 1
+		state=$(pa pactl list short sinks | awk -v sink="$sink" '$2 == sink { print $NF; exit }')
+		pa pactl suspend-sink "$sink" 0 >/dev/null 2>&1 || return 1
+		if [ "$sink" = speaker ] && [ "$state" = SUSPENDED ]; then
+			# Unsuspending alone need not start FAST_P. Run 100 ms of zeros
+			# through the PCM first, then restore gain after DSP startup.
+			# This is only for cold speaker playback, never an idle keeper.
+			head -c 19200 /dev/zero | pa paplay --device="$sink" --raw \
+				--rate=48000 --channels=2 --format=s16le --latency-msec=20 \
+				--client-name=e5-silent-preroll >/dev/null 2>&1 || return 1
+		fi
+	fi
+	apply "$1"
+}
+status() {
+	local out=speaker
+	case "$(pa pactl get-default-sink 2>/dev/null)" in bluez_sink*) out=bluetooth ;; esac
+	printf '{"level":%d,"max":%d,"kind":"media","card":%s,"output":"%s"}\n' "$(level)" $MAX \
+		"$([ -n "$(card)" ] && echo true || echo false)" "$out"
+}
+save() {
+	uci -q set e5-audio.main=audio
+	uci set e5-audio.main.volume="$1"
+	uci commit e5-audio
+}
+play() {
+	local c f=$1
+	case "$f" in beep) f=/usr/share/e5/beep.wav ;; esac
+	c=$(card); [ -n "$c" ] && [ -f "$f" ] || return 1
+	[ "$(level)" -gt 0 ] || return 0
+	prepare "$(level)" || return 1
+	if pidof pulseaudio >/dev/null; then
+		PULSE_SERVER=unix:/var/run/pulse/native paplay "$f" >/dev/null 2>&1 &
+		return 0
+	fi
+	pidof aplay >/dev/null && return 0
+	aplay -q -D "hw:$c,3" "$f" >/dev/null 2>&1 &
+}
+
+case "${1:-}" in
+	''|set|up|down)
+		# Route physical keys to CP voice while a fresh call is active. Media
+		# apply/play remain explicit media operations, including startup/ringing.
+		if [ -x /usr/libexec/e5-call-volume ]; then
+			/usr/libexec/e5-call-volume auto "$@"
+			r=$?; [ "$r" = 3 ] || exit "$r"
+		fi ;;
+	call) shift; exec /usr/libexec/e5-call-volume "$@" ;;
+esac
+
+case "${1:-}" in
+	'') status ;;
+	set) n=${2:-}; case "$n" in ''|*[!0-9]*) echo "a level 0-$MAX" >&2; exit 2 ;; esac
+	     [ "$n" -gt $MAX ] && n=$MAX; save "$n"; apply "$n"; status ;;
+	up) n=$(level); [ "$n" -lt $MAX ] && n=$((n + 1)); save "$n"; apply "$n"; status ;;
+	down) n=$(level); [ "$n" -gt 0 ] && n=$((n - 1)); save "$n"; apply "$n"; status ;;
+	apply) apply "$(level)" ;;
+	prepare) prepare "$(level)" ;;
+	play) play "${2:-beep}" ;;
+	*) sed -n '2,15p' "$0"; exit 2 ;;
+esac

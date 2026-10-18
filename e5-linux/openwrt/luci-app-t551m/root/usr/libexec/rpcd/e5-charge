@@ -1,0 +1,21 @@
+#!/usr/bin/python3
+import json
+import subprocess
+import sys
+
+sys.path.insert(0, '/usr/lib/e5')
+from e5_charge import METHODS, dispatch
+
+if sys.argv[1:] == ['list']:
+    print(json.dumps(METHODS))
+elif len(sys.argv) == 3 and sys.argv[1] == 'call':
+    try:
+        data = json.loads(sys.stdin.read(2049) or '{}')
+        if not isinstance(data, dict):
+            raise ValueError('charge_invalid')
+        print(json.dumps(dispatch(sys.argv[2], data)))
+    except BlockingIOError:
+        print(json.dumps({'ok': False, 'error': 'charge_busy'}))
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        code = str(error)
+        print(json.dumps({'ok': False, 'error': code if code.startswith('charge_') else 'charge_unavailable'}))

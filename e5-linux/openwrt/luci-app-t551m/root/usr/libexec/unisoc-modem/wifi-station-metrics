@@ -1,0 +1,159 @@
+#!/usr/bin/python3
+"""Fill missing station-dump metrics without blocking dashboard snapshots.
+
+Input/output: MAC|signal|tx bitrate|rx bitrate|connected time, one row per
+currently associated station. Only missing values use a <= 5s fallback cache.
+One on-demand worker queries station get with a shared 1s budget. No daemon,
+AT request, association changes, persistent writes or extra polling timer.
+"""
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import time
+
+MAC = re.compile(r'(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\Z')
+IFACE = re.compile(r'[a-zA-Z0-9_.-]{1,15}\Z')
+CACHE = Path('/run/unisoc-wifi-metrics')
+TTL = 5.0
+BUDGET = 1.0
+
+
+def normalize(row):
+    if not isinstance(row, list) or len(row) != 5 or not all(isinstance(v, str) for v in row) or not MAC.fullmatch(row[0]):
+        return None
+    row = list(row)
+    if not re.fullmatch(r'-\d+(?:\.\d+)?', row[1]) or not -127 <= float(row[1]) < 0:
+        row[1] = ''
+    for i in (2, 3):
+        if not re.fullmatch(r'\d+(?:\.\d+)? Mbit/s', row[i]) or float(row[i].split()[0]) <= 0:
+            row[i] = ''
+    if not re.fullmatch(r'\d+ min', row[4]):
+        row[4] = ''
+    return row
+
+
+def parse_get(text, mac):
+    row = [mac, '', '', '', '']
+    # A driver returning another station's data must never contaminate a row.
+    station = re.search(r'^Station\s+(\S+)', text, re.M)
+    if not station or station[1].lower() != mac:
+        return None
+    for i, pattern, suffix in (
+        (1, r'^\s+signal:\s+(-?\d+(?:\.\d+)?)', ''),
+        (2, r'^\s+tx bitrate:\s+(\d+(?:\.\d+)?)', ' Mbit/s'),
+        (3, r'^\s+rx bitrate:\s+(\d+(?:\.\d+)?)', ' Mbit/s'),
+    ):
+        match = re.search(pattern, text, re.M)
+        if match:
+            row[i] = match[1] + suffix
+    return normalize(row)
+
+
+def private_dir(path):
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise OSError('unsafe metrics directory')
+
+
+def read_cache(path):
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def refresh(iface, key, macs, cache_dir=CACHE):
+    path = cache_dir / (key + '.json')
+    data = read_cache(path)
+    deadline = time.monotonic() + BUDGET
+    values = {}
+    # Rotate when a slow driver exhausts the total budget, so later clients
+    # are not permanently starved by the first client.
+    cursor = int(data.get('cursor', 0)) % max(1, len(macs))
+    ordered = macs[cursor:] + macs[:cursor]
+    queried = 0
+    for mac in ordered:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        queried += 1
+        try:
+            result = subprocess.run(['iw', 'dev', iface, 'station', 'get', mac],
+                                    capture_output=True, text=True,
+                                    timeout=min(0.3, remaining), check=False)
+            row = parse_get(result.stdout, mac) if result.returncode == 0 else None
+            if row:
+                values[mac] = row
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    # Record failed attempts too: unsupported drivers must not be queried
+    # on every snapshot. Atomic publication, including an empty result.
+    temp = path.with_suffix('.new')
+    temp.write_text(json.dumps({'ts': time.monotonic(), 'values': values,
+                                'cursor': (cursor + queried) % max(1, len(macs))}))
+    temp.replace(path)
+
+
+def fill(rows, iface, cache_dir=CACHE):
+    rows = [row for row in (normalize(r) for r in rows) if row]
+    if not IFACE.fullmatch(iface) or not rows:
+        return rows
+    missing = [r[0] for r in rows if not all(r[1:4])][:32]
+    if not missing:
+        return rows
+    try:
+        private_dir(cache_dir)
+        index = (Path('/sys/class/net') / iface / 'ifindex').read_text().strip()
+        if not index.isdigit():
+            return rows
+        key = iface + '-' + index
+        data = read_cache(cache_dir / (key + '.json'))
+        age = time.monotonic() - float(data.get('ts', -TTL))
+        if 0 <= age < TTL:
+            values = data.get('values', {})
+            if not isinstance(values, dict):
+                values = {}
+            for row in rows:
+                cached = normalize(values.get(row[0], []))
+                if cached:
+                    for i in (1, 2, 3):
+                        row[i] = row[i] or cached[i]
+            return rows
+        fd = os.open(cache_dir / (key + '.lock'), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            subprocess.Popen([sys.executable, str(Path(__file__).resolve()),
+                              '--refresh', iface, key, str(fd), *missing],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True, pass_fds=(fd,))
+        finally:
+            # The child owns the inherited flock until it exits.
+            os.close(fd)
+    except (OSError, ValueError, TypeError):
+        pass  # Metrics are optional; association/count remains authoritative.
+    return rows
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == '--refresh':
+        _, _, iface, key, lockfd, *macs = sys.argv
+        if IFACE.fullmatch(iface) and key.startswith(iface + '-') and all(MAC.fullmatch(m) for m in macs):
+            refresh(iface, key, macs)
+        os.close(int(lockfd))
+    elif len(sys.argv) == 2:
+        for row in fill([s.split('|') for s in sys.stdin.read().splitlines()], sys.argv[1]):
+            print('|'.join(row))
+
+
+if __name__ == '__main__':
+    main()

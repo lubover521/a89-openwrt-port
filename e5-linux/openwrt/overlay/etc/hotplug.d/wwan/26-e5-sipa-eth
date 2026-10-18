@@ -1,0 +1,5 @@
+#!/bin/sh
+# Share the AT-first, card-scoped port discovery with MM startup/restart.
+[ "$ACTION" = add ] || exit 0
+case "$DEVNAME" in wwan*at*) ;; *) exit 0 ;; esac
+/usr/libexec/e5-mm-report-ports

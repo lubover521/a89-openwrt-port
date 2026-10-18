@@ -1,0 +1,10 @@
+#!/usr/bin/python3
+import sys
+sys.path.insert(0, '/usr/lib/e5')
+from e5_sounds import play
+if len(sys.argv) == 3 and sys.argv[1] == 'preview':
+    play(sys.argv[2], preview=True)
+elif len(sys.argv) in (2, 3) and sys.argv[1] in ('ring', 'sms'):
+    play(sys.argv[1], sys.argv[2] if len(sys.argv) == 3 else None)
+else:
+    raise SystemExit('usage: e5-notification-sound ring|sms [tone] | preview ring|sms')

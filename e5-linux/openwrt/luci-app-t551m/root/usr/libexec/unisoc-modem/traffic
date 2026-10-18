@@ -1,0 +1,183 @@
+#!/usr/bin/ucode
+import * as fs from 'fs';
+import * as uloop from 'uloop';
+import * as ubus from 'ubus';
+import * as core from './traffic-core.uc';
+
+const BASE = getenv('MU300_TRAFFIC_DIR') || '/etc/unisoc-modem/traffic';
+const RUN = getenv('MU300_TRAFFIC_RUN') || '/run/unisoc-modem-traffic';
+const NET = getenv('MU300_TRAFFIC_SYS') || '/sys/class/net';
+const BUS = getenv('MU300_TRAFFIC_BUS') || 'unisoc.traffic';
+const CARD = getenv('MU300_TRAFFIC_CARD') || '/sys/module/sipc_wwan/parameters/card';
+const boot = trim(fs.readfile('/proc/sys/kernel/random/boot_id') || '');
+fs.mkdir('/etc/unisoc-modem', 448);
+fs.mkdir(BASE, 448); fs.mkdir(RUN, 448);
+function read_json(path) {
+    let text = fs.readfile(path);
+    if (text == null) return null;
+    try { return json(text); } catch (e) { die('Invalid traffic database: ' + path + '\n'); }
+}
+function atomic(path, value) {
+    let text = sprintf('%J\n', value), tmp = path + '.new';
+    if (fs.writefile(tmp, text) != length(text)) return false;
+    fs.chmod(tmp, 384);
+    return fs.rename(tmp, path);
+}
+function active_slot() { return trim(fs.readfile(CARD) || '') == '1' ? 1 : 0; }
+let cached = read_json(RUN + '/state.json'), durable = read_json(BASE + '/state.json');
+// A crash after committing a clear/config change but before refreshing RAM
+// must never resurrect an older cached ledger on service restart.
+let ledger = durable && (!cached || (durable.revision ?? 0) > (cached.revision ?? 0)) ? durable : cached ?? durable;
+if (ledger?.version == 1) {
+    // Preserve the original ledger once; never clone totals into both cards.
+    if (fs.stat(BASE + '/state-v1.json') == null && !atomic(BASE + '/state-v1.json', ledger))
+        die('Cannot preserve legacy traffic database\n');
+    let owner = ledger.last?.device == 'sipa_eth8' ? 1 : ledger.last?.device == 'sipa_eth0' ? 0 : active_slot();
+    let slots = [core.fresh(time()), core.fresh(time())];slots[owner] = ledger;
+    ledger = {version:2, legacy_owner:owner, slots};
+}
+ledger ??= {version:2, slots:[core.fresh(time()),core.fresh(time())]};
+ledger.revision ??= 0;
+if (ledger.version != 2 || length(ledger.slots ?? []) != 2) die('Unsupported traffic database\n');
+for (let db in ledger.slots) {
+    if (db.version != 1 || type(db.days) != 'object' || type(db.months) != 'object') die('Unsupported SIM traffic database\n');
+    db.config = core.config(db.config);
+}
+let saved_at = 0, storage_error = false;
+uloop.init();
+const bus = ubus.connect(null, 2);
+if (!bus) die('Traffic ubus connection failed\n');
+
+function snapshot(slot) {
+    // Count the SIM's whole bank, including a data APN placed at CID 2+.
+    // Keep its historical device key and first port's generation for ledgers.
+    let name = slot == 1 ? 'sipa_eth8' : 'sipa_eth0';
+    let idx = trim(fs.readfile(NET + '/' + name + '/ifindex') || '');
+    if (!match(idx, /^[0-9]+$/)) return null;
+    let rx = 0, tx = 0;
+    for (let offset = 0; offset < 8; offset++) {
+        let path = NET + '/sipa_eth' + (slot * 8 + offset);
+        if (!fs.stat(path)) continue;
+        let r = trim(fs.readfile(path + '/statistics/rx_bytes') || '');
+        let t = trim(fs.readfile(path + '/statistics/tx_bytes') || '');
+        if (!match(r, /^[0-9]+$/) || !match(t, /^[0-9]+$/)) return null;
+        rx += int(r); tx += int(t);
+    }
+    let sample = { device: name, boot: boot, ifindex: int(idx), rx, tx };
+    let db = ledger.slots[slot];
+    if (!db.bank_counters) {
+        // Upgrade without charging old non-CID1 counters to today's usage.
+        if (db.last?.boot == boot && db.last?.ifindex == int(idx)) {
+            db.last.rx = rx; db.last.tx = tx;
+        }
+        db.bank_counters = true;
+    }
+    return sample;
+}
+function view(now, slot) {
+    let s = core.status(ledger.slots[slot], now);
+    s.storage_error = storage_error;
+    s.slot = slot;
+    return s;
+}
+function checkpoint(force) {
+    let now = time();
+    if (!atomic(RUN + '/state.json', ledger)) storage_error = true;
+    if (force || now - saved_at >= 60 || now < saved_at) {
+        if (atomic(BASE + '/state.json', ledger)) { saved_at = now; storage_error = false; }
+        else storage_error = true;
+    }
+    atomic(RUN + '/view.json', view(now, active_slot()));
+    for (let slot in [0,1]) atomic(RUN + '/view-sim' + slot + '.json', view(now, slot));
+}
+function sample(force) {
+    let now = time();
+    for (let slot in [0,1]) core.advance(ledger.slots[slot], snapshot(slot), now);
+    checkpoint(force);
+}
+function get_data(slot) {
+    let db = ledger.slots[slot];
+    let days = [], months = [];
+    for (let date in reverse(sort(keys(db.days)))) {
+        if (length(days) >= 31) break;
+        push(days, { date: date, rx: db.days[date].rx, tx: db.days[date].tx });
+    }
+    for (let date in reverse(sort(keys(db.months)))) {
+        if (length(months) >= 12) break;
+        push(months, { date: date, rx: db.months[date].rx, tx: db.months[date].tx });
+    }
+    return { slot, config: db.config, status: view(time(), slot), days: days, months: months };
+}
+function selected(req) {
+    let slot = req.args?.slot;
+    if (slot == null || slot == '') return active_slot();
+    if (slot != '0' && slot != '1') return null;
+    return int(slot);
+}
+const obj = bus.publish(BUS, {
+    get: { args:{slot:''}, call: function(req) { let slot=selected(req);return slot == null ? {error:'invalid_slot'} : get_data(slot); } },
+    clear: { args:{slot:'',confirm:false}, call:function(req) {
+        // Destructive requests always name their scope; never infer active SIM.
+        let slot = req.args?.slot;
+        if (slot != '0' && slot != '1' && slot != 'all') return {ok:0,error:'invalid_slot'};
+        if (req.args?.confirm !== true) return {ok:0,error:'confirmation_required'};
+        sample(false);
+        let previous = ledger.slots, revision = ledger.revision, now = time();
+        let next = [previous[0],previous[1]];
+        for (let id in slot == 'all' ? [0,1] : [int(slot)]) {
+            next[id] = core.clear_records(previous[id], snapshot(id), now);
+            next[id].bank_counters = true;
+        }
+        ledger.slots = next;
+        ledger.revision++;
+        if (!atomic(BASE + '/state.json', ledger)) {
+            ledger.slots = previous;
+            ledger.revision = revision;
+            storage_error = true;
+            return {ok:0,error:'storage_failed'};
+        }
+        saved_at = now;
+        storage_error = false;
+        checkpoint(false);
+        return {ok:1,slot};
+    } },
+    set: { args: { payload: '', slot:'' }, call: function(req) {
+        let slot = selected(req);
+        if (slot == null) return {ok:0,error:'invalid_slot'};
+        let db = ledger.slots[slot];
+        let input;
+        try {
+            if (length(req.args.payload || '') > 4096) die('invalid_config');
+            input = json(req.args.payload);
+            core.config(input);
+            if (input.device && input.device != (slot == 1 ? 'sipa_eth8' : 'sipa_eth0')) die('invalid_config');
+            if (input.used_gb != null && time() < 1704067200) return { ok: 0, error: 'clock_unsynced' };
+        } catch (e) { return { ok: 0, error: 'invalid_config' }; }
+        sample(false);
+        let previous = db.config, adjustment = db.adjustment, last = db.last, revision = ledger.revision;
+        try { core.update_config(db, input, time()); }
+        catch (e) { return { ok: 0, error: 'invalid_config' }; }
+        // Persist the full transaction before acknowledging changed settings.
+        ledger.revision++;
+        if (!atomic(BASE + '/state.json', ledger)) {
+            db.config = previous; db.adjustment = adjustment; db.last = last;
+            ledger.revision = revision;
+            storage_error = true;
+            return { ok: 0, error: 'storage_failed' };
+        }
+        sample(true);
+        return { ok: 1 };
+    } },
+    flush: { call: function(req) { sample(true); return { ok: !storage_error }; } }
+});
+if (!obj) die('Traffic service already running or publish failed\n');
+sample(true);
+let ticker;
+ticker = uloop.timer(10000, function() {
+    sample(false);
+    ticker.set(10000);
+});
+let term = uloop.signal(15, function() { sample(true); uloop.end(); });
+let intr = uloop.signal(2, function() { sample(true); uloop.end(); });
+uloop.run();
+sample(true);

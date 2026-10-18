@@ -1,0 +1,6 @@
+#!/bin/sh
+# The USB gadget connected again after a cable replug, or when the host did not
+# enumerate it.  The logic is shared with Debian (rootfs/overlay/opt/e5/
+# usb-watch.sh, copied to /opt/e5/usb-watch.sh by openwrt/build-rootfs.sh); this
+# is the procd service's entry point (/etc/init.d/e5-usb-watch).
+exec /opt/e5/usb-watch.sh

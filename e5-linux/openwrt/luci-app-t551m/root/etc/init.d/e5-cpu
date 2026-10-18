@@ -1,0 +1,11 @@
+#!/bin/sh /etc/rc.common
+START=13
+STOP=89
+boot() {
+    /usr/libexec/unisoc-modem/cpu-control boot | logger -t e5-cpu
+}
+start() { boot; }
+# A manual service stop must not disarm crash recovery for this running boot.
+shutdown() {
+    /usr/libexec/unisoc-modem/cpu-control shutdown | logger -t e5-cpu
+}

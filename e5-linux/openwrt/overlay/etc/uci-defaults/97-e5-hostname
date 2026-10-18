@@ -1,0 +1,11 @@
+#!/bin/sh
+# Migrate only the generic factory hostname, once; preserve user choices.
+[ -r /etc/e5/device-hostname ] || exit 0
+name=$(cat /etc/e5/device-hostname)
+case "$name" in ''|*[!a-zA-Z0-9-]*) exit 1 ;; esac
+if [ "$(uci -q get system.@system[0].hostname)" = OpenWrt ]; then
+	uci set "system.@system[0].hostname=$name" && uci commit system || exit 1
+	printf '%s\n' "$name" > /etc/hostname
+	printf '%s\n' "$name" > /proc/sys/kernel/hostname
+fi
+exit 0
